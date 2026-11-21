@@ -89,6 +89,8 @@ mod palette_panel;
 #[cfg(windows)]
 mod passphrase_view;
 #[cfg(windows)]
+mod rules_panel;
+#[cfg(windows)]
 mod script_args;
 #[cfg(windows)]
 mod script_editor;
@@ -177,6 +179,8 @@ mod rail;
 mod reconnect;
 #[cfg(windows)]
 mod remote_app;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod rules_view;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod same_dir;
 #[cfg(windows)]

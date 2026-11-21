@@ -278,7 +278,7 @@ Without any rules, hosts tagged `production`, `staging` or `development` get Pro
 
 ## Security rules
 
-A `SecurityRule` puts limits on connections by tag, folder or host name, whatever each connection's own settings say. A rule can only tighten. Every rule that matches adds its limits, and none takes one away, so a rule such as `ForwardAgent yes` does nothing.
+A `SecurityRule` puts limits on connections by tag, folder or host name, whatever each connection's own settings say. Tools > Security rules edits these blocks for you. A rule can only tighten. Every rule that matches adds its limits, and none takes one away, so a rule such as `ForwardAgent yes` does nothing.
 
 ```
 SecurityRule
@@ -301,7 +301,7 @@ SecurityRule
 | `SavePassword no` | No password is read from or kept in the Windows Credential Manager, for the login, a proxy (also when only a jump host on the way has the rule) or a login script, including its named secrets. A password manager command still works. |
 | `ForwardAgent no` | No agent forwarding, even when the connection or ssh_config asks for it. |
 | `Clipboard no` | The server cannot set this PC's clipboard (OSC 52). |
-| `ConfirmConnect yes` | FeroSSH asks before connecting, also when only a jump host on the way matches. The question names the user, host and port (a saved Telnet or WinRM connection's own port) and the route there, and if any of that changes before the connection starts, it asks again. A reconnect or a split of a connected pane does not ask again. |
+| `ConfirmConnect yes` | FeroSSH asks before connecting, also when only a jump host on the way matches. The question names the user, host and port (a saved Telnet or WinRM connection's own port) and the route there, and if any of that changes before the connection starts, it asks again. A reconnect or a split of a connected pane does not ask again. A direct Remote Desktop connection (one without Via SSH) asks in a message box before Remote Desktop Connection starts. |
 | `LogSession yes` | The session is logged, and Session > Log this session cannot turn it off. If the log cannot be opened, nothing starts on the session (no login script, forwards or tmux) and it disconnects; if a write fails later, it disconnects too. Once the connection ends or you disconnect, Log this session goes back to how you had it. |
 
 A rule needs at least one of `Hosts`, `Tags` or `Folders`, and at least one limit. A connection shows the limits that apply when it starts. The limits cover SSH, Mosh, SFTP and tunnel connections, and the clipboard, confirmation and log limits cover Telnet and WinRM too.

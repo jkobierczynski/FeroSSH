@@ -81,7 +81,7 @@ Fields that need the whole form (host, port, forwards, login script) stay one co
 - `SavePassword no`: no Windows Credential Manager password, read or kept.
 - `ForwardAgent no`, `Clipboard no` (OSC 52), `ConfirmConnect yes` (asked once per connect, also for a matching jump host, bound to the endpoint asked about; not on reconnect or split), `LogSession yes` (the log cannot be turned off; a log that fails disconnects).
 - Each hop of a jump route gets its own rules. A connection prints the limits that apply.
-- Rules are edited in the file for now, like theme rules. A rules page in Settings is a possible follow-up.
+- Tools > Security rules (the padlock on the tools rail; Known hosts now has a fingerprint) lists the rules in the tools pane with what each matches, its limits and the connections it covers, and adds, changes and deletes them.
 
 ## 7. Inventory columns with CSV export (done, #261)
 

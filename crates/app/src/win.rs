@@ -157,6 +157,7 @@ use crate::proxycmd::ProxyRun;
 use crate::pwcommand;
 use crate::rail;
 use crate::reconnect::{self, Next, Retry};
+use crate::rules_panel;
 use crate::same_dir;
 use crate::sandbox;
 use crate::script_args;
@@ -619,6 +620,8 @@ mod cmd {
     pub const NEW_KEY: u32 = 639;
     /// Tools > Credential manager.
     pub const CREDENTIAL_MANAGER: u32 = 680;
+    /// Tools > Security rules.
+    pub const SECURITY_RULES: u32 = 681;
     /// Session > Copy public key to this server.
     pub const COPY_ID: u32 = 640;
     /// Session > Logs and recordings > Record this pane (asciicast), and Play a recording.
@@ -1258,6 +1261,8 @@ enum SideView {
     Inventory,
     /// The credential manager (native controls only).
     Credentials,
+    /// The security rules (native controls only).
+    SecurityRules,
     /// The command palette, shown over whatever the side pane showed.
     Palette,
 }
@@ -2859,6 +2864,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
+                RailItem::SecurityRules => cmd::SECURITY_RULES,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => cmd::TOOLS_PIN,
             });
@@ -2885,6 +2891,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = inventory_panel::create(hwnd, inventory_event, dpi);
         // The credential manager's, likewise.
         let _ = credential_panel::create(hwnd, credential_event, dpi);
+        // The security rules', likewise.
+        let _ = rules_panel::create(hwnd, rules_event, dpi);
         // The scripts pane's, likewise.
         let _ = scripts_panel::create(hwnd, scripts_event, dpi);
         // The script editor's, likewise.
@@ -2992,6 +3000,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || known_hosts_panel::pre_translate(&msg)
                 || inventory_panel::pre_translate(&msg)
                 || credential_panel::pre_translate(&msg)
+                || rules_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
                 || script_editor::pre_translate(&msg)
                 || script_args::pre_translate(&msg)
@@ -3357,6 +3366,7 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         separator(tools)?;
         item(tools, cmd::CREDENTIAL_MANAGER, "Cre&dential manager")?;
+        item(tools, cmd::SECURITY_RULES, "Securit&y rules")?;
         item(tools, cmd::NEW_KEY, "New SSH &key...")?;
         item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
 
@@ -12149,6 +12159,7 @@ impl Window {
             SideView::KnownHosts => RailItem::KnownHosts,
             SideView::Inventory => RailItem::Inventory,
             SideView::Credentials => RailItem::Credentials,
+            SideView::SecurityRules => RailItem::SecurityRules,
             SideView::Palette => RailItem::Palette,
         });
         rail::Look {
@@ -12227,6 +12238,19 @@ impl Window {
     /// Whether the credential manager shows (always native controls).
     fn credentials_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::Credentials
+    }
+
+    /// Reads the security rules again for Tools > Security rules, and
+    /// shows them: what another FeroSSH changed in a shared settings file
+    /// first, as a save would.
+    fn reload_rules(&mut self) {
+        self.pull_vault_settings();
+        rules_panel::set_rows(self.rule_rows());
+    }
+
+    /// Whether the security rules show (always native controls).
+    fn rules_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::SecurityRules
     }
 
     /// Whether port forwards show as native controls.
@@ -12333,6 +12357,8 @@ impl Window {
             inventory_panel::has_focus()
         } else if self.credentials_native() {
             credential_panel::has_focus()
+        } else if self.rules_native() {
+            rules_panel::has_focus()
         } else if self.scripts_native() {
             scripts_panel::has_focus()
         } else if self.script_editor_native() {
@@ -12419,6 +12445,11 @@ impl Window {
             credential_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             credential_panel::place(None, 0, self.dpi);
+        }
+        if self.rules_native() {
+            rules_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            rules_panel::place(None, 0, self.dpi);
         }
         if self.scripts_native() {
             scripts_panel::seed_folds(self.settings.expanded_script_cats.clone());
@@ -12525,6 +12556,7 @@ impl Window {
             || self.known_hosts_native()
             || self.inventory_native()
             || self.credentials_native()
+            || self.rules_native()
             || self.scripts_native()
             || self.script_editor_native()
             || self.script_args_native()
@@ -12626,11 +12658,12 @@ impl Window {
                     );
                 }
                 // Native controls (`files_panel`, `known_hosts_panel`,
-                // `inventory_panel`, `credential_panel`).
+                // `inventory_panel`, `credential_panel`, `rules_panel`).
                 SideView::Files
                 | SideView::KnownHosts
                 | SideView::Inventory
-                | SideView::Credentials => {}
+                | SideView::Credentials
+                | SideView::SecurityRules => {}
             }
             self.invalidate_grid(side);
         }
@@ -13579,6 +13612,7 @@ impl Window {
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
+                RailItem::SecurityRules => cmd::SECURITY_RULES,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => return String::new(),
             };
@@ -13919,6 +13953,11 @@ impl Window {
         self.side.visible && self.side.focused && self.side.view == SideView::Credentials
     }
 
+    /// Whether a paste is for the security rules.
+    fn rules_paste(&self) -> bool {
+        self.side.visible && self.side.focused && self.side.view == SideView::SecurityRules
+    }
+
     fn paste_side(&mut self, text: &str) -> bool {
         if self.side.visible
             && self.side.focused
@@ -13933,7 +13972,11 @@ impl Window {
         // event needs the window, so the paste comes after this borrow);
         // the list has nowhere to paste into, and the terminal behind must
         // not get it either.
-        if self.known_hosts_paste() || self.inventory_paste() || self.credentials_paste() {
+        if self.known_hosts_paste()
+            || self.inventory_paste()
+            || self.credentials_paste()
+            || self.rules_paste()
+        {
             return true;
         }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
@@ -15519,6 +15562,30 @@ impl Window {
     /// connections that pick it, and every password FeroSSH keeps (in the
     /// Windows Credential Manager or the vault) with the connections whose
     /// login keeps it there. No password is kept in a row.
+    /// Tools > Security rules: each rule with the saved connections it
+    /// covers, matched as a connection is (its folder as the connection
+    /// manager shows it).
+    fn rule_rows(&self) -> Vec<crate::rules_view::Row> {
+        use crate::rules_view::{Connection, rows};
+        let saved = load_saved();
+        let all: Vec<Connection> = host_items(&ssh_env(), &self.settings)
+            .into_iter()
+            .map(|h| {
+                let own = saved
+                    .iter()
+                    .find(|s| s.alias.eq_ignore_ascii_case(&h.name))
+                    .and_then(|s| s.folder.clone());
+                Connection {
+                    folder: own.or(h.folder),
+                    name: h.name,
+                    hostname: h.hostname,
+                    tags: h.tags,
+                }
+            })
+            .collect();
+        rows(&self.settings.security_rules, &all)
+    }
+
     fn credential_rows(&self) -> Vec<crate::credential_view::Row> {
         use crate::credential_view::{Place, credential_rows, password_row};
         let mut rows = credential_rows(&self.settings);
@@ -15898,7 +15965,24 @@ impl Window {
                 format!("{host}:{port}")
             };
             let clipboard = self.desktop_clip(self.desktop_clip_limit(&[name])) == (true, true);
-            if let Err(e) = launch_rdp_client(&addr, self.fixed_desktop_size(name), clipboard) {
+            let size = self.fixed_desktop_size(name);
+            // No pane to ask in: a security rule that asks before
+            // connecting asks in a message box before mstsc starts.
+            if self
+                .policy_of(name, Some(&host), cfg.tag.as_deref())
+                .confirm_connect
+            {
+                self.workspace_asks.push(Command::ConfirmRdp {
+                    name: name.to_owned(),
+                    addr,
+                    size,
+                    clipboard,
+                });
+                // SAFETY: our window; replaces any earlier timer with this id.
+                unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
+                return;
+            }
+            if let Err(e) = launch_rdp_client(&addr, size, clipboard) {
                 self.queued.push(Command::Notice(format!(
                     "Remote Desktop Connection (mstsc.exe) did not start: {e}"
                 )));
@@ -17270,6 +17354,7 @@ impl Window {
             SideView::KnownHosts => self.reload_known_hosts(),
             SideView::Inventory => self.reload_inventory(),
             SideView::Credentials => self.reload_credentials(),
+            SideView::SecurityRules => self.reload_rules(),
             SideView::Live => {
                 let all = self.open_sessions();
                 self.live_view.reset(&all);
@@ -17311,6 +17396,7 @@ impl Window {
             cmd::KNOWN_HOSTS => SideView::KnownHosts,
             cmd::INVENTORY => SideView::Inventory,
             cmd::CREDENTIAL_MANAGER => SideView::Credentials,
+            cmd::SECURITY_RULES => SideView::SecurityRules,
             _ => SideView::Sessions,
         };
         let open = self.side.visible && self.side.view == view;
@@ -19925,6 +20011,10 @@ impl Window {
                     cmd::CREDENTIAL_MANAGER,
                     self.side.visible && self.side.view == SideView::Credentials,
                 ),
+                (
+                    cmd::SECURITY_RULES,
+                    self.side.visible && self.side.view == SideView::SecurityRules,
+                ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
@@ -21764,7 +21854,6 @@ enum Command {
     LogRequired(PaneId),
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
-    /// Tools > Credential manager.
     /// Settings > Key bindings: the window that changes them.
     KeyBindings,
     /// File > Import and export > Export connections, Import encrypted connections and the
@@ -21844,6 +21933,14 @@ enum Command {
     ClearAllHistory,
     /// A message box with this text.
     Notice(String),
+    /// A direct Remote Desktop connection a security rule asks about
+    /// first: mstsc starts after Yes.
+    ConfirmRdp {
+        name: String,
+        addr: String,
+        size: Option<(u16, u16)>,
+        clipboard: bool,
+    },
     /// Ask, then delete `entries` in folder `dir` of `key`'s host (when
     /// it is still the listed one).
     ConfirmDelete {
@@ -22741,6 +22838,7 @@ fn tools_have_focus() -> bool {
         || known_hosts_panel::has_focus()
         || inventory_panel::has_focus()
         || credential_panel::has_focus()
+        || rules_panel::has_focus()
 }
 
 /// Carries out what the user did on a script run's report: its keys go
@@ -23408,6 +23506,228 @@ fn credential_event(hwnd: HWND, event: credential_panel::Event) {
     });
 }
 
+/// Carries out what the user did in the security rules: New, Edit and
+/// Delete happen here, and the list is read again after.
+fn rules_event(hwnd: HWND, event: rules_panel::Event) {
+    use rules_panel::Event;
+    match event {
+        Event::New => edit_rule(hwnd, None),
+        Event::Edit(row) => edit_rule(hwnd, Some((row.index, row.rule))),
+        Event::Delete(row) => {
+            save_rules(hwnd, |rules| {
+                // Only the rule asked about: the list may have changed
+                // under it (a vault sync).
+                if let Some(i) = find_rule(rules, row.index, &row.rule) {
+                    rules.remove(i);
+                }
+            });
+        }
+        Event::Reload => {}
+        Event::Focused => {
+            tools_focused();
+            return;
+        }
+        Event::Leave => {
+            with_window(Window::focus_terminal);
+            return;
+        }
+    }
+    with_window(|w| {
+        if w.rules_native() {
+            w.reload_rules();
+        }
+        w.refresh_chrome();
+    });
+}
+
+/// Changes the security rules with `change` and saves them; on a
+/// failed save they stay as they were, and the user is told.
+fn save_rules(
+    hwnd: HWND,
+    change: impl FnOnce(&mut Vec<ferossh_config::host_policy::SecurityRule>),
+) -> bool {
+    let Some(result) = with_window(|w| {
+        w.pull_vault_settings();
+        let before = w.settings.security_rules.clone();
+        change(&mut w.settings.security_rules);
+        let saved = w.try_save_settings();
+        if saved.is_err() {
+            w.settings.security_rules = before;
+        }
+        saved
+    }) else {
+        return false;
+    };
+    let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
+    run_commands(hwnd, next);
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+            false
+        }
+    }
+}
+
+/// Where `rule` is in `rules` now: at `index` as it was shown, or else
+/// the first one just like it (the list changed under it, a vault sync).
+fn find_rule(
+    rules: &[ferossh_config::host_policy::SecurityRule],
+    index: usize,
+    rule: &ferossh_config::host_policy::SecurityRule,
+) -> Option<usize> {
+    if rules.get(index) == Some(rule) {
+        return Some(index);
+    }
+    rules.iter().position(|r| r == rule)
+}
+
+/// The question when a rule changed elsewhere before it could be saved.
+const RULE_CHANGED: &str = "This rule was changed or deleted elsewhere (another FeroSSH \
+                            sharing the settings) while it was open. Nothing was saved; Reload \
+                            shows the rules as they are now.";
+
+/// Opens rule `shown` (its place as listed, and the rule then), or a
+/// new one, to change; saves it once it names something and limits
+/// something.
+fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::SecurityRule)>) {
+    use ferossh_config::host_policy::{LIMITS, Policy, SecurityRule, words, words_text};
+    let index = shown.as_ref().map(|(i, _)| *i);
+    let original = shown.clone().map(|(_, rule)| rule);
+    if let Some((i, rule)) = &shown
+        && with_window(|w| find_rule(&w.settings.security_rules, *i, rule))
+            .flatten()
+            .is_none()
+    {
+        dialog(hwnd, RULE_CHANGED, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    let mut rule = original.clone().unwrap_or_default();
+    let title = match index {
+        Some(i) => format!("Security rule {}", i + 1),
+        None => "New security rule".to_owned(),
+    };
+    let intro = "Which connections: host name patterns, tags and connection manager \
+                 folders, separated by spaces (\"quotes\" around one with spaces; * and ? \
+                 work; a folder covers the folders inside it). A connection that matches \
+                 any of them gets the limits ticked below, whatever its own settings say. \
+                 Changes apply to connections opened from now on.";
+    loop {
+        if DIALOG_OPEN.get() {
+            return;
+        }
+        let (hosts, tags, folders) = (
+            words_text(&rule.hosts),
+            words_text(&rule.tags),
+            words_text(&rule.folders),
+        );
+        let flags = rule.limits.flags();
+        let checks: Vec<(&str, bool)> = LIMITS
+            .iter()
+            .zip(flags)
+            .map(|((label, _), on)| (*label, on))
+            .collect();
+        DIALOG_OPEN.set(true);
+        let answer = crate::fields_view::ask(
+            hwnd,
+            &crate::fields_view::Ask {
+                title: &title,
+                intro,
+                fields: &[("Hosts", &hosts), ("Tags", &tags), ("Folders", &folders)],
+                checks: &checks,
+                option: original.as_ref().map(|_| ("Delete this rule", false)),
+                ok: "Save",
+                cancel: "Cancel",
+            },
+        );
+        DIALOG_OPEN.set(false);
+        let Some(answer) = answer else {
+            return;
+        };
+        let mut f = answer.fields.iter();
+        rule = SecurityRule {
+            hosts: words(f.next().map_or("", String::as_str)),
+            tags: words(f.next().map_or("", String::as_str)),
+            folders: words(f.next().map_or("", String::as_str)),
+            limits: Policy::from_flags(&answer.checks),
+        };
+        if answer.option
+            && let (Some(i), Some(o)) = (index, &original)
+        {
+            // The same question as the page's Delete..., naming the
+            // connections that lose the limits.
+            let question = with_window(|w| {
+                w.rule_rows()
+                    .into_iter()
+                    .find(|r| r.index == i && &r.rule == o)
+                    .map(|r| crate::rules_view::delete_question(&r))
+            })
+            .flatten()
+            .unwrap_or_else(|| {
+                format!(
+                    "Delete security rule {} ({})?",
+                    i + 1,
+                    crate::ssh::sanitize_line(&o.describe_match())
+                )
+            });
+            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+                continue;
+            }
+            let lost = std::cell::Cell::new(false);
+            let saved = save_rules(hwnd, |rules| match find_rule(rules, i, o) {
+                Some(at) => {
+                    rules.remove(at);
+                }
+                None => lost.set(true),
+            });
+            if lost.get() {
+                dialog(hwnd, RULE_CHANGED, MB_OK | MB_ICONWARNING);
+                return;
+            }
+            if saved {
+                return;
+            }
+            continue;
+        }
+        if rule.hosts.is_empty() && rule.tags.is_empty() && rule.folders.is_empty() {
+            dialog(
+                hwnd,
+                "Name the connections the rule is for: a host pattern, a tag or a folder.",
+                MB_OK | MB_ICONWARNING,
+            );
+            continue;
+        }
+        if rule.limits.is_empty() {
+            dialog(hwnd, "Tick at least one limit.", MB_OK | MB_ICONWARNING);
+            continue;
+        }
+        let new = rule.clone();
+        let old = original.clone();
+        let lost = std::cell::Cell::new(false);
+        let saved = save_rules(hwnd, |rules| match (index, &old) {
+            // Edited where it is now; one changed or deleted elsewhere
+            // meanwhile is left alone (never added a second time).
+            (Some(i), Some(old)) => match find_rule(rules, i, old) {
+                Some(at) => {
+                    if let Some(r) = rules.get_mut(at) {
+                        *r = new;
+                    }
+                }
+                None => lost.set(true),
+            },
+            _ => rules.push(new),
+        });
+        if lost.get() {
+            dialog(hwnd, RULE_CHANGED, MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if saved {
+            return;
+        }
+        // Not saved: the form again, with what was typed.
+    }
+}
+
 /// Opens credential `original` (or a new one) to change, rename or
 /// delete; saves what is typed once it checks out.
 fn edit_credential(hwnd: HWND, original: Option<String>) {
@@ -23452,6 +23772,7 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
                     ("Key file", &typed.key),
                     ("Password", &typed.source),
                 ],
+                checks: &[],
                 option: original.as_ref().map(|_| ("Delete this credential", false)),
                 ok: "Save",
                 cancel: "Cancel",
@@ -23737,6 +24058,7 @@ fn edit_many(hwnd: HWND, names: Vec<String>, field: crate::bulk_edit::EditField)
                 title: &title,
                 intro: &intro,
                 fields: &[(field.label(), &typed)],
+                checks: &[],
                 option: None,
                 ok: "Preview",
                 cancel: "Cancel",
@@ -23844,6 +24166,7 @@ fn is_side_pane(id: u32) -> bool {
             | cmd::KNOWN_HOSTS
             | cmd::INVENTORY
             | cmd::CREDENTIAL_MANAGER
+            | cmd::SECURITY_RULES
     )
 }
 
@@ -24074,6 +24397,9 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
                 if with_window(|w| w.credentials_paste()) == Some(true) {
                     credential_panel::paste(&text);
+                }
+                if with_window(|w| w.rules_paste()) == Some(true) {
+                    rules_panel::paste(&text);
                 }
                 return;
             }
@@ -24410,6 +24736,43 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::Notice(text) => {
             dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
         }
+        Command::ConfirmRdp {
+            name,
+            addr,
+            size,
+            clipboard,
+        } => {
+            let question = format!(
+                "A security rule asks before connecting to {}. Open Remote Desktop to {}?",
+                crate::ssh::sanitize_line(&name),
+                crate::ssh::sanitize_line(&addr)
+            );
+            match dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
+                Some(IDYES) => {
+                    if let Err(e) = launch_rdp_client(&addr, size, clipboard) {
+                        dialog(
+                            hwnd,
+                            &format!("Remote Desktop Connection (mstsc.exe) did not start: {e}"),
+                            MB_OK | MB_ICONINFORMATION,
+                        );
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    // Another dialog is open: ask once it has closed.
+                    with_window(|w| {
+                        w.workspace_asks.push(Command::ConfirmRdp {
+                            name,
+                            addr,
+                            size,
+                            clipboard,
+                        });
+                    });
+                    // SAFETY: our window; replaces any earlier timer with this id.
+                    unsafe { SetTimer(Some(hwnd), TIMER_WORKSPACE_ASK, 500, None) };
+                }
+            }
+        }
         Command::WriteLibrary => write_library(hwnd),
         Command::PickStandbyHotkey => {
             let text = "After OK, press the hotkey you want for the standby window, such as \
@@ -24560,6 +24923,7 @@ fn run_command(hwnd: HWND, command: Command) {
                     title: "Share this session",
                     intro: &intro,
                     fields: &[("Session", &session), ("Accounts (optional)", "")],
+                    checks: &[],
                     option: Some(("Let them type (they can also run commands as you)", false)),
                     ok: "Share",
                     cancel: "Cancel",
@@ -24595,6 +24959,7 @@ fn run_command(hwnd: HWND, command: Command) {
                             resizes, closes or rearranges their windows. Leave Session empty \
                             to pick one.",
                     fields: &[("Shared by account", ""), ("Session (optional)", "")],
+                    checks: &[],
                     option: Some(("Type into it too", false)),
                     ok: "Join",
                     cancel: "Cancel",
@@ -26701,6 +27066,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && with_window(|w| w.credentials_native()) == Some(true) => {
                         credential_panel::focus_search();
                     }
+                    1 if want && with_window(|w| w.rules_native()) == Some(true) => {
+                        rules_panel::focus_search();
+                    }
                     1 if want && scripts => scripts_panel::focus_first(),
                     1 if want && editor => script_editor::focus_first(),
                     1 if want && args => script_args::focus_first(),
@@ -26845,6 +27213,7 @@ mod tests {
             cmd::KNOWN_HOSTS,
             cmd::INVENTORY,
             cmd::CREDENTIAL_MANAGER,
+            cmd::SECURITY_RULES,
         ] {
             assert!(is_side_pane(id), "{id}");
         }
