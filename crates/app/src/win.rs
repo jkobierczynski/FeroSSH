@@ -12241,8 +12241,8 @@ impl Window {
     }
 
     /// Reads the theme rules, themes and fonts again for Tools > Theme
-    /// manager, and shows them: what another FeroSSH changed in a shared
-    /// settings file first, as a save would.
+    /// manager, and shows them (after what the shared vault brings in,
+    /// as a save would: its host profiles and credentials).
     fn reload_themes(&mut self) {
         self.pull_vault_settings();
         // The themes folder too, so a theme file copied in shows (and a
@@ -19732,6 +19732,11 @@ impl Window {
                 let _ = CheckMenuRadioItem(menu, first, last, checked, MF_BYCOMMAND.0);
             }
         }
+        // The items moved: what the owner-drawn menu recorded for each
+        // place (and the command palette reads) is taken again, also
+        // when this runs with the menu closed (a theme saved, the theme
+        // manager's reload).
+        ui_theme::own_popup(menu);
     }
 
     /// Picks custom theme `id` for `pane`: its colours, its font if it
