@@ -1347,11 +1347,19 @@ fn security_line(r: &mut SecurityRule, keyword: &str, args: Vec<String>, line: &
 }
 
 /// A rule line kept as written: trimmed, tabs inside kept (they may
-/// separate a keyword from its value), other control characters dropped.
+/// separate a keyword from its value), other control characters shown as
+/// U+FFFD. Replaced, not dropped, so that `ye\0s` never becomes `yes`
+/// on the next read.
 fn kept_line(line: &str) -> String {
     line.trim()
         .chars()
-        .filter(|c| *c == '\t' || !c.is_control())
+        .map(|c| {
+            if c != '\t' && c.is_control() {
+                char::REPLACEMENT_CHARACTER
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -3628,6 +3636,12 @@ DesktopShareSelection yes
         let again = Settings::parse(&s.to_text());
         assert_eq!(again.security_rules, s.security_rules);
         assert!(s.to_text().contains("    X11Forwarding no\n"));
+        // A control character in a value never joins it into a known one.
+        let s = Settings::parse("SecurityRule\n    Tags lab\n    KeysOnly ye\0s\n");
+        assert!(!s.security_rules[0].limits.keys_only);
+        let again = Settings::parse(&s.to_text());
+        assert!(!again.security_rules[0].limits.keys_only);
+        assert_eq!(again.security_rules[0].unknown.len(), 1);
     }
 
     #[test]

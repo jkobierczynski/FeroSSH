@@ -7566,6 +7566,12 @@ impl Window {
             crate::ssh::sanitize_line(&lines.join("; "))
         );
         self.show(id, &text);
+        // The login session of a desktop or remote app is hidden and goes
+        // once the app holds the connection: shown in a tab instead, so
+        // the warning is seen and stays.
+        if self.launch_hidden.contains(&id) {
+            self.reveal_launch(id);
+        }
     }
 
     /// Whether `destination` logs in over SSH: not a serial port, a
@@ -24071,7 +24077,13 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
             // Lines the form cannot show stay as they were.
             unknown: rule.unknown.clone(),
         };
-        if rule.hosts.is_empty() && rule.tags.is_empty() && rule.folders.is_empty() {
+        // A rule kept with lines not understood (perhaps naming its
+        // connections in a newer way) may be saved as it is.
+        if rule.hosts.is_empty()
+            && rule.tags.is_empty()
+            && rule.folders.is_empty()
+            && rule.unknown.is_empty()
+        {
             dialog(
                 hwnd,
                 "Name the connections the rule is for: a host pattern, a tag or a folder.",
