@@ -23565,9 +23565,7 @@ fn hosts_event(hwnd: HWND, event: hosts_panel::Event) {
                 w.show_side(SideView::Sessions, true);
                 w.update_menu_checks();
             });
-            // `addr:` is the whole address (an IP however it is
-            // written), so db.example does not bring db.example.backup.
-            conn_view::set_search(&format!("addr:{address}"));
+            conn_view::set_search(&crate::hosts_view::connections_search(&address));
         }
         Event::Reload => {
             with_window(|w| {

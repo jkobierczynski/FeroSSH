@@ -106,6 +106,21 @@ fn push_new<T: PartialEq>(list: &mut Vec<T>, v: T) {
     }
 }
 
+/// The connection manager search that lists a host's connections:
+/// `addr:` is the whole address (an IP however it is written), so
+/// db.example does not bring db.example.backup. One longer than a search
+/// can be ends in `*` where it is cut, so the box shows what it finds.
+pub fn connections_search(address: &str) -> String {
+    let max = ferossh_config::host_query::MAX_SAVED_LEN;
+    let whole = format!("addr:{address}");
+    if whole.chars().count() <= max {
+        return whole;
+    }
+    let mut cut: String = whole.chars().take(max - 1).collect();
+    cut.push('*');
+    cut
+}
+
 /// The inventory's connection rows taken together by the machine they
 /// reach, sorted by address.
 pub fn hosts(rows: &[Connection]) -> Vec<Host> {
@@ -463,5 +478,17 @@ mod tests {
         assert_eq!(s, "2 hosts, 4 connections.");
         let one = summary(&shown[..1], 2);
         assert_eq!(one, "1 of 2 hosts, 2 connections.");
+    }
+
+    #[test]
+    fn connections_search_fits_the_search_box() {
+        use ferossh_config::host_query::MAX_SAVED_LEN;
+        assert_eq!(connections_search("db.example"), "addr:db.example");
+        let long = format!("{}.example", "a".repeat(70));
+        let q = connections_search(&long);
+        assert_eq!(q.chars().count(), MAX_SAVED_LEN);
+        assert!(q.ends_with('*'));
+        let fits = "b".repeat(MAX_SAVED_LEN - 5);
+        assert_eq!(connections_search(&fits), format!("addr:{fits}"));
     }
 }
