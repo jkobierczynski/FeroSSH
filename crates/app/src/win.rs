@@ -23531,6 +23531,9 @@ fn inventory_event(hwnd: HWND, event: inventory_panel::Event) {
                 return;
             }
             let next = with_window(|w| {
+                // A read still under way would write its OS back.
+                w.system_reads
+                    .retain(|_, r| !r.alias.eq_ignore_ascii_case(&name));
                 w.update_inventory(Some(InventoryFix::Remove(vec![name])), |_| {});
                 w.reload_inventory();
                 std::mem::take(&mut w.queued)
