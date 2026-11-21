@@ -2200,12 +2200,27 @@ fn write_app_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Saved connection `alias`: the team library's when it is one of its
+/// connections (a local one of that name is not used), else the user's
+/// own.
+fn saved_for(settings: &Settings, alias: &str) -> Option<SavedHost> {
+    let hosts = if settings.is_team(alias) {
+        ferossh_config::saved::parse(&settings.team.hosts_text)
+    } else {
+        load_saved()
+    };
+    hosts
+        .into_iter()
+        .find(|h| h.alias.eq_ignore_ascii_case(alias))
+}
+
 /// The hosts the connection manager lists.
 fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
     let includes = ssh_config::DirIncludes {
         home: env.home.clone(),
     };
     let saved = load_saved();
+    let team = ferossh_config::saved::parse(&settings.team.hosts_text);
     ssh_config::hosts(&env.config, &includes)
         .into_iter()
         .map(|h| {
@@ -2215,7 +2230,12 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 .unwrap_or_default();
             if kind == SessionKind::WinRm {
                 // As connect() resolves it: the saved user and port.
-                let own = saved.iter().find(|s| s.alias.eq_ignore_ascii_case(&h.name));
+                let from = if settings.is_team(&h.name) {
+                    &team
+                } else {
+                    &saved
+                };
+                let own = from.iter().find(|s| s.alias.eq_ignore_ascii_case(&h.name));
                 let https = settings.profile(&h.name).is_some_and(|p| p.winrm_https);
                 let target = WinrmTarget::resolve(&h.name, env, None, https, own).map(|t| {
                     t.with_login_user(
@@ -7377,14 +7397,7 @@ impl Window {
     /// connections (a local one of that name is not used), else the
     /// user's own.
     fn saved_of(&self, alias: &str) -> Option<ferossh_config::saved::SavedHost> {
-        let hosts = if self.settings.is_team(alias) {
-            ferossh_config::saved::parse(&self.settings.team.hosts_text)
-        } else {
-            load_saved()
-        };
-        hosts
-            .into_iter()
-            .find(|h| h.alias.eq_ignore_ascii_case(alias))
+        saved_for(&self.settings, alias)
     }
 
     fn winrm_target(&self, destination: &str, env: &Env) -> Option<WinrmTarget> {
@@ -8028,9 +8041,7 @@ impl Window {
                 // removed or replaced since leaves no user of its own behind.
                 if target.saved {
                     let alias = target.alias.clone();
-                    let saved = load_saved()
-                        .into_iter()
-                        .find(|h| h.alias.eq_ignore_ascii_case(&alias));
+                    let saved = self.saved_of(&alias);
                     let own = WinrmTarget::resolve(
                         &alias,
                         &ssh_env(),
@@ -15724,9 +15735,7 @@ impl Window {
     /// Saved WinRM connection `name` as the settings describe it now: its
     /// current host, port and transport.
     fn saved_winrm_target(&self, name: &str) -> Option<WinrmTarget> {
-        let saved = load_saved()
-            .into_iter()
-            .find(|h| h.alias.eq_ignore_ascii_case(name));
+        let saved = self.saved_of(name);
         let https = self.settings.profile(name).is_some_and(|p| p.winrm_https);
         WinrmTarget::resolve(name, &ssh_env(), None, https, saved.as_ref()).map(|t| {
             t.with_login_user(
@@ -24165,18 +24174,35 @@ fn team_library_settings(hwnd: HWND) {
                 continue;
             }
         }
-        with_window(|w| {
+        let saved = with_window(|w| {
+            let before = (
+                w.settings.team_library.clone(),
+                w.settings.team_library_keys.clone(),
+            );
             w.settings.team_library = Some(library).filter(|l| !l.is_empty());
             w.settings.team_library_keys = if w.settings.team_library.is_some() {
                 keys
             } else {
                 Vec::new()
             };
-            w.save_settings();
-            // Said again if it still fails.
-            w.team_note = None;
-            w.refresh_team();
+            let saved = w.try_save_settings();
+            if saved.is_err() {
+                (w.settings.team_library, w.settings.team_library_keys) = before;
+            } else {
+                // Said again if it still fails.
+                w.team_note = None;
+                w.refresh_team();
+            }
+            saved
         });
+        if let Some(Err(e)) = saved {
+            dialog(
+                hwnd,
+                &format!("Could not save the settings: {e}"),
+                MB_OK | MB_ICONERROR,
+            );
+            continue;
+        }
         let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
         run_commands(hwnd, next);
         return;
