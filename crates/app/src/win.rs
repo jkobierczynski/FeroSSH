@@ -7739,6 +7739,12 @@ impl Window {
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
         let policy = self.apply_policy(id, &target.alias, &target.hostname, target.tag.as_deref());
+        // A jump host's rule lines not understood are said too, also when
+        // this pane shares a connection already open; its limits stay its
+        // own.
+        for j in &target.jumps {
+            self.warn_rule_lines_for(id, &j.alias, &j.hostname, j.tag.as_deref(), true);
+        }
         let x11 = target
             .forward_x11
             .then(|| self.x11_auth(id, shared))
@@ -7786,11 +7792,6 @@ impl Window {
                     (t.alias.clone(), t.hostname.clone(), t.tag.clone())
                 })
                 .collect();
-            // A jump host's rule lines not understood are said too; its
-            // limits stay its own.
-            for (a, h, t) in &hop_targets {
-                self.warn_rule_lines_for(id, a, h, t.as_deref(), true);
-            }
             let hop_policies: Vec<Policy> = hop_targets
                 .into_iter()
                 .map(|(a, h, t)| self.policy_of(&a, Some(&h), t.as_deref()))
