@@ -16161,11 +16161,17 @@ impl Window {
     }
 
     /// Reads the hosts again after a session was saved or deleted.
-    /// Takes in host profiles another PC changed in a shared vault, and
-    /// shows them in the connection list.
+    /// Takes in host profiles, credentials, rules and saved searches that
+    /// another PC (in a shared vault) or another FeroSSH window changed,
+    /// and shows them: in the connection list, and in the Security rules
+    /// page when it is open. Connections made from now on follow the
+    /// rules taken in.
     fn pull_vault_settings(&mut self) {
         if vault_ui::pull_settings(&mut self.settings) {
             self.reload_sessions(None);
+            if self.rules_native() {
+                rules_panel::set_rows(self.rule_rows());
+            }
         }
     }
 
