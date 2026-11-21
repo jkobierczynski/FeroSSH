@@ -64,6 +64,16 @@ fn hold(path: &Path) -> Option<ProcessLock> {
     lock
 }
 
+/// Holds `file`'s lock (the same kind as a vault's, in the Windows
+/// temporary folder) until the value returned is dropped: another FeroSSH
+/// process on this PC that asks for it waits, so a read, merge and write
+/// of a settings file never interleaves with its own. `None` when it
+/// cannot be had within about two seconds; the caller then does not
+/// merge or write.
+pub fn lock_file(file: &Path) -> Option<impl Sized + use<>> {
+    ProcessLock::take(file, 200)
+}
+
 /// Whether the [`with`] running now holds the vault's lock: a vault is
 /// only written while it does, so two FeroSSH processes never interleave.
 static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

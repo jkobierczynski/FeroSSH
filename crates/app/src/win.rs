@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use ferossh_auth::Broker;
-use ferossh_config::host_policy::{Policy, Subject};
+use ferossh_config::host_policy::{Policy, SecurityRule, Subject};
 use ferossh_config::hotkey::Hotkey;
 use ferossh_config::import::{self, Client};
 use ferossh_config::login::{self, Place, Snippet, Step};
@@ -1031,6 +1031,9 @@ struct Pane {
     cast: Option<Recording>,
     font: FontSpec,
     theme: Theme,
+    /// What enforced theme rules fix on this pane's look; its tabs and
+    /// panes opened from it, and its tmux windows, get the same.
+    lock: look::Lock,
     metrics: CellMetrics,
     /// The pane's area in the client, padding included.
     rect: Rect,
@@ -1532,6 +1535,9 @@ struct Window {
     /// Those of them no tab shows: they show only when the login needs
     /// an answer or fails.
     launch_hidden: HashSet<PaneId>,
+    /// Launch sessions shown because they got a security rule warning:
+    /// they stay in their tab when the desktop or app takes over.
+    launch_warned: HashSet<PaneId>,
     /// Remote Desktop Connections running on a connection's tunnel: the
     /// connection stays while they run.
     mstsc: Vec<(std::process::Child, ChannelId)>,
@@ -2912,6 +2918,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 clip_pane: None,
                 launches: HashMap::new(),
                 launch_hidden: HashSet::new(),
+                launch_warned: HashSet::new(),
                 mstsc: Vec::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
@@ -3147,6 +3154,7 @@ fn new_pane(
         cast: None,
         font,
         theme,
+        lock: look::Lock::default(),
         metrics,
         rect: Rect::default(),
         title: None,
@@ -4315,24 +4323,30 @@ impl Window {
         };
         let mut font = g.font.clone();
         let mut metrics = g.metrics;
+        // The connection's enforced look holds for each of its windows.
+        let lock = g.lock.clone();
         // A saved look never overrides a Production or Staging colour.
-        let theme = look
-            .theme
-            .as_deref()
-            .and_then(Theme::by_name)
-            .filter(|t| g_theme.group() != ThemeGroup::Warning && t.group() != ThemeGroup::Warning)
-            .unwrap_or(g_theme);
+        let theme = lock.theme(
+            look.theme
+                .as_deref()
+                .and_then(Theme::by_name)
+                .filter(|t| {
+                    g_theme.group() != ThemeGroup::Warning && t.group() != ThemeGroup::Warning
+                })
+                .unwrap_or(g_theme),
+        );
         if look.font.is_some() || look.size.is_some() {
-            let wanted = FontSpec::new(
+            let wanted = lock.font(FontSpec::new(
                 look.font.as_deref().unwrap_or(&font.family),
                 look.size.unwrap_or(font.size_pt),
-            );
+            ));
             if let Ok(m) = self.renderer.metrics(&wanted, self.dpi) {
                 font = wanted;
                 metrics = m;
             }
         }
         let mut pane = new_pane(native, font, theme, metrics, scrollback);
+        pane.lock = lock;
         pane.term.resize(usize::from(cols), usize::from(rows));
         pane.host = Host::Tmux { gateway, label };
         pane.hl_host = self.panes.get(&gateway).and_then(|g| g.hl_host.clone());
@@ -4791,6 +4805,9 @@ impl Window {
         self.stop_log(id);
         if let Some(p) = self.panes.get_mut(&id) {
             p.host = Host::Ask(String::new());
+            // The connection's enforced look goes with it; the next one
+            // brings its own.
+            p.lock = look::Lock::default();
             p.desktop = None;
             p.title = None;
             p.cwd = None;
@@ -7305,10 +7322,20 @@ impl Window {
             return Policy::default();
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
-        // The folder the Connection manager shows it in: the team
-        // library's for its connections, a FeroSSH connection's own, else
-        // the one its ssh_config (an import's file) gives it.
-        let folder = self.saved_of(alias).and_then(|h| h.folder).or_else(|| {
+        let folder = self.rule_folder(alias);
+        self.settings.policy(&Subject {
+            name: alias,
+            hostname,
+            tags: &tags,
+            folder: folder.as_deref(),
+        })
+    }
+
+    /// The folder the Connection manager shows connection `alias` in:
+    /// the team library's for its connections, a FeroSSH connection's
+    /// own, else the one its ssh_config (an import's file) gives it.
+    fn rule_folder(&self, alias: &str) -> Option<String> {
+        self.saved_of(alias).and_then(|h| h.folder).or_else(|| {
             let env = ssh_env();
             let includes = ssh_config::DirIncludes {
                 home: env.home.clone(),
@@ -7317,12 +7344,6 @@ impl Window {
                 .into_iter()
                 .find(|h| h.name.eq_ignore_ascii_case(alias))
                 .and_then(|h| h.folder)
-        });
-        self.settings.policy(&Subject {
-            name: alias,
-            hostname,
-            tags: &tags,
-            folder: folder.as_deref(),
         })
     }
 
@@ -7583,7 +7604,75 @@ impl Window {
             self.show(id, &text);
             self.update_menu_checks();
         }
+        self.warn_rule_lines(id, alias, hostname, tag);
         policy
+    }
+
+    /// Says so in pane `id` when a rule for the connection has lines this
+    /// FeroSSH does not understand: a limit it may be meant to have, and
+    /// does not get.
+    fn warn_rule_lines(&mut self, id: PaneId, alias: &str, hostname: &str, tag: Option<&str>) {
+        self.warn_rule_lines_for(id, alias, hostname, tag, false);
+    }
+
+    /// [`Self::warn_rule_lines`] for connection `alias`, a jump host on the
+    /// way when `hop` (named in the warning).
+    fn warn_rule_lines_for(
+        &mut self,
+        id: PaneId,
+        alias: &str,
+        hostname: &str,
+        tag: Option<&str>,
+        hop: bool,
+    ) {
+        // The team library's rules and the user's own.
+        let rules: Vec<SecurityRule> = self
+            .settings
+            .team
+            .security_rules
+            .iter()
+            .chain(&self.settings.security_rules)
+            .filter(|r| !r.unknown.is_empty())
+            .cloned()
+            .collect();
+        if rules.is_empty() {
+            return;
+        }
+        let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
+        let folder = self.rule_folder(alias);
+        let lines = ferossh_config::host_policy::not_understood(
+            &rules,
+            &Subject {
+                name: alias,
+                hostname: Some(hostname),
+                tags: &tags,
+                folder: folder.as_deref(),
+            },
+        );
+        if lines.is_empty() {
+            return;
+        }
+        let whose = if hop {
+            format!("jump host {}", crate::ssh::sanitize_line(alias))
+        } else {
+            "this connection".to_owned()
+        };
+        let text = format!(
+            "\x1b[0;33mA security rule for {whose} has lines this FeroSSH does not \
+             understand, so they are not applied: {}. See Tools > Security rules.\x1b[0m\r\n",
+            crate::ssh::sanitize_line(&lines.join("; "))
+        );
+        self.show(id, &text);
+        // The login session of a desktop or remote app is hidden and goes
+        // once the app holds the connection: shown in a tab instead, so
+        // the warning is seen and stays.
+        if self.launches.contains_key(&id) {
+            // Also one already shown (to confirm the connection, say).
+            self.launch_warned.insert(id);
+            if self.launch_hidden.contains(&id) {
+                self.reveal_launch(id);
+            }
+        }
     }
 
     /// Whether `destination` logs in over SSH: not a serial port, a
@@ -7616,10 +7705,12 @@ impl Window {
             .profile(&alias)
             .and_then(|p| p.scrollback)
             .or(self.settings.scrollback);
+        let lock = look::lock_for(&self.settings, &alias, &target.port, None);
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.set_settings(&term_settings(scrollback));
             p.term.scroll_to_bottom();
             p.hl_host = Some((alias.clone(), target.port.clone()));
+            p.lock = lock;
         }
         self.apply_highlight(id, true);
         self.set_theme(id, theme);
@@ -7746,6 +7837,12 @@ impl Window {
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
         let policy = self.apply_policy(id, &target.alias, &target.hostname, target.tag.as_deref());
+        // A jump host's rule lines not understood are said too, also when
+        // this pane shares a connection already open; its limits stay its
+        // own.
+        for j in &target.jumps {
+            self.warn_rule_lines_for(id, &j.alias, &j.hostname, j.tag.as_deref(), true);
+        }
         let x11 = target
             .forward_x11
             .then(|| self.x11_auth(id, shared))
@@ -7786,13 +7883,14 @@ impl Window {
             if !hops.is_empty() {
                 self.via.insert(channel, hops);
             }
-            let hop_policies: Vec<Policy> = session
+            let hop_targets: Vec<(String, String, Option<String>)> = session
                 .hops_mut()
                 .map(|hop| {
                     let t = &hop.target;
                     (t.alias.clone(), t.hostname.clone(), t.tag.clone())
                 })
-                .collect::<Vec<_>>()
+                .collect();
+            let hop_policies: Vec<Policy> = hop_targets
                 .into_iter()
                 .map(|(a, h, t)| self.policy_of(&a, Some(&h), t.as_deref()))
                 .collect();
@@ -7970,9 +8068,11 @@ impl Window {
             .profile(alias)
             .and_then(|p| p.scrollback)
             .or(self.settings.scrollback);
+        let lock = look::lock_for(&self.settings, alias, hostname, tag);
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.set_settings(&term_settings(scrollback));
             p.hl_host = Some((alias.to_owned(), hostname.to_owned()));
+            p.lock = lock;
         }
         self.apply_highlight(id, true);
         self.set_theme(id, theme.clone());
@@ -11318,12 +11418,19 @@ impl Window {
                     .into(),
             ));
         }
-        let (label, theme) = self.panes.get(&from).map_or_else(
-            || (String::new(), self.default_theme.clone()),
-            |p| (p.host_label(), p.theme.clone()),
+        let (label, theme, lock) = self.panes.get(&from).map_or_else(
+            || {
+                (
+                    String::new(),
+                    self.default_theme.clone(),
+                    look::Lock::default(),
+                )
+            },
+            |p| (p.host_label(), p.theme.clone(), p.lock.clone()),
         );
         let id = self.new_tab_pane();
         if let Some(p) = self.panes.get_mut(&id) {
+            p.lock = lock;
             // The host's look (a Production host stays red), room for the
             // longest diff shown, and never part of a broadcast.
             p.term.set_theme(&theme);
@@ -11346,6 +11453,10 @@ impl Window {
                 shown: None,
                 files: Vec::new(),
             }));
+        }
+        // The enforced font and size too (the lock holds them from now on).
+        if let Some(font) = self.panes.get(&id).map(|p| p.font.clone()) {
+            self.set_font(id, font);
         }
         self.run_diff(id);
         // Keys go to the new tab, not to a tools pane that had them.
@@ -14116,6 +14227,11 @@ impl Window {
             Some(view) => {
                 self.side.view = view;
                 self.side.focused = false;
+                // A save while the palette was open may have merged in
+                // rules from another window or PC.
+                if view == SideView::SecurityRules && self.rules_native() {
+                    rules_panel::set_rows(self.rule_rows());
+                }
                 self.refresh_chrome();
                 self.request_full_redraw();
                 self.refresh(self.focused_id());
@@ -16388,11 +16504,17 @@ impl Window {
     }
 
     /// Reads the hosts again after a session was saved or deleted.
-    /// Takes in host profiles another PC changed in a shared vault, and
-    /// shows them in the connection list.
+    /// Takes in host profiles, credentials, rules and saved searches that
+    /// another PC (in a shared vault) or another FeroSSH window changed,
+    /// and shows them: in the connection list, and in the Security rules
+    /// page when it is open. Connections made from now on follow the
+    /// rules taken in.
     fn pull_vault_settings(&mut self) {
         if vault_ui::pull_settings(&mut self.settings) {
             self.reload_sessions(None);
+            if self.rules_native() {
+                rules_panel::set_rows(self.rule_rows());
+            }
         }
     }
 
@@ -16606,15 +16728,17 @@ impl Window {
                 self.end_host(id);
                 self.panes.remove(&id);
                 self.watches.remove(&id);
-            } else if self.ws.tabs.len() > 1
-                || self.ws.tab().is_some_and(|t| t.root.panes().len() > 1)
+            } else if !self.launch_warned.contains(&id)
+                && (self.ws.tabs.len() > 1
+                    || self.ws.tab().is_some_and(|t| t.root.panes().len() > 1))
             {
                 if let Some(c) = self.close_pane(id) {
                     self.queued.push(c);
                 }
             } else {
-                // The window's only tab: it stays, free for another
-                // connection.
+                // The window's only tab, or one showing a rule warning: it
+                // stays, free for another connection.
+                self.launch_warned.remove(&id);
                 self.end_host(id);
                 self.show(
                     id,
@@ -16627,6 +16751,7 @@ impl Window {
         let panes = &self.panes;
         self.launches.retain(|id, _| panes.contains_key(id));
         self.launch_hidden.retain(|id| panes.contains_key(id));
+        self.launch_warned.retain(|id| panes.contains_key(id));
         if self.mstsc.len() != before {
             self.prune_forwards();
         }
@@ -18910,7 +19035,37 @@ impl Window {
     /// [`Self::save_settings`], with the failure also returned, for callers
     /// that must not go on without the settings saved.
     fn try_save_settings(&mut self) -> std::result::Result<(), String> {
+        // Another FeroSSH window on this PC waits while this one reads,
+        // merges and writes the settings, so neither drops what the other
+        // added. (A file of its own, not the vault's lock, which the vault
+        // takes itself for each read and write.)
+        // With a vault open, the lock is named after the vault, so an
+        // installed and a portable FeroSSH using the same vault wait for
+        // each other too.
+        let lock_on = crate::vault::path().map_or_else(settings_path, |v| {
+            let mut name = v.into_os_string();
+            name.push(".settings");
+            std::path::PathBuf::from(name)
+        });
+        let Some(_lock) = crate::vault::lock_file(&lock_on) else {
+            // Saving anyway could write over what the other window is
+            // merging in; this window's settings stay as they are and the
+            // next save tries again.
+            let e = "Could not save settings: another FeroSSH window is \
+                     saving them. Try again in a moment."
+                .to_owned();
+            let id = self.focused_id();
+            self.show(id, &format!("\r\n\x1b[0;31m{e}\x1b[0m\r\n"));
+            self.refresh(id);
+            return Err(e);
+        };
+        let rules = self.settings.security_rules.clone();
         vault_ui::sync_settings(&mut self.settings);
+        // Rules the merge brought in show at once: the next focus finds
+        // nothing new to take in.
+        if self.settings.security_rules != rules && self.rules_native() {
+            rules_panel::set_rows(self.rule_rows());
+        }
         // Window colours shown by a menu preview are not saved.
         let shown = self.settings.window_colours;
         if let Some(p) = self
@@ -18963,6 +19118,9 @@ impl Window {
         // return their choice send no WM_COMMAND).
         self.end_look_preview(Some(id));
         let pane = self.focused_id();
+        if let Some(why) = self.look_refused(pane, id) {
+            return Some(Command::Notice(why));
+        }
         match id {
             cmd::EXIT => return Some(Command::Exit),
             cmd::CLOSE_TAB => return Some(Command::CloseTab(self.ws.active)),
@@ -19896,6 +20054,11 @@ impl Window {
     /// or loses cells right away, so a shell started next (the pty-req of
     /// a new connection) gets the rows and columns that fit.
     fn set_font(&mut self, id: PaneId, font: FontSpec) {
+        // An enforced theme rule's font and size stay.
+        let font = match self.panes.get(&id) {
+            Some(p) => p.lock.font(font),
+            None => font,
+        };
         let Ok(metrics) = self.renderer.metrics(&font, self.dpi) else {
             return;
         };
@@ -19909,6 +20072,8 @@ impl Window {
 
     fn set_theme(&mut self, id: PaneId, theme: Theme) {
         if let Some(p) = self.panes.get_mut(&id) {
+            // An enforced theme rule's theme stays.
+            let theme = p.lock.theme(theme);
             p.term.set_theme(&theme);
             p.theme = theme;
         }
@@ -19919,7 +20084,7 @@ impl Window {
     /// answering colour queries with the committed one.
     fn show_theme(&mut self, id: PaneId, theme: Theme) {
         if let Some(p) = self.panes.get_mut(&id) {
-            p.theme = theme;
+            p.theme = p.lock.theme(theme);
         }
         self.update_menu_checks();
     }
@@ -19957,6 +20122,21 @@ impl Window {
             }
         }
         (font, theme)
+    }
+
+    /// Why menu item `id` may not change pane `pane`'s look: an enforced
+    /// theme rule fixes the theme (Settings > Theme, a custom theme), the
+    /// font (Settings > Font) or the size (zoom).
+    fn look_refused(&self, pane: PaneId, id: u32) -> Option<String> {
+        let lock = &self.panes.get(&pane)?.lock;
+        let theme = (cmd::THEME..cmd::THEME + Theme::builtin().len() as u32).contains(&id)
+            || self.custom_at(id).is_some();
+        let family = (cmd::FONT..cmd::FONT + FONT_CHOICES.len() as u32).contains(&id);
+        let size = matches!(id, cmd::ZOOM_IN | cmd::ZOOM_OUT | cmd::ZOOM_RESET);
+        let refused = (theme && lock.theme.is_some())
+            || (family && lock.font.is_some())
+            || (size && lock.size.is_some());
+        refused.then(|| lock.why())
     }
 
     /// The custom theme behind menu id `id`, by its place in the list.
@@ -20128,7 +20308,11 @@ impl Window {
         };
         // A choice applies to the focused pane: a preview on another one
         // (focus moved meanwhile) goes back.
-        let chosen = chosen.filter(|_| self.focused_id() == p.pane);
+        // A pick an enforced theme rule refuses is no choice: what the
+        // preview showed goes back (window colours included).
+        let chosen = chosen
+            .filter(|_| self.focused_id() == p.pane)
+            .filter(|id| self.look_refused(p.pane, *id).is_none());
         let back = |by: Option<u32>| by.is_some() && by != chosen;
         // Only what the preview itself shows goes back.
         let theme_now = self.panes.get(&p.pane).map(|x| &x.theme);
@@ -24304,6 +24488,17 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
                  work; a folder covers the folders inside it). A connection that matches \
                  any of them gets the limits ticked below, whatever its own settings say. \
                  Changes apply to connections opened from now on.";
+    let odd = original
+        .as_ref()
+        .filter(|r| !r.unknown.is_empty())
+        .map(|r| {
+            format!(
+                "{intro}\n\nThis rule also has lines this FeroSSH does not understand, kept in \
+                 the file as they are but not applied: {}.",
+                crate::ssh::sanitize_line(&r.unknown.join("; "))
+            )
+        });
+    let intro = odd.as_deref().unwrap_or(intro);
     loop {
         if DIALOG_OPEN.get() {
             return;
@@ -24342,8 +24537,16 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
             tags: words(f.next().map_or("", String::as_str)),
             folders: words(f.next().map_or("", String::as_str)),
             limits: Policy::from_flags(&answer.checks),
+            // Lines the form cannot show stay as they were.
+            unknown: rule.unknown.clone(),
         };
-        if rule.hosts.is_empty() && rule.tags.is_empty() && rule.folders.is_empty() {
+        // A rule kept with lines not understood (perhaps naming its
+        // connections in a newer way) may be saved as it is.
+        if rule.hosts.is_empty()
+            && rule.tags.is_empty()
+            && rule.folders.is_empty()
+            && rule.unknown.is_empty()
+        {
             dialog(
                 hwnd,
                 "Name the connections the rule is for: a host pattern, a tag or a folder.",
@@ -24351,7 +24554,9 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
             );
             continue;
         }
-        if rule.limits.is_empty() {
+        // A rule with lines not understood keeps them: it may still be
+        // saved with no limit ticked here.
+        if rule.limits.is_empty() && rule.unknown.is_empty() {
             dialog(hwnd, "Tick at least one limit.", MB_OK | MB_ICONWARNING);
             continue;
         }
@@ -24535,6 +24740,7 @@ fn edit_theme_rule(
             theme: r.theme.clone(),
             font: r.font.clone().unwrap_or_default(),
             size: r.font_size.map(|s| s.to_string()).unwrap_or_default(),
+            enforce: r.enforce,
         },
         None => Typed {
             theme: theme.unwrap_or_default(),
@@ -24551,7 +24757,10 @@ fn edit_theme_rule(
                  them opens with the theme, font and size set here, unless the connection \
                  sets its own. Leave any of the three empty to keep what it would get \
                  anyway. The first rule that sets each wins. Names as the Theme manager \
-                 lists them; changes apply to connections opened from now on.";
+                 lists them; changes apply to connections opened from now on. Enforced: \
+                 what the rule sets beats the connection's own look and cannot be changed \
+                 on its panes, on the tabs and panes opened from them, or in its tmux \
+                 windows.";
     loop {
         if DIALOG_OPEN.get() {
             return;
@@ -24569,7 +24778,10 @@ fn edit_theme_rule(
                     ("Font", &typed.font),
                     ("Font size (points)", &typed.size),
                 ],
-                checks: &[],
+                checks: &[(
+                    "Enforce: the connections cannot change this look",
+                    typed.enforce,
+                )],
                 option: original.as_ref().map(|_| ("Delete this rule", false)),
                 ok: "Save",
                 cancel: "Cancel",
@@ -24586,6 +24798,7 @@ fn edit_theme_rule(
             theme: f.next().unwrap_or_default(),
             font: f.next().unwrap_or_default(),
             size: f.next().unwrap_or_default(),
+            enforce: answer.checks.first().copied().unwrap_or(false),
         };
         if answer.option
             && let (Some(i), Some(o)) = (index, &original)

@@ -6,6 +6,8 @@
 //! line such as
 //! `Tag production` both groups the hosts for OpenSSH's `Match tagged` and
 //! colours FeroSSH's panes. The first matching rule wins, like ssh_config.
+//! The built-in tag rules come first and are enforced: no rule, connection
+//! look or pane setting overrides them.
 
 use crate::pattern::{match_host, match_pattern};
 
@@ -25,6 +27,11 @@ pub struct ThemeRule {
     pub font: Option<String>,
     /// The font size in points, unless the connection sets one.
     pub font_size: Option<f32>,
+    /// What it sets cannot be changed: not by the connection's own look,
+    /// nor on its panes, the tabs and panes opened from them or its tmux
+    /// windows (Settings > Theme and Font, zoom, workspaces). An earlier
+    /// enforced rule wins over a later one.
+    pub enforce: bool,
 }
 
 impl ThemeRule {
@@ -36,7 +43,14 @@ impl ThemeRule {
             tint: None,
             font: None,
             font_size: None,
+            enforce: false,
         }
+    }
+
+    /// Makes it enforced (see [`ThemeRule::enforce`]).
+    pub fn enforced(mut self) -> Self {
+        self.enforce = true;
+        self
     }
 
     pub fn font(mut self, family: &str, size: Option<f32>) -> Self {
@@ -73,6 +87,9 @@ impl ThemeRule {
             (Some(f), None) => parts.push(f.clone()),
             (None, Some(s)) => parts.push(format!("{s} pt")),
             (None, None) => {}
+        }
+        if self.enforce && !parts.is_empty() {
+            parts.push("enforced".to_owned());
         }
         parts.join(", ")
     }
@@ -112,7 +129,8 @@ impl ThemeRule {
     }
 }
 
-/// The user's rules, then the built-in tag rules.
+/// The built-in tag rules (enforced, so nothing overrides them), then
+/// the user's rules.
 #[derive(Clone, Debug, Default)]
 pub struct HostThemes {
     rules: Vec<ThemeRule>,
@@ -125,7 +143,7 @@ impl HostThemes {
         Self { rules: Vec::new() }
     }
 
-    /// Adds a user rule. User rules are tried in the order added, before
+    /// Adds a user rule. User rules are tried in the order added, after
     /// the built-in ones.
     pub fn push(&mut self, rule: ThemeRule) {
         self.rules.push(rule);
@@ -162,15 +180,68 @@ impl HostThemes {
         tags: &[&str],
         sets: impl Fn(&ThemeRule) -> bool,
     ) -> Option<&ThemeRule> {
-        self.rules
+        // The built-in tag rules are enforced and come first; then the
+        // user's in order.
+        builtin_rules()
             .iter()
-            .chain(builtin_rules())
+            .chain(&self.rules)
             .find(|r| sets(r) && hosts.iter().any(|h| r.matches(h, tags)))
     }
 
-    /// The built-in tag rules, after the user's.
+    /// What the enforced rules that match fix: each of theme, font and
+    /// size from the first enforced rule that sets it.
+    pub fn enforced(&self, hosts: &[&str], tags: &[&str]) -> Enforced {
+        // The built-in tag rules first: nothing overrides them.
+        let first = |sets: &dyn Fn(&ThemeRule) -> bool| {
+            builtin_rules()
+                .iter()
+                .chain(&self.rules)
+                .find(|r| r.enforce && sets(r) && hosts.iter().any(|h| r.matches(h, tags)))
+        };
+        let theme = first(&|r| !r.theme.is_empty());
+        Enforced {
+            builtin: theme.is_some_and(|r| builtin_rules().iter().any(|b| std::ptr::eq(b, r))),
+            theme: theme.map(|r| (r.theme.clone(), r.tint)),
+            font: first(&|r| r.font.is_some()).and_then(|r| r.font.clone()),
+            size: first(&|r| r.font_size.is_some()).and_then(|r| r.font_size),
+            rule: [
+                theme,
+                first(&|r| r.font.is_some()),
+                first(&|r| r.font_size.is_some()),
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+            .map(ThemeRule::describe_match),
+        }
+    }
+
+    /// The built-in tag rules: enforced, and tried before the user's.
     pub fn builtin() -> &'static [ThemeRule] {
         builtin_rules()
+    }
+}
+
+/// A background tint: colour and strength 0-255.
+pub type Tint = ([u8; 3], u8);
+
+/// What enforced theme rules fix for one host (see
+/// [`HostThemes::enforced`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Enforced {
+    /// The theme and its tint.
+    pub theme: Option<(String, Option<Tint>)>,
+    pub font: Option<String>,
+    pub size: Option<f32>,
+    /// What the first of those rules matches (`tags prod`), to name it.
+    pub rule: Option<String>,
+    /// The theme comes from a built-in tag rule, which cannot be changed.
+    pub builtin: bool,
+}
+
+impl Enforced {
+    pub fn is_empty(&self) -> bool {
+        self.theme.is_none() && self.font.is_none() && self.size.is_none()
     }
 }
 
@@ -179,9 +250,15 @@ fn builtin_rules() -> &'static [ThemeRule] {
     static RULES: OnceLock<[ThemeRule; 3]> = OnceLock::new();
     RULES.get_or_init(|| {
         [
-            ThemeRule::new("Production").tags(&["production", "prod"]),
-            ThemeRule::new("Staging").tags(&["staging", "stage"]),
-            ThemeRule::new("Nord").tags(&["development", "dev"]),
+            ThemeRule::new("Production")
+                .tags(&["production", "prod"])
+                .enforced(),
+            ThemeRule::new("Staging")
+                .tags(&["staging", "stage"])
+                .enforced(),
+            ThemeRule::new("Nord")
+                .tags(&["development", "dev"])
+                .enforced(),
         ]
     })
 }
@@ -213,6 +290,37 @@ mod tests {
     }
 
     #[test]
+    fn enforced_rules_fix_each_field_from_the_first_that_sets_it() {
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("Dracula").tags(&["lab"]));
+        t.push(ThemeRule::new("Production").tags(&["pci"]).enforced());
+        t.push(
+            ThemeRule::new("")
+                .tags(&["pci"])
+                .font("Consolas", Some(12.0))
+                .enforced(),
+        );
+        let e = t.enforced(&["db1"], &["pci", "lab"]);
+        assert_eq!(e.theme, Some(("Production".to_owned(), None)));
+        assert_eq!(e.font.as_deref(), Some("Consolas"));
+        assert_eq!(e.size, Some(12.0));
+        assert_eq!(e.rule.as_deref(), Some("tags pci"));
+        assert!(t.enforced(&["db1"], &["lab"]).is_empty());
+        // A built-in tag rule comes before every enforced rule of the user's.
+        t.push(ThemeRule::new("Dracula").tags(&["prod"]).enforced());
+        let e = t.enforced(&["db1"], &["prod"]);
+        assert_eq!(e.theme, Some(("Production".to_owned(), None)));
+        assert_eq!(e.rule.as_deref(), Some("tags production prod"));
+        assert_eq!(
+            ThemeRule::new("Production")
+                .tags(&["prod"])
+                .enforced()
+                .describe_look(),
+            "Production, enforced"
+        );
+    }
+
+    #[test]
     fn builtin_tags() {
         let t = HostThemes::new();
         assert_eq!(theme(&t, "db1", &["production"]), Some("Production"));
@@ -237,8 +345,13 @@ mod tests {
         let r = t.rule_for("db.prod.example.com", &[]);
         assert_eq!(r.map(|r| r.tint), Some(Some(([0x80, 0, 0], 60))));
         assert_eq!(theme(&t, "x", &["qa-eu"]), Some("Staging"));
-        // A user host rule beats a built-in tag.
-        assert_eq!(theme(&t, "prod-web", &["dev"]), Some("Dracula"));
+        // A built-in tag beats every user rule: it cannot be overridden.
+        assert_eq!(theme(&t, "prod-web", &["dev"]), Some("Nord"));
+        assert_eq!(theme(&t, "prod-web", &[]), Some("Dracula"));
+        assert_eq!(
+            t.enforced(&["prod-web"], &["prod"]).theme,
+            Some(("Production".to_owned(), None))
+        );
         assert_eq!(theme(&t, "dev-web", &["dev"]), Some("Nord"));
     }
 

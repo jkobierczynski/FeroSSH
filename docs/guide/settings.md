@@ -261,14 +261,14 @@ Only text in the terminal's own colours is recoloured. A rule that does not comp
 
 ## Theme rules
 
-Rules pick a theme, a font and a font size from the host's name or its tags: ssh_config's `Tag` and the profile's own `Tags`. Tools > Theme rules edits these blocks for you and puts them in order. A host's profile wins over the rules, and the rules win over `--theme` and `DefaultTheme`. Each of theme, font and size comes from the first rule that sets it, so a rule may set only a font.
+Rules pick a theme, a font and a font size from the host's name or its tags: ssh_config's `Tag` and the profile's own `Tags`. Tools > Theme rules edits these blocks for you and puts them in order. A host's profile wins over the rules (except an enforced one), and the rules win over `--theme` and `DefaultTheme`. Each of theme, font and size comes from the first rule that sets it, so a rule may set only a font.
 
 ```
 ThemeRule
     Hosts *.prod.example.com !prod-sandbox
     Theme Production
 ThemeRule
-    Tags staging
+    Tags qa
     Theme Nord
     Tint ffb000 40
 ThemeRule
@@ -285,8 +285,9 @@ ThemeRule
 | `Font FAMILY` | The font family to use, unless the connection sets its own. |
 | `FontSize POINTS` | The font size, 4 to 96 points, unless the connection sets its own. |
 | `Tint RRGGBB AMOUNT` | Mixes a colour into the theme by 0 to 255, for example a red tint over your usual theme. |
+| `Enforce yes` | What the rule sets cannot be changed: it beats the connection's own look (`Profile`), and Settings > Theme and Font, zoom, custom themes, workspaces and tmux layouts leave it alone on the connection's panes, the tabs and panes opened from them and its tmux windows. The first enforced rule that sets each of theme, font and size wins. |
 
-Without any rules, hosts tagged `production`, `staging` or `development` get Production, Staging or Nord.
+Hosts tagged `production` or `prod`, `staging` or `stage`, and `development` or `dev` always get Production, Staging or Nord. These built-in rules are enforced and come before yours, so no `ThemeRule`, `Profile` theme or pane setting overrides them; your rules can still set their font and size.
 
 ## Security rules
 
@@ -316,7 +317,9 @@ SecurityRule
 | `ConfirmConnect yes` | FeroSSH asks before connecting, also when only a jump host on the way matches. The question names the user, host and port (a saved Telnet or WinRM connection's own port) and the route there, and if any of that changes before the connection starts, it asks again. A reconnect or a split of a connected pane does not ask again. A direct Remote Desktop connection (one without Via SSH) asks in a message box before Remote Desktop Connection starts. |
 | `LogSession yes` | The session is logged, and Session > Log this session cannot turn it off. If the log cannot be opened, nothing starts on the session (no login script, forwards or tmux) and it disconnects; if a write fails later, it disconnects too. Once the connection ends or you disconnect, Log this session goes back to how you had it. |
 
-A rule needs at least one of `Hosts`, `Tags` or `Folders`, and at least one limit. A connection shows the limits that apply when it starts. The limits cover SSH, Mosh, SFTP and tunnel connections, and the clipboard, confirmation and log limits cover Telnet and WinRM too.
+A rule needs at least one of `Hosts`, `Tags` or `Folders`, and at least one limit. `Tag`, `Host` and `Folder` are read as `Tags`, `Hosts` and `Folders`. A connection shows the limits that apply when it starts.
+
+A line of a rule that FeroSSH does not understand (a keyword from a newer FeroSSH, a misspelling, or a value other than `yes` or `no`, such as `KeysOnly 1`) is never dropped: it stays in the file, and FeroSSH writes it back unchanged. It is not applied, though. Tools > Security rules marks the rule with ⚠ and names the line, and a connection that the rule covers says so in its pane when it starts. The limits cover SSH, Mosh, SFTP and tunnel connections, and the clipboard, confirmation and log limits cover Telnet and WinRM too.
 
 ## Team library
 

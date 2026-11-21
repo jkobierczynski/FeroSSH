@@ -386,7 +386,14 @@ pub fn paste(text: &str) {
 /// Shows `rows` (read afresh). The picked row stays picked when it is
 /// still listed.
 pub fn set_rows(rows: Vec<Row>) {
-    let keep = selected().map(|r| r.index);
+    // The rule picked stays picked where it moved to (another window or
+    // PC may have added or removed one above it); one now gone leaves
+    // its place picked.
+    let keep = selected().map(|r| {
+        rows.iter()
+            .find(|n| n.rule == r.rule)
+            .map_or(r.index, |n| n.index)
+    });
     with(|s| s.rows = rows);
     fill(keep);
 }
