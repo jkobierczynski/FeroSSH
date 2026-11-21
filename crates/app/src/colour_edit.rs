@@ -64,23 +64,16 @@ pub fn hex(c: Rgb) -> String {
     format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)
 }
 
-/// A colour typed as `#RRGGBB`, `RRGGBB` or `#RGB`, spaces around it
-/// ignored.
+/// A colour typed as `#RRGGBB` or `RRGGBB`, spaces around it ignored.
+/// Only the full six digits count: half typed (`#123`), it is no colour
+/// yet, so the field never takes a colour the user did not mean.
 pub fn parse(text: &str) -> Option<Rgb> {
     let t = text.trim();
     let t = t.strip_prefix('#').unwrap_or(t);
-    if !t.chars().all(|c| c.is_ascii_hexdigit()) {
+    if t.len() != 6 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    match t.len() {
-        6 => u32::from_str_radix(t, 16).ok().map(Rgb::hex),
-        3 => {
-            let v = u32::from_str_radix(t, 16).ok()?;
-            let d = |n: u32| ((n & 0xF) * 0x11) as u8;
-            Some(Rgb::new(d(v >> 8), d(v >> 4), d(v)))
-        }
-        _ => None,
-    }
+    u32::from_str_radix(t, 16).ok().map(Rgb::hex)
 }
 
 /// Whether Save may write theme `name` back to its own file: only one
@@ -136,7 +129,8 @@ mod tests {
     fn colours_parse_as_typed() {
         assert_eq!(parse("#88C0D0"), Some(Rgb::hex(0x88C0D0)));
         assert_eq!(parse(" 88c0d0 "), Some(Rgb::hex(0x88C0D0)));
-        assert_eq!(parse("#fa0"), Some(Rgb::new(0xFF, 0xAA, 0x00)));
+        assert_eq!(parse("#fa0"), None, "half typed is no colour yet");
+        assert_eq!(parse("#1234"), None);
         assert_eq!(parse("#12345"), None);
         assert_eq!(parse("#GG0000"), None);
         assert_eq!(parse(""), None);

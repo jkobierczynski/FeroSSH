@@ -58,9 +58,9 @@ pub struct CustomTheme {
     pub window: Option<WindowSpec>,
     /// What was wrong but left out, for the menu to show.
     pub warnings: Vec<String>,
-    /// Its file's name in the themes folder ([`load`] sets it), so the
-    /// colour editor's Save writes it back there.
-    pub file: String,
+    /// Its file ([`load`] sets it; empty for a theme not read from one),
+    /// so the colour editor's Save writes it back there, by its own path.
+    pub path: std::path::PathBuf,
 }
 
 /// A theme file that could not be used: its file name and why.
@@ -248,7 +248,7 @@ pub fn parse(text: &str, fallback: &str) -> Result<CustomTheme, String> {
         size,
         window,
         warnings,
-        file: String::new(),
+        path: std::path::PathBuf::new(),
     })
 }
 
@@ -397,7 +397,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
                 reason: format!("more than {MAX} themes"),
             }),
             Ok(mut t) => {
-                t.file = file;
+                t.path = path;
                 themes.push(t);
             }
             Err(reason) => broken.push(Broken { file, reason }),

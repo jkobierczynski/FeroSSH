@@ -20212,7 +20212,27 @@ impl Window {
         path: &Path,
         name: &str,
     ) -> std::result::Result<String, String> {
-        let own = self.custom_named(original.name).cloned();
+        let mut own = self.custom_named(original.name).cloned();
+        if name == original.name {
+            // Saved over its file: the font and window lines as the file
+            // has them now, and not over colours changed there meanwhile.
+            let now = std::fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| custom_theme::parse(&t, name));
+            match now {
+                Ok(c) if crate::colour_edit::changed(original, &c.theme).is_empty() => {
+                    own = Some(c);
+                }
+                _ => {
+                    return Err(format!(
+                        "{} changed since the colour editor opened, so Save leaves it as it \
+                         is. Save as keeps your colours in a new theme; or cancel and open the \
+                         editor again.",
+                        path.display()
+                    ));
+                }
+            }
+        }
         let text = custom_theme::write(
             name,
             edited,
@@ -20241,6 +20261,10 @@ impl Window {
             }
             for id in &ids {
                 self.set_theme(*id, saved.clone());
+            }
+            // New tabs too, when it is the default theme.
+            if self.default_theme == *original {
+                self.default_theme = saved.clone();
             }
             shown = ids.len();
             if shown > 0 {
@@ -26725,7 +26749,7 @@ fn edit_colours(hwnd: HWND, name: &str) {
     let Some((original, file)) = with_window(|w| match w.custom_named(name) {
         Some(c) => Some((
             c.theme.clone(),
-            Some(c.file.clone()).filter(|f| !f.is_empty()),
+            Some(c.path.clone()).filter(|p| !p.as_os_str().is_empty()),
         )),
         None => Theme::by_name(name).map(|t| (t, None)),
     })
@@ -26750,7 +26774,7 @@ fn edit_colours(hwnd: HWND, name: &str) {
                 if now == original {
                     return;
                 }
-                (themes_dir().join(file), original.name.to_owned())
+                (file.clone(), original.name.to_owned())
             }
             _ => {
                 let suggested = crate::colour_edit::suggested_name(original.name);
@@ -26765,12 +26789,40 @@ fn edit_colours(hwnd: HWND, name: &str) {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                match custom_theme::clean_name(&stem) {
+                // Refused before anything is written: a name the themes
+                // folder cannot list, a file outside it, or a name another
+                // theme file has (the folder would list only one of them).
+                let refused = match custom_theme::clean_name(&stem) {
+                    Err(e) => Err(format!(
+                        "A theme cannot be saved as {stem}: {e}. Pick another file name."
+                    )),
+                    Ok(_) if !in_themes_dir(&path) => Err(format!(
+                        "Themes are read from {} only: save the theme there.",
+                        themes_dir().display()
+                    )),
+                    Ok(n) => {
+                        let taken = with_window(|w| {
+                            w.custom_themes
+                                .iter()
+                                .find(|c| {
+                                    c.theme.name.eq_ignore_ascii_case(&n)
+                                        && !same_file(&c.path, &path)
+                                })
+                                .map(|c| c.path.display().to_string())
+                        })
+                        .flatten();
+                        match taken {
+                            Some(other) => Err(format!(
+                                "{other} already holds a theme named {n}. Pick another file \
+                                 name."
+                            )),
+                            None => Ok(n),
+                        }
+                    }
+                };
+                match refused {
                     Ok(n) => (path, n),
-                    Err(e) => {
-                        let text = format!(
-                            "A theme cannot be saved as {stem}: {e}. Pick another file name."
-                        );
+                    Err(text) => {
                         dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
                         continue;
                     }
@@ -26786,6 +26838,22 @@ fn edit_colours(hwnd: HWND, name: &str) {
             None => return,
         };
     }
+}
+
+/// Whether `path` is a file directly in the themes folder.
+fn in_themes_dir(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|dir| same_file(dir, &themes_dir()))
+}
+
+/// Whether `a` and `b` name the same file or folder: the same path, or
+/// both resolve to one (Windows paths differ in case and form).
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
 }
 
 fn save_theme_as(hwnd: HWND) {

@@ -26,13 +26,14 @@ use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_DEFPUSHBUTTON, BS_OWNERDRAW, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW,
-    CreateWindowExW, DestroyWindow, DispatchMessageW, EN_CHANGE, EN_KILLFOCUS, ES_AUTOHSCROLL,
-    GW_CHILD, GW_HWNDNEXT, GetClientRect, GetMessageW, GetWindow, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IDCANCEL, IDOK, IsDialogMessageW,
-    LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW, SendMessageW, SetForegroundWindow,
-    SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
-    WM_COMMAND, WM_DRAWITEM, WM_ERASEBKGND, WM_PAINT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD,
-    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DC_HASDEFID, DM_GETDEFID, DestroyWindow, DispatchMessageW, EN_CHANGE,
+    EN_KILLFOCUS, ES_AUTOHSCROLL, GW_CHILD, GW_HWNDNEXT, GetClientRect, GetMessageW, GetWindow,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IDCANCEL, IDOK,
+    IsDialogMessageW, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW, SendMessageW,
+    SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DRAWITEM, WM_ERASEBKGND, WM_PAINT, WNDCLASSW, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -78,6 +79,8 @@ struct State {
     dpi: u32,
     /// The text fields are being set from the colours, not typed in.
     setting: bool,
+    /// Save is offered (else only Save as, the default button then).
+    can_save: bool,
     /// The colour picker's sixteen custom colours, kept while it is open.
     custom: [COLORREF; 16],
     done: Option<Option<(Theme, Choice)>>,
@@ -241,6 +244,27 @@ unsafe fn create(
         let _ = GetWindowRect(owner, &mut o);
         let x = o.left + ((o.right - o.left) - w) / 2;
         let top = o.top + ((o.bottom - o.top) - h) / 3;
+        // Kept on the owner's monitor's work area, the buttons with it
+        // (the top first when it is taller than the area).
+        let (x, top) = {
+            use windows::Win32::Graphics::Gdi::{
+                GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+            };
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let mon = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                let a = mi.rcWork;
+                (
+                    x.min(a.right - w).max(a.left),
+                    top.min(a.bottom - h).max(a.top),
+                )
+            } else {
+                (x, top)
+            }
+        };
         let title = wide(&format!("Edit colours: {}", original.name));
         let dlg = CreateWindowExW(
             ex,
@@ -330,7 +354,8 @@ unsafe fn build(
                 ID_HEX + slot,
                 (x + 168, y, 84, 24),
             )?;
-            SendMessageW(e, EM_LIMITTEXT, Some(WPARAM(7)), None);
+            // Room for spaces around a pasted colour, which `parse` ignores.
+            SendMessageW(e, EM_LIMITTEXT, Some(WPARAM(16)), None);
             swatches.push(b);
             hexes.push(e);
         }
@@ -392,6 +417,7 @@ unsafe fn build(
                 mono: mono_font(dpi),
                 dpi,
                 setting: false,
+                can_save,
                 custom,
                 done: None,
             });
@@ -623,7 +649,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let id = wparam.0 & 0xFFFF;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             match id {
-                x if x == IDOK.0 as usize => finish(Choice::Save),
+                // Enter sends IDOK too: Save as when there is no Save.
+                x if x == IDOK.0 as usize => {
+                    if with(|s| s.can_save).unwrap_or(false) {
+                        finish(Choice::Save);
+                    } else {
+                        finish(Choice::SaveAs);
+                    }
+                }
                 ID_SAVE_AS => finish(Choice::SaveAs),
                 x if x == IDCANCEL.0 as usize => {
                     with(|s| s.done = Some(None));
@@ -649,6 +682,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 _ => {}
             }
             LRESULT(0)
+        }
+        DM_GETDEFID => {
+            // The default button, for Enter in IsDialogMessageW.
+            let id = if with(|s| s.can_save).unwrap_or(false) {
+                IDOK.0 as usize
+            } else {
+                ID_SAVE_AS
+            };
+            LRESULT(((DC_HASDEFID as usize) << 16 | id) as isize)
         }
         WM_DRAWITEM => {
             // SAFETY: Windows passes a valid DRAWITEMSTRUCT for the message.
