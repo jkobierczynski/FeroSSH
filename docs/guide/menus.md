@@ -370,6 +370,7 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Enter in the list, a double click or Apply to this pane | Puts the picked theme or font on the pane behind the tools. |
 | Set as default | New tabs open with the picked theme or font. |
 | Use in a rule... | Opens Theme rules with a new rule that starts with the picked theme or font. |
+| Edit colours... | Changes the picked theme's colours (foreground, background, cursor, cursor text, the 16 ANSI colours) with a swatch, `#RRGGBB` field and preview each. Save writes your own theme's file; Save as... makes a new theme file. Built-in themes only have Save as (suggested name "My <theme>"), so they never change. |
 | Open themes folder | Opens the folder of your own themes in Explorer. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 

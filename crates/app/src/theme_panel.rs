@@ -73,6 +73,8 @@ pub enum Event {
     SetDefault(Row),
     /// Open the themes folder in Explorer.
     OpenFolder,
+    /// Change this theme's colours (a built-in one into a new theme).
+    EditColours(Row),
     /// Move this rule up or down the list.
     Move(Row, Move),
     /// Make a new rule, starting with this theme and font (from the
@@ -109,12 +111,14 @@ const ID_USE: usize = 220;
 const ID_APPLY: usize = 221;
 const ID_DEFAULT: usize = 222;
 const ID_FOLDER: usize = 223;
+const ID_COLOURS: usize = 224;
 
 /// Every button: its id, label, width in DIPs and page.
-const BUTTONS: [(usize, &str, i32, Page); 9] = [
+const BUTTONS: [(usize, &str, i32, Page); 10] = [
     (ID_APPLY, "Apply to this pane", 120, Page::Looks),
     (ID_DEFAULT, "Set as default", 100, Page::Looks),
     (ID_USE, "Use in a rule...", 104, Page::Looks),
+    (ID_COLOURS, "Edit colours...", 104, Page::Looks),
     (ID_FOLDER, "Open themes folder", 128, Page::Looks),
     (ID_NEW, "New rule...", 88, Page::Rules),
     (ID_EDIT, "Edit...", 72, Page::Rules),
@@ -144,7 +148,7 @@ struct Handles {
     panel: HWND,
     search: HWND,
     list: HWND,
-    buttons: [HWND; 9],
+    buttons: [HWND; 10],
 }
 
 struct State {
@@ -220,7 +224,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             None,
         )?;
         // A control that cannot be made takes the panel down with it.
-        let made = (|| -> windows::core::Result<(HWND, HWND, [HWND; 9])> {
+        let made = (|| -> windows::core::Result<(HWND, HWND, [HWND; 10])> {
             let child = |class: PCWSTR, text: PCWSTR, style: u32, id: usize| {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
@@ -268,7 +272,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 Some(LPARAM(ex as isize)),
             );
             set_columns(list, Page::default(), dpi);
-            let mut buttons = [HWND::default(); 9];
+            let mut buttons = [HWND::default(); 10];
             for (b, (id, label, _, _)) in buttons.iter_mut().zip(BUTTONS) {
                 let text = wide(label);
                 *b = child(WC_BUTTONW, PCWSTR(text.as_ptr()), BS_PUSHBUTTON as u32, id)?;
@@ -717,6 +721,7 @@ fn update_buttons(h: Handles) {
         ID_UP => own.is_some_and(|r| view::moved_to(rules, r.index, Move::Up).is_some()),
         ID_DOWN => own.is_some_and(|r| view::moved_to(rules, r.index, Move::Down).is_some()),
         ID_APPLY | ID_DEFAULT | ID_USE => look,
+        ID_COLOURS => row.as_ref().is_some_and(|r| r.preset_theme().is_some()),
         _ => true,
     };
     for (b, (id, ..)) in h.buttons.iter().zip(BUTTONS) {
@@ -922,6 +927,11 @@ fn command(h: Handles, id: usize, code: u32) {
         }
         (ID_USE, BN_CLICKED) => use_in_rule(),
         (ID_FOLDER, BN_CLICKED) => emit(Event::OpenFolder),
+        (ID_COLOURS, BN_CLICKED) => {
+            if let Some(r) = selected().filter(|r| r.preset_theme().is_some()) {
+                emit(Event::EditColours(r));
+            }
+        }
         _ => {}
     }
 }

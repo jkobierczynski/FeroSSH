@@ -44,6 +44,8 @@ mod bulk_edit;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
+mod colour_editor;
+#[cfg(windows)]
 mod conn_view;
 #[cfg(windows)]
 mod conpty;
@@ -109,6 +111,8 @@ mod theme_panel;
 #[cfg(windows)]
 mod toast;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod colour_edit;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod copy_id;
 #[cfg_attr(not(windows), allow(dead_code))]
