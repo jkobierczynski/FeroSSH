@@ -20186,7 +20186,7 @@ impl Window {
         }
         // The saved file itself loaded (not another file's theme of the
         // same name, which makes this one a duplicate).
-        let listed = path.parent() == Some(dir.as_path())
+        let listed = path.parent().is_some_and(|parent| same_file(parent, &dir))
             && reason.is_none()
             && self.custom_named(name).is_some();
         if !listed {
