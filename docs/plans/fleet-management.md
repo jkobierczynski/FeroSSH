@@ -14,7 +14,7 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 | 4 | Change one field on many connections at once | Done (#257) |
 | 5 | Named credentials shared by many connections | Done (#258) |
 | 6 | Credential and security rules by tag or folder | Done (#259, #260) |
-| 7 | Inventory columns with CSV export | Built |
+| 7 | Inventory columns with CSV export | Done (#261) |
 | 8 | Run a script or broadcast to a tag or saved search | To do |
 | 9 | A shared, read-only connection library for a team | To do |
 | 10 | A machine-wide admin policy file | To do |
@@ -67,7 +67,7 @@ Fields that need the whole form (host, port, forwards, login script) stay one co
 **What was built.** A credential is a named user, key file and password source: ask, the Windows Credential Manager, or a password manager's command. It is kept as a `Credential` block in `ferossh.conf`, so a vault and an encrypted export carry it.
 
 - **Using one:** a connection names it (`Credential ops-admin` in its profile). It is picked in the connection form (**Credential**, shown once a credential exists) or for many at once with **Change a field** (item 4).
-- **Editing:** **Credentials...** in the connection manager's right-click menu makes, changes, renames (the connections follow) and deletes them.
+- **Editing:** Tools > Credential manager (a key icon on the tools rail, also **Credentials** in the connection manager's right-click menu) lists them and the saved passwords in the tools pane, each with what uses it, and makes, changes, renames (the connections follow) and deletes them.
 - **Precedence:** what a credential sets wins over the connection's own login, and a user typed in the address still wins. This works for SSH, Mosh, SFTP, tunnels, jump hosts and WinRM. The user and key file come through the ssh_config resolution (a `Match originalhost` block placed first). The password source comes from `Settings::password_source`.
 - **Secrets stay where they are today.** A Windows-saved password is still kept per connection. One shared password saved once for all is a possible follow-up.
 
@@ -83,7 +83,7 @@ Fields that need the whole form (host, port, forwards, login script) stay one co
 - Each hop of a jump route gets its own rules. A connection prints the limits that apply.
 - Rules are edited in the file for now, like theme rules. A rules page in Settings is a possible follow-up.
 
-## 7. Inventory columns with CSV export (built)
+## 7. Inventory columns with CSV export (done, #261)
 
 **What FeroSSH had.** The status bar shows live CPU, memory and disk for the focused pane; script runs give a CSV report.
 

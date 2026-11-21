@@ -47,6 +47,10 @@ mod clipboard;
 mod conn_view;
 #[cfg(windows)]
 mod conpty;
+#[cfg(windows)]
+mod credential_panel;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod credential_view;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod credentials;
 #[cfg(windows)]
