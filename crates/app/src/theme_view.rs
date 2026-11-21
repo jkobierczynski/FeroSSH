@@ -50,8 +50,8 @@ impl Page {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
     Rules,
-    /// The built-in tag rules (Production, Staging), tried after the
-    /// user's; they cannot be changed.
+    /// The built-in tag rules (Production, Staging, Nord): enforced and
+    /// tried before the user's, so nothing overrides them.
     BuiltInRules,
     /// The built-in themes, by kind.
     Dark,
@@ -78,7 +78,7 @@ impl Group {
     pub fn title(self) -> &'static str {
         match self {
             Group::Rules => "Your rules (tried from the top)",
-            Group::BuiltInRules => "Built-in rules (tried after yours)",
+            Group::BuiltInRules => "Built-in rules (always win, cannot change)",
             Group::Dark => "Dark themes",
             Group::Light => "Light themes",
             Group::Warning => "Warning themes",

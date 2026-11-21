@@ -266,7 +266,7 @@ ThemeRule
     Hosts *.prod.example.com !prod-sandbox
     Theme Production
 ThemeRule
-    Tags staging
+    Tags qa
     Theme Nord
     Tint ffb000 40
 ThemeRule
@@ -285,7 +285,7 @@ ThemeRule
 | `Tint RRGGBB AMOUNT` | Mixes a colour into the theme by 0 to 255, for example a red tint over your usual theme. |
 | `Enforce yes` | What the rule sets cannot be changed: it beats the connection's own look (`Profile`), and Settings > Theme and Font, zoom, custom themes, workspaces and tmux layouts leave it alone on the connection's panes, the tabs and panes opened from them and its tmux windows. The first enforced rule that sets each of theme, font and size wins. |
 
-Without any rules, hosts tagged `production`, `staging` or `development` get Production, Staging or Nord.
+Hosts tagged `production` or `prod`, `staging` or `stage`, and `development` or `dev` always get Production, Staging or Nord. These built-in rules are enforced and come before yours, so no `ThemeRule`, `Profile` theme or pane setting overrides them; your rules can still set their font and size.
 
 ## Security rules
 
