@@ -23770,7 +23770,7 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
                 intro,
                 fields: &[("Hosts", &hosts), ("Tags", &tags), ("Folders", &folders)],
                 checks: &checks,
-                option: original.as_ref().map(|_| ("Delete this rule", false)),
+                option: None,
                 ok: "Save",
                 cancel: "Cancel",
             },
@@ -23786,44 +23786,6 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
             folders: words(f.next().map_or("", String::as_str)),
             limits: Policy::from_flags(&answer.checks),
         };
-        if answer.option
-            && let (Some(i), Some(o)) = (index, &original)
-        {
-            // The same question as the page's Delete..., naming the
-            // connections that lose the limits.
-            let question = with_window(|w| {
-                w.rule_rows()
-                    .into_iter()
-                    .find(|r| r.index == i && &r.rule == o)
-                    .map(|r| crate::rules_view::delete_question(&r))
-            })
-            .flatten()
-            .unwrap_or_else(|| {
-                format!(
-                    "Delete security rule {} ({})?",
-                    i + 1,
-                    crate::ssh::sanitize_line(&o.describe_match())
-                )
-            });
-            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
-                continue;
-            }
-            let lost = std::cell::Cell::new(false);
-            let saved = save_rules(hwnd, |rules| match find_rule(rules, i, o) {
-                Some(at) => {
-                    rules.remove(at);
-                }
-                None => lost.set(true),
-            });
-            if lost.get() {
-                dialog(hwnd, RULE_CHANGED, MB_OK | MB_ICONWARNING);
-                return;
-            }
-            if saved {
-                return;
-            }
-            continue;
-        }
         if rule.hosts.is_empty() && rule.tags.is_empty() && rule.folders.is_empty() {
             dialog(
                 hwnd,
