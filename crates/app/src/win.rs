@@ -1691,6 +1691,8 @@ struct PendingDesktop {
     port: u16,
     kind: SessionKind,
     user: Option<String>,
+    /// Said yes to, when a security rule asks before connecting.
+    confirmed: bool,
 }
 
 /// A remote desktop asked for.
@@ -16390,6 +16392,7 @@ impl Window {
             port,
             kind,
             user: cfg.user,
+            confirmed: false,
         };
         // Only the desktop or app shows: the SSH login runs in a session
         // no tab shows, which shows when the login asks for something or
@@ -16581,6 +16584,18 @@ impl Window {
         }
         let size = self.fixed_desktop_size(&p.label);
         let rules = self.launch_rules(id, Some((&p.label, Some(&p.host))));
+        // The tunnel reaches the desktop itself: a security rule that asks
+        // before connecting to it asks here, in a message box, as for a
+        // direct Remote Desktop connection.
+        if rules.confirm_connect && !p.confirmed {
+            self.workspace_asks.push(Command::ConfirmDesktop {
+                pane: id,
+                desktop: p,
+            });
+            // SAFETY: our window; replaces any earlier timer with this id.
+            unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
+            return;
+        }
         let clip_limit = self.desktop_clip_limit(&[&p.label, &s.target.alias], rules);
         let (local, want) = match p.kind {
             SessionKind::Vnc => (
@@ -22406,6 +22421,12 @@ enum Command {
         size: Option<(u16, u16)>,
         clipboard: bool,
     },
+    /// A desktop through an SSH connection (pane `pane`'s) a security
+    /// rule asks about first: the tunnel opens after Yes.
+    ConfirmDesktop {
+        pane: PaneId,
+        desktop: PendingDesktop,
+    },
     /// Ask, then delete `entries` in folder `dir` of `key`'s host (when
     /// it is still the listed one).
     ConfirmDelete {
@@ -25572,6 +25593,45 @@ fn run_command(hwnd: HWND, command: Command) {
                             size,
                             clipboard,
                         });
+                    });
+                    // SAFETY: our window; replaces any earlier timer with this id.
+                    unsafe { SetTimer(Some(hwnd), TIMER_WORKSPACE_ASK, 500, None) };
+                }
+            }
+        }
+        Command::ConfirmDesktop { pane, desktop } => {
+            let question = format!(
+                "A security rule asks before connecting to {}. Open the desktop on {} port {} \
+                 through this SSH connection?",
+                crate::ssh::sanitize_line(&desktop.label),
+                crate::ssh::sanitize_line(&desktop.host),
+                desktop.port
+            );
+            match dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
+                Some(IDYES) => {
+                    with_window(|w| {
+                        w.pending_desktops.insert(
+                            pane,
+                            PendingDesktop {
+                                confirmed: true,
+                                ..desktop
+                            },
+                        );
+                        w.desktop_after_login(pane);
+                    });
+                }
+                Some(_) => {
+                    with_window(|w| {
+                        w.show(pane, "\x1b[0;90mThe desktop was not opened.\x1b[0m\r\n");
+                        w.abandon_launch(pane);
+                        w.refresh(pane);
+                    });
+                }
+                None => {
+                    // Another dialog is open: ask once it has closed.
+                    with_window(|w| {
+                        w.workspace_asks
+                            .push(Command::ConfirmDesktop { pane, desktop });
                     });
                     // SAFETY: our window; replaces any earlier timer with this id.
                     unsafe { SetTimer(Some(hwnd), TIMER_WORKSPACE_ASK, 500, None) };
