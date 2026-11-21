@@ -2230,14 +2230,27 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 };
             }
             let target = Target::resolve(&h.name, env);
+            // The host itself when the way there does not resolve (jump
+            // hosts that loop, say): its host name and Tag still carry
+            // the security rules to the same machine reached another way.
+            let host_only = match target {
+                Some(_) => None,
+                None => Target::resolve_host(&h.name, env),
+            };
             let tags = ferossh_config::settings::host_tags(
-                target.as_ref().and_then(|t| t.tag.as_deref()),
+                target
+                    .as_ref()
+                    .or(host_only.as_ref())
+                    .and_then(|t| t.tag.as_deref()),
                 settings.profile(&h.name),
             );
-            let (user, hostname, mut port) = target
+            let (user, mut hostname, mut port) = target
                 .as_ref()
                 .map(|t| (Some(t.user.clone()), Some(t.hostname.clone()), Some(t.port)))
                 .unwrap_or_default();
+            if let Some(t) = &host_only {
+                hostname = Some(t.hostname.clone());
+            }
             // The port the session opens, for port: searches: SSH's 22 is
             // not Telnet's or a desktop's default.
             let own_port = || ssh_config::resolve_in(&env.config, &h.name, &includes).port;
@@ -7596,15 +7609,37 @@ impl Window {
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
         let folder = self.rule_folder(alias);
-        let lines = ferossh_config::host_policy::not_understood(
-            &self.settings.security_rules,
-            &Subject {
-                name: alias,
-                hostname: Some(hostname),
-                tags: &tags,
-                folder: folder.as_deref(),
-            },
-        );
+        let subject = Subject {
+            name: alias,
+            hostname: Some(hostname),
+            tags: &tags,
+            folder: folder.as_deref(),
+        };
+        let rules = &self.settings.security_rules;
+        let mut lines = ferossh_config::host_policy::not_understood(rules, &subject);
+        // Rules follow the machine: so do the lines they are missing.
+        let here = ferossh_config::host_policy::machine(&subject);
+        for c in self.rule_connections() {
+            let peer = Subject {
+                name: &c.name,
+                hostname: c.hostname.as_deref(),
+                tags: &c.tags,
+                folder: c.folder.as_deref(),
+            };
+            if c.name.eq_ignore_ascii_case(alias)
+                || !ferossh_config::host_policy::same_machine(
+                    ferossh_config::host_policy::machine(&peer),
+                    here,
+                )
+            {
+                continue;
+            }
+            for line in ferossh_config::host_policy::not_understood(rules, &peer) {
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+            }
+        }
         if lines.is_empty() {
             return;
         }
