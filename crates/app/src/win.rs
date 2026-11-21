@@ -26830,23 +26830,28 @@ fn edit_colours(hwnd: HWND, name: &str) {
                         // saved a theme since this one last looked), read
                         // aside: the window's own list stays what its panes
                         // were given, for the save to recolour them.
-                        let now = custom_theme::load(&themes_dir())
-                            .map(|(themes, _)| themes)
-                            .ok()
-                            .or_else(|| with_window(|w| w.custom_themes.clone()))
-                            .unwrap_or_default();
-                        let taken = now
-                            .iter()
-                            .find(|c| {
-                                c.theme.name.eq_ignore_ascii_case(&n) && !same_file(&c.path, &path)
-                            })
-                            .map(|c| c.path.display().to_string());
-                        match taken {
-                            Some(other) => Err(format!(
-                                "{other} already holds a theme named {n}. Pick another file \
-                                 name."
+                        // Unread, a duplicate name cannot be ruled out:
+                        // nothing is written then.
+                        match custom_theme::load(&themes_dir()) {
+                            Err(e) => Err(format!(
+                                "The themes folder {} could not be read ({e}), so the name \
+                                 {n} cannot be checked. Nothing was saved.",
+                                themes_dir().display()
                             )),
-                            None => Ok(n),
+                            Ok((now, _)) => match now
+                                .iter()
+                                .find(|c| {
+                                    c.theme.name.eq_ignore_ascii_case(&n)
+                                        && !same_file(&c.path, &path)
+                                })
+                                .map(|c| c.path.display().to_string())
+                            {
+                                Some(other) => Err(format!(
+                                    "{other} already holds a theme named {n}. Pick another \
+                                     file name."
+                                )),
+                                None => Ok(n),
+                            },
                         }
                     }
                 };
