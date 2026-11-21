@@ -99,6 +99,18 @@ pub fn save(
     }) {
         Some(i) => {
             let old = settings.credentials.get(i).map(|c| c.name.clone());
+            if let Some(old) = old.as_deref().filter(|o| !o.eq_ignore_ascii_case(name))
+                && settings.team.profiles.iter().any(|p| {
+                    p.credential
+                        .as_deref()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(old))
+                })
+            {
+                return Err(format!(
+                    "The team library's connections use credential {old} by that name, so it \
+                     cannot be renamed."
+                ));
+            }
             if let Some(slot) = settings.credentials.get_mut(i) {
                 *slot = credential;
             }

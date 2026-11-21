@@ -557,10 +557,18 @@ fn edit() {
     }
 }
 
+/// What a team library rule says when asked to change.
+pub const TEAM_RULE: &str = "This rule comes from the team library. It applies as the team \
+                             set it and cannot be changed or deleted here.";
+
 fn delete(h: Handles) {
     let Some(row) = selected() else {
         return;
     };
+    if row.team {
+        emit(Event::Edit(row));
+        return;
+    }
     let text = wide(&view::delete_question(&row));
     let caption = wide("Security rules");
     // SAFETY: a message box over the main window; the strings live

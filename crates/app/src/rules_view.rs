@@ -17,8 +17,10 @@ pub struct Connection {
 /// One rule, as listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    /// Where it sits in the settings' list of rules.
+    /// Where it sits in the settings' list of rules (or the team's).
     pub index: usize,
+    /// From the team library: shown, never changed here.
+    pub team: bool,
     pub rule: SecurityRule,
     /// The connections it covers, by name, sorted.
     pub used_by: Vec<String>,
@@ -52,7 +54,7 @@ impl Column {
     /// Width in DIPs.
     pub fn width(self) -> i32 {
         match self {
-            Column::Number => 40,
+            Column::Number => 56,
             Column::Matches => 260,
             Column::Limits => 330,
             Column::Connections => 320,
@@ -60,12 +62,20 @@ impl Column {
     }
 }
 
-/// The rows for `rules`, each with the connections of `all` it covers.
-pub fn rows(rules: &[SecurityRule], all: &[Connection]) -> Vec<Row> {
-    rules
+/// The rows for the team's rules, then `rules`, each with the connections
+/// of `all` it covers.
+pub fn rows_with_team(
+    team: &[SecurityRule],
+    rules: &[SecurityRule],
+    all: &[Connection],
+) -> Vec<Row> {
+    let tagged = team
         .iter()
         .enumerate()
-        .map(|(index, rule)| {
+        .map(|(i, r)| (i, r, true))
+        .chain(rules.iter().enumerate().map(|(i, r)| (i, r, false)));
+    tagged
+        .map(|(index, rule, team)| {
             let mut used_by: Vec<String> = all
                 .iter()
                 .filter(|c| {
@@ -81,6 +91,7 @@ pub fn rows(rules: &[SecurityRule], all: &[Connection]) -> Vec<Row> {
             used_by.sort_by_key(|n| n.to_lowercase());
             Row {
                 index,
+                team,
                 rule: rule.clone(),
                 used_by,
             }
@@ -91,6 +102,7 @@ pub fn rows(rules: &[SecurityRule], all: &[Connection]) -> Vec<Row> {
 /// Cell `column` of `row`, cleaned of control and direction characters.
 pub fn text(row: &Row, column: Column) -> String {
     let raw = match column {
+        Column::Number if row.team => format!("team {}", row.index + 1),
         Column::Number => (row.index + 1).to_string(),
         Column::Matches => row.rule.describe_match(),
         Column::Limits => limits_text(&row.rule),
@@ -158,7 +170,7 @@ pub fn filter<'a>(rows: &'a [Row], query: &str) -> Vec<&'a Row> {
 pub fn sort(rows: &mut [&Row], column: Column, descending: bool) {
     rows.sort_by(|a, b| {
         let by = match column {
-            Column::Number => a.index.cmp(&b.index),
+            Column::Number => b.team.cmp(&a.team).then(a.index.cmp(&b.index)),
             Column::Connections => a.used_by.len().cmp(&b.used_by.len()),
             c => text(a, c).to_lowercase().cmp(&text(b, c).to_lowercase()),
         };
@@ -248,7 +260,7 @@ mod tests {
 
     #[test]
     fn rows_list_the_connections_each_rule_covers() {
-        let rows = rows(&rules(), &all());
+        let rows = rows_with_team(&[], &rules(), &all());
         assert_eq!(rows[0].used_by, ["db", "web"]);
         assert_eq!(rows[1].used_by, ["db", "pi"]);
         assert!(rows[2].used_by.is_empty());
@@ -260,7 +272,7 @@ mod tests {
 
     #[test]
     fn search_and_sort() {
-        let rows = rows(&rules(), &all());
+        let rows = rows_with_team(&[], &rules(), &all());
         let hits = filter(&rows, "pi");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].index, 1);
@@ -277,7 +289,7 @@ mod tests {
 
     #[test]
     fn the_delete_question_names_who_loses_the_limits() {
-        let rows = rows(&rules(), &all());
+        let rows = rows_with_team(&[], &rules(), &all());
         let q = delete_question(&rows[0]);
         assert!(
             q.starts_with("Delete rule 1 (tags prod*: keys only)?"),
@@ -290,13 +302,32 @@ mod tests {
     }
 
     #[test]
+    fn team_rules_come_first_marked() {
+        let team = [SecurityRule {
+            tags: vec!["prod".into()],
+            limits: ferossh_config::host_policy::Policy {
+                keys_only: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        let rows = rows_with_team(&team, &team, &[]);
+        assert!(rows[0].team && !rows[1].team);
+        assert_eq!(text(&rows[0], Column::Number), "team 1");
+        assert_eq!(text(&rows[1], Column::Number), "1");
+        let mut all: Vec<&Row> = rows.iter().rev().collect();
+        sort(&mut all, Column::Number, false);
+        assert!(all[0].team);
+    }
+
+    #[test]
     fn lines_not_understood_show_as_a_warning() {
         let mut rule = SecurityRule::default();
         rule.tags.push("prod".into());
         rule.limits.log_session = true;
         rule.unknown.push("KeysOnly 1".into());
         let all = [conn("db", &["prod"], None)];
-        let rows = rows(&[rule], &all);
+        let rows = rows_with_team(&[], &[rule], &all);
         assert_eq!(
             text(&rows[0], Column::Limits),
             "session logged, ⚠ not understood: KeysOnly 1"

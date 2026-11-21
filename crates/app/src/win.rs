@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use ferossh_auth::Broker;
-use ferossh_config::host_policy::{Policy, Subject};
+use ferossh_config::host_policy::{Policy, SecurityRule, Subject};
 use ferossh_config::hotkey::Hotkey;
 use ferossh_config::import::{self, Client};
 use ferossh_config::login::{self, Place, Snippet, Step};
@@ -549,6 +549,10 @@ mod cmd {
     pub const HOSTS: u32 = 690;
     /// Settings > Allow deleting connection log entries.
     pub const CONNECTION_LOG_DELETE: u32 = 691;
+    /// File > Import and export > Export team library.
+    pub const TEAM_EXPORT: u32 = 692;
+    /// Settings > Team library.
+    pub const TEAM_LIBRARY: u32 = 693;
     /// Settings > Font ligatures.
     pub const FONT_LIGATURES: u32 = 221;
     /// Settings > Server status bar.
@@ -1567,6 +1571,24 @@ struct Window {
     /// Secrets for login scripts from password manager commands, as they
     /// finish.
     script_secrets: Arc<std::sync::Mutex<Vec<ScriptSecret>>>,
+    /// The team library as read in the background, waiting to be used.
+    /// The read it came from is tagged with [`Self::team_read`]'s number
+    /// then, so a read started before the library or its key changed is
+    /// dropped.
+    team_loaded: Arc<std::sync::Mutex<Option<(u64, crate::team_lib::Loaded)>>>,
+    /// Counts the reads of the team library started.
+    team_read: u64,
+    /// The same, for the reads themselves to see whether they are still
+    /// the newest.
+    team_latest: Arc<std::sync::atomic::AtomicU64>,
+    /// What was last said about the team library, so it is not said
+    /// again on every refresh.
+    team_note: Option<String>,
+    /// A note about the team library not shown yet, because another
+    /// dialog was open.
+    team_note_pending: Option<String>,
+    /// Whether a wait to show [`Self::team_note_pending`] is running.
+    team_note_retry: Arc<std::sync::atomic::AtomicBool>,
     /// Login scripts started so far, which numbers each run.
     script_runs: u64,
     snippets_view: SnippetsView,
@@ -1998,14 +2020,29 @@ fn ssh_env() -> Env {
     let home = home();
     // Named credentials first: their user and key file win (see
     // Settings::credential_config).
-    let mut config = app_read(&settings_path())
-        .map(|t| Settings::parse(&t).credential_config())
+    let mut settings = app_read(&settings_path())
+        .map(|t| Settings::parse(&t))
         .unwrap_or_default();
+    settings.team = crate::team_lib::current();
+    let mut config = settings.credential_config();
+    // The team library's connections before anything of the user's: the
+    // first value found is the one used.
+    if !settings.team.hosts_text.is_empty() {
+        config.push_str("\nHost !*\n");
+        config.push_str(&settings.team.hosts_text);
+        // What the user's file says before its first Host line still
+        // applies to every host.
+        config.push_str("\nHost *\n");
+    }
     config.push_str(&std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default());
     if let Ok(made) = app_read(&sessions_path()) {
         // A Host line first: the user's last block must not swallow it.
         config.push_str("\nHost !*\n");
-        config.push_str(&made);
+        // A saved connection with a team connection's name is not used.
+        config.push_str(&ferossh_config::team::without_team_hosts(
+            &made,
+            &settings.team,
+        ));
     }
     for client in Client::ALL {
         if let Ok(imported) = app_read(&imported_path(client)) {
@@ -2178,12 +2215,27 @@ fn write_app_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Saved connection `alias`: the team library's when it is one of its
+/// connections (a local one of that name is not used), else the user's
+/// own.
+fn saved_for(settings: &Settings, alias: &str) -> Option<SavedHost> {
+    let hosts = if settings.is_team(alias) {
+        ferossh_config::saved::parse(&settings.team.hosts_text)
+    } else {
+        load_saved()
+    };
+    hosts
+        .into_iter()
+        .find(|h| h.alias.eq_ignore_ascii_case(alias))
+}
+
 /// The hosts the connection manager lists.
 fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
     let includes = ssh_config::DirIncludes {
         home: env.home.clone(),
     };
     let saved = load_saved();
+    let team = ferossh_config::saved::parse(&settings.team.hosts_text);
     ssh_config::hosts(&env.config, &includes)
         .into_iter()
         .map(|h| {
@@ -2193,7 +2245,12 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 .unwrap_or_default();
             if kind == SessionKind::WinRm {
                 // As connect() resolves it: the saved user and port.
-                let own = saved.iter().find(|s| s.alias.eq_ignore_ascii_case(&h.name));
+                let from = if settings.is_team(&h.name) {
+                    &team
+                } else {
+                    &saved
+                };
+                let own = from.iter().find(|s| s.alias.eq_ignore_ascii_case(&h.name));
                 let https = settings.profile(&h.name).is_some_and(|p| p.winrm_https);
                 let target = WinrmTarget::resolve(&h.name, env, None, https, own).map(|t| {
                     t.with_login_user(
@@ -2702,6 +2759,14 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         // opened on.
         let dpi = GetDpiForWindow(hwnd);
         let mut settings = load_settings();
+        // The team library's checked copy at once (connections may start
+        // before the share answers); the share is read in the background.
+        settings.team = crate::team_lib::cached(
+            settings.team_library.as_deref(),
+            &settings.team_library_keys,
+            &app_dir(),
+        );
+        crate::team_lib::set_current(settings.team.clone());
         load_snippets(&mut settings);
         KEY_OPTIONS.set(key_options(&settings));
         INLINE_IMAGES.set(settings.inline_images);
@@ -2885,6 +2950,12 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 snippet_next: HashMap::new(),
                 zmodem: HashMap::new(),
                 script_secrets: Arc::default(),
+                team_loaded: Arc::default(),
+                team_read: 0,
+                team_latest: Arc::default(),
+                team_note: None,
+                team_note_pending: None,
+                team_note_retry: Arc::default(),
                 script_runs: 0,
                 snippets_view: SnippetsView::default(),
                 snippets_peek: false,
@@ -2983,6 +3054,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
             }
         });
         with_window(Window::update_menu_checks);
+        with_window(Window::refresh_team);
         // Custom themes in their menu now, for the command palette too.
         with_window(|w| {
             if let Some(menu) = custom_themes_menu(w.menu) {
@@ -3159,6 +3231,7 @@ fn build_menu() -> Result<HMENU> {
         item(transfer, cmd::IMPORT_SNIPPETS, "Import sc&ripts...")?;
         separator(transfer)?;
         item(transfer, cmd::EXPORT, "&Export connections...")?;
+        item(transfer, cmd::TEAM_EXPORT, "Export &team library...")?;
         item(
             transfer,
             cmd::IMPORT_SEALED,
@@ -3520,6 +3593,7 @@ fn build_menu() -> Result<HMENU> {
             cmd::CONNECTION_LOG_DELETE,
             "Allow deleting connection log entries",
         )?;
+        item(view, cmd::TEAM_LIBRARY, "&Team library...")?;
         separator(view)?;
         item(view, cmd::KEY_BINDINGS, "Key bin&dings...")?;
         let links = CreatePopupMenu()?;
@@ -7278,7 +7352,7 @@ impl Window {
         hostname: Option<&str>,
         tag: Option<&str>,
     ) -> (Policy, Vec<String>) {
-        if self.settings.security_rules.is_empty() {
+        if !self.settings.has_security_rules() {
             return (Policy::default(), Vec::new());
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
@@ -7293,8 +7367,17 @@ impl Window {
                 folder: c.folder.as_deref(),
             })
             .collect();
+        // The team's rules and the user's: each can only add limits.
+        let rules: Vec<SecurityRule> = self
+            .settings
+            .team
+            .security_rules
+            .iter()
+            .chain(&self.settings.security_rules)
+            .cloned()
+            .collect();
         let (policy, from) = ferossh_config::host_policy::policy_with_peers(
-            &self.settings.security_rules,
+            &rules,
             &Subject {
                 name: alias,
                 hostname,
@@ -7306,24 +7389,20 @@ impl Window {
         (policy, from.into_iter().map(str::to_owned).collect())
     }
 
-    /// The folder the Connection manager shows connection `alias` in: a
-    /// FeroSSH connection's own, else the one its ssh_config (an
-    /// import's file) gives it.
+    /// The folder the Connection manager shows connection `alias` in:
+    /// the team library's for its connections, a FeroSSH connection's
+    /// own, else the one its ssh_config (an import's file) gives it.
     fn rule_folder(&self, alias: &str) -> Option<String> {
-        load_saved()
-            .into_iter()
-            .find(|h| h.alias.eq_ignore_ascii_case(alias))
-            .and_then(|h| h.folder)
-            .or_else(|| {
-                let env = ssh_env();
-                let includes = ssh_config::DirIncludes {
-                    home: env.home.clone(),
-                };
-                ssh_config::hosts(&env.config, &includes)
-                    .into_iter()
-                    .find(|h| h.name.eq_ignore_ascii_case(alias))
-                    .and_then(|h| h.folder)
-            })
+        self.saved_of(alias).and_then(|h| h.folder).or_else(|| {
+            let env = ssh_env();
+            let includes = ssh_config::DirIncludes {
+                home: env.home.clone(),
+            };
+            ssh_config::hosts(&env.config, &includes)
+                .into_iter()
+                .find(|h| h.name.eq_ignore_ascii_case(alias))
+                .and_then(|h| h.folder)
+        })
     }
 
     /// Whether pane `id` may connect to `destination` now. A security
@@ -7337,7 +7416,7 @@ impl Window {
         extras: &Extras,
         env: &Env,
     ) -> bool {
-        if self.settings.security_rules.is_empty() {
+        if !self.settings.has_security_rules() {
             self.connect_confirmed.remove(&id);
             return true;
         }
@@ -7396,12 +7475,17 @@ impl Window {
 
     /// `destination` as a WinRM session: a saved WinRM connection (its
     /// port, HTTPS and login user), or a typed `winrm://` address.
+    /// Saved connection `alias`: the team library's when it is one of its
+    /// connections (a local one of that name is not used), else the
+    /// user's own.
+    fn saved_of(&self, alias: &str) -> Option<ferossh_config::saved::SavedHost> {
+        saved_for(&self.settings, alias)
+    }
+
     fn winrm_target(&self, destination: &str, env: &Env) -> Option<WinrmTarget> {
         match self.settings.profile(destination) {
             Some(p) if p.kind == SessionKind::WinRm => {
-                let saved = load_saved()
-                    .into_iter()
-                    .find(|h| h.alias.eq_ignore_ascii_case(destination));
+                let saved = self.saved_of(destination);
                 WinrmTarget::resolve(
                     destination,
                     env,
@@ -7607,12 +7691,17 @@ impl Window {
         tag: Option<&str>,
         hop: bool,
     ) {
-        if self
+        // The team library's rules and the user's own.
+        let rules: Vec<SecurityRule> = self
             .settings
+            .team
             .security_rules
             .iter()
-            .all(|r| r.unknown.is_empty())
-        {
+            .chain(&self.settings.security_rules)
+            .filter(|r| !r.unknown.is_empty())
+            .cloned()
+            .collect();
+        if rules.is_empty() {
             return;
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
@@ -7623,8 +7712,7 @@ impl Window {
             tags: &tags,
             folder: folder.as_deref(),
         };
-        let rules = &self.settings.security_rules;
-        let mut lines = ferossh_config::host_policy::not_understood(rules, &subject);
+        let mut lines = ferossh_config::host_policy::not_understood(&rules, &subject);
         // Rules follow the machine: so do the lines they are missing.
         let here = ferossh_config::host_policy::machine(&subject);
         for c in self.rule_connections() {
@@ -7642,7 +7730,7 @@ impl Window {
             {
                 continue;
             }
-            for line in ferossh_config::host_policy::not_understood(rules, &peer) {
+            for line in ferossh_config::host_policy::not_understood(&rules, &peer) {
                 if !lines.contains(&line) {
                     lines.push(line);
                 }
@@ -8143,9 +8231,7 @@ impl Window {
                 // removed or replaced since leaves no user of its own behind.
                 if target.saved {
                     let alias = target.alias.clone();
-                    let saved = load_saved()
-                        .into_iter()
-                        .find(|h| h.alias.eq_ignore_ascii_case(&alias));
+                    let saved = self.saved_of(&alias);
                     let own = WinrmTarget::resolve(
                         &alias,
                         &ssh_env(),
@@ -11018,6 +11104,7 @@ impl Window {
         }
         self.poll_passwords();
         self.poll_script_secrets();
+        self.poll_team();
         // The forwards list and the tab badges.
         if self
             .workers
@@ -15676,8 +15763,28 @@ impl Window {
             Some(name) => {
                 let profile = self.settings.profile(&name);
                 let saved = load_saved();
-                match saved.iter().find(|h| h.alias.eq_ignore_ascii_case(&name)) {
-                    Some(h) => SessionForm::new(
+                // A team connection is the team's even when a local one
+                // shares its name (that one is not used).
+                let team = self
+                    .settings
+                    .is_team(&name)
+                    .then(|| self.saved_of(&name))
+                    .flatten();
+                let own = (!self.settings.is_team(&name))
+                    .then(|| saved.iter().find(|h| h.alias.eq_ignore_ascii_case(&name)))
+                    .flatten();
+                match (team, own) {
+                    // The team's record as the library has it, as the
+                    // connection uses it.
+                    (Some(h), _) => SessionForm::new(
+                        Some(h.alias.clone()),
+                        Source::ReadOnly("the team library".to_owned()),
+                        Values::from_saved(&h).with_profile(profile),
+                        hints,
+                        names,
+                        themes,
+                    ),
+                    (None, Some(h)) => SessionForm::new(
                         Some(h.alias.clone()),
                         Source::Saved,
                         Values::from_saved(h).with_profile(profile),
@@ -15685,7 +15792,7 @@ impl Window {
                         names,
                         themes,
                     ),
-                    None => {
+                    (None, None) => {
                         let folder = items
                             .iter()
                             .find(|h| h.name == name)
@@ -15728,7 +15835,11 @@ impl Window {
                                 ..Values::default()
                             },
                         };
-                        let source = Source::ReadOnly(host_file(&name));
+                        let source = Source::ReadOnly(if self.settings.is_team(&name) {
+                            "the team library".to_owned()
+                        } else {
+                            host_file(&name)
+                        });
                         SessionForm::new(
                             Some(name),
                             source,
@@ -15766,6 +15877,15 @@ impl Window {
                 let mut hosts = load_saved();
                 let mut settings = self.settings.clone();
                 let name = form.apply(&mut hosts, &mut settings);
+                // Nothing is saved under a team connection's name: it would
+                // not be used, and the team's would not change.
+                if self.settings.is_team(&name) {
+                    return Some(Command::Notice(format!(
+                        "{} is a team library connection, which cannot be changed here. \
+                         Give it another name to save a copy of your own.",
+                        crate::ssh::sanitize_line(&name)
+                    )));
+                }
                 // The inventory follows a renamed connection (a read-only one
                 // saved under a new name is a copy: it has none yet).
                 let renamed = form
@@ -15836,9 +15956,7 @@ impl Window {
     /// Saved WinRM connection `name` as the settings describe it now: its
     /// current host, port and transport.
     fn saved_winrm_target(&self, name: &str) -> Option<WinrmTarget> {
-        let saved = load_saved()
-            .into_iter()
-            .find(|h| h.alias.eq_ignore_ascii_case(name));
+        let saved = self.saved_of(name);
         let https = self.settings.profile(name).is_some_and(|p| p.winrm_https);
         WinrmTarget::resolve(name, &ssh_env(), None, https, saved.as_ref()).map(|t| {
             t.with_login_user(
@@ -15920,7 +16038,11 @@ impl Window {
     /// covers, matched as a connection is (its folder as the connection
     /// manager shows it).
     fn rule_rows(&self) -> Vec<crate::rules_view::Row> {
-        crate::rules_view::rows(&self.settings.security_rules, &self.rule_connections())
+        crate::rules_view::rows_with_team(
+            &self.settings.team.security_rules,
+            &self.settings.security_rules,
+            &self.rule_connections(),
+        )
     }
 
     /// Every connection the Connection manager lists, as the security
@@ -15928,10 +16050,16 @@ impl Window {
     fn rule_connections(&self) -> Vec<crate::rules_view::Connection> {
         use crate::rules_view::Connection;
         let saved = load_saved();
+        let team = ferossh_config::saved::parse(&self.settings.team.hosts_text);
         host_items(&ssh_env(), &self.settings)
             .into_iter()
             .map(|h| {
-                let own = saved
+                let from = if self.settings.is_team(&h.name) {
+                    &team
+                } else {
+                    &saved
+                };
+                let own = from
                     .iter()
                     .find(|s| s.alias.eq_ignore_ascii_case(&h.name))
                     .and_then(|s| s.folder.clone());
@@ -16225,6 +16353,10 @@ impl Window {
     /// Removes the saved sessions `names` (after the user said yes): the
     /// file is written once, and settings change only once it is.
     fn delete_sessions(&mut self, names: &[String]) {
+        let names = &self.not_team(names);
+        if names.is_empty() {
+            return;
+        }
         // Where their Windows-stored passwords are, found while the
         // connections are still saved; removed once they are gone.
         let targets: Vec<String> = names
@@ -16268,16 +16400,19 @@ impl Window {
                 }
             }
             BulkAction::AddTag(names, tag) => {
+                let names = self.not_team(&names);
                 crate::bulk::add_tag(&mut self.settings, &names, &tag);
                 self.save_settings();
                 self.reload_sessions(None);
             }
             BulkAction::RemoveTag(names, tag) => {
+                let names = self.not_team(&names);
                 crate::bulk::remove_tag(&mut self.settings, &names, &tag);
                 self.save_settings();
                 self.reload_sessions(None);
             }
             BulkAction::MoveTo(names, folder) => {
+                let names = self.not_team(&names);
                 let mut hosts = load_saved();
                 let out = crate::bulk::move_to_folder(&mut hosts, &names, folder.as_deref());
                 if out.changed > 0 {
@@ -16298,7 +16433,11 @@ impl Window {
                     )));
                 }
             }
-            BulkAction::Edit(plan) => {
+            BulkAction::Edit(mut plan) => {
+                let names: Vec<String> = plan.changes.iter().map(|c| c.name.clone()).collect();
+                let own = self.not_team(&names);
+                plan.changes
+                    .retain(|c| own.iter().any(|n| n.eq_ignore_ascii_case(&c.name)));
                 // Profiles in a shared vault, and sessions.conf, may have
                 // changed since the preview: take both in before checking.
                 // The vault refresh comes first, so the hosts read next
@@ -16353,6 +16492,106 @@ impl Window {
         }
         conn_view::clear_marks();
         self.refresh_chrome();
+    }
+
+    /// Reads the team library from its share in the background (a share
+    /// that does not answer must not hold up the window);
+    /// [`Self::poll_team`] puts it to use.
+    fn refresh_team(&mut self) {
+        let library = self.settings.team_library.clone();
+        let keys = self.settings.team_library_keys.clone();
+        // Whatever an earlier read finds is no longer wanted.
+        self.team_read += 1;
+        crate::team_lib::newest(&self.team_latest, self.team_read);
+        if library.is_none() {
+            self.use_team(crate::team_lib::Loaded::default());
+            return;
+        }
+        let read = self.team_read;
+        let latest = self.team_latest.clone();
+        let slot = self.team_loaded.clone();
+        let notify = self.notifier();
+        std::thread::spawn(move || {
+            // Only the newest read keeps its copy, so an older one that
+            // finishes late does not replace it.
+            let current = || latest.load(Ordering::Acquire) == read;
+            let loaded = crate::team_lib::load(library.as_deref(), &keys, &app_dir(), &current);
+            if let Ok(mut s) = slot.lock()
+                && s.as_ref().is_none_or(|(had, _)| *had < read)
+            {
+                *s = Some((read, loaded));
+            }
+            notify();
+        });
+    }
+
+    fn poll_team(&mut self) {
+        let loaded = match self.team_loaded.lock() {
+            Ok(mut s) => s.take(),
+            Err(_) => return,
+        };
+        if let Some((read, loaded)) = loaded
+            && read == self.team_read
+        {
+            self.use_team(loaded);
+        }
+        if self.team_note_pending.is_some() {
+            if DIALOG_OPEN.get() {
+                // Said once the dialog open now closes: look again soon,
+                // one wait at a time.
+                if !self.team_note_retry.swap(true, Ordering::AcqRel) {
+                    let notify = self.notifier();
+                    let retry = self.team_note_retry.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        retry.store(false, Ordering::Release);
+                        notify();
+                    });
+                }
+            } else {
+                self.queued
+                    .extend(self.team_note_pending.take().map(Command::Notice));
+            }
+        }
+    }
+
+    /// Puts team library `loaded` to use: its connections in the
+    /// connection manager, its rules on the next connection.
+    fn use_team(&mut self, loaded: crate::team_lib::Loaded) {
+        if loaded.note.is_some() && loaded.note != self.team_note {
+            // Shown by poll_team when no other dialog is open.
+            self.team_note_pending.clone_from(&loaded.note);
+        } else if loaded.note.is_none() {
+            self.team_note_pending = None;
+        }
+        self.team_note = loaded.note;
+        if loaded.team == self.settings.team {
+            return;
+        }
+        crate::team_lib::set_current(loaded.team.clone());
+        self.settings.team = loaded.team;
+        self.reload_sessions(None);
+        if self.rules_native() {
+            self.reload_rules();
+        }
+        self.refresh_chrome();
+    }
+
+    /// The names in `names` that are not the team library's; a notice
+    /// names the others, which cannot be changed here.
+    fn not_team(&mut self, names: &[String]) -> Vec<String> {
+        let (team, own): (Vec<String>, Vec<String>) = names
+            .iter()
+            .cloned()
+            .partition(|n| self.settings.is_team(n));
+        if !team.is_empty() {
+            self.queued.push(Command::Notice(format!(
+                "Left as they are: {}. They come from the team library, which cannot be \
+                 changed here.",
+                crate::bulk::name_list(&team)
+            )));
+        }
+        own
     }
 
     /// Reads the hosts again after a session was saved or deleted.
@@ -19204,6 +19443,8 @@ impl Window {
             cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
             cmd::NEW_KEY => return Some(Command::NewKey),
             cmd::EXPORT
+            | cmd::TEAM_EXPORT
+            | cmd::TEAM_LIBRARY
             | cmd::IMPORT_SEALED
             | cmd::VAULT_SET
             | cmd::VAULT_USE
@@ -23488,7 +23729,10 @@ fn conn_event(hwnd: HWND, event: conn_view::Event) {
             None
         }
         Event::Refresh => {
-            with_window(|w| w.show_side(SideView::Sessions, true));
+            with_window(|w| {
+                w.refresh_team();
+                w.show_side(SideView::Sessions, true);
+            });
             None
         }
     };
@@ -24276,6 +24520,10 @@ fn rules_event(hwnd: HWND, event: rules_panel::Event) {
     use rules_panel::Event;
     match event {
         Event::New => edit_rule(hwnd, None),
+        Event::Edit(row) | Event::Delete(row) if row.team => {
+            dialog(hwnd, rules_panel::TEAM_RULE, MB_OK | MB_ICONINFORMATION);
+            return;
+        }
         Event::Edit(row) => edit_rule(hwnd, Some((row.index, row.rule))),
         Event::Delete(row) => {
             save_rules(hwnd, |rules| {
@@ -24302,6 +24550,123 @@ fn rules_event(hwnd: HWND, event: rules_panel::Event) {
         }
         w.refresh_chrome();
     });
+}
+
+/// Settings > Team library: where the team's library is and the key it
+/// must be signed with. Saved, then read again at once.
+fn team_library_settings(hwnd: HWND) {
+    if DIALOG_OPEN.get() {
+        return;
+    }
+    let Some((library, key)) = with_window(|w| {
+        (
+            w.settings.team_library.clone().unwrap_or_default(),
+            w.settings.team_library_keys.join(" | "),
+        )
+    }) else {
+        return;
+    };
+    let intro = "A team library is a file of connections and security and theme rules that \
+                 an administrator exports from FeroSSH (File > Import and export > Export \
+                 team library), signs with an SSH key and puts on a share or in a synced \
+                 folder. FeroSSH reads it at start and on Refresh in the connection manager, \
+                 only when its .sig matches the key below, and shows its connections in the \
+                 Team folder. They cannot be changed here, and its rules apply first. Leave \
+                 the file empty for none.";
+    let mut answer_fields = (library, key);
+    loop {
+        DIALOG_OPEN.set(true);
+        let answer = crate::fields_view::ask(
+            hwnd,
+            &crate::fields_view::Ask {
+                title: "Team library",
+                intro,
+                fields: &[
+                    ("Library file", &answer_fields.0),
+                    ("Signing key (ssh-ed25519 AAAA...)", &answer_fields.1),
+                ],
+                checks: &[],
+                option: None,
+                ok: "Save",
+                cancel: "Cancel",
+            },
+        );
+        DIALOG_OPEN.set(false);
+        let Some(answer) = answer else {
+            return;
+        };
+        let mut f = answer.fields.into_iter();
+        let library = f
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_owned();
+        let key_text = f.next().unwrap_or_default();
+        let keys: Vec<String> = key_text
+            .split('|')
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty())
+            .collect();
+        answer_fields = (library.clone(), key_text);
+        if !library.is_empty() {
+            if keys.is_empty() {
+                dialog(
+                    hwnd,
+                    "Paste the public key the library is signed with: one line, as in the \
+                     administrator's .pub file.",
+                    MB_OK | MB_ICONWARNING,
+                );
+                continue;
+            }
+            if ferossh_config::team::keys(&keys).len() != keys.len() {
+                dialog(
+                    hwnd,
+                    "That is not an SSH public key. Paste one line from the administrator's \
+                     .pub file (ssh-ed25519 AAAA... or ssh-rsa AAAA...).",
+                    MB_OK | MB_ICONWARNING,
+                );
+                continue;
+            }
+        }
+        let saved = with_window(|w| {
+            let before = (
+                w.settings.team_library.clone(),
+                w.settings.team_library_keys.clone(),
+            );
+            // A read still running under the old settings keeps no copy
+            // from now on.
+            w.team_read += 1;
+            crate::team_lib::newest(&w.team_latest, w.team_read);
+            w.settings.team_library = Some(library).filter(|l| !l.is_empty());
+            w.settings.team_library_keys = if w.settings.team_library.is_some() {
+                keys
+            } else {
+                Vec::new()
+            };
+            let saved = w.try_save_settings();
+            if saved.is_err() {
+                (w.settings.team_library, w.settings.team_library_keys) = before;
+            } else {
+                // Said again if it still fails.
+                w.team_note = None;
+            }
+            // Read again under whichever settings stand now.
+            w.refresh_team();
+            saved
+        });
+        if let Some(Err(e)) = saved {
+            dialog(
+                hwnd,
+                &format!("Could not save the settings: {e}"),
+                MB_OK | MB_ICONERROR,
+            );
+            continue;
+        }
+        let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
+        run_commands(hwnd, next);
+        return;
+    }
 }
 
 /// Changes the security rules with `change` and saves them; on a
@@ -25624,6 +25989,8 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::KeyBindings => key_bindings(hwnd),
         Command::Vault(id) => match id {
             cmd::EXPORT => vault_ui::export(hwnd),
+            cmd::TEAM_EXPORT => vault_ui::export_team(hwnd),
+            cmd::TEAM_LIBRARY => team_library_settings(hwnd),
             cmd::IMPORT_SEALED => vault_ui::import(hwnd),
             cmd::VAULT_SET => vault_ui::set(hwnd),
             cmd::VAULT_USE => vault_ui::use_file(hwnd),
