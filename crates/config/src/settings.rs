@@ -40,6 +40,10 @@
 //!     Tags production
 //!     Theme Production
 //!     Tint 800000 60
+//! ThemeRule
+//!     Tags lab
+//!     Font "JetBrains Mono"
+//!     FontSize 11
 //! SecurityRule
 //!     Tags production
 //!     KeysOnly yes
@@ -1862,6 +1866,12 @@ impl Settings {
                             "hosts" => r.hosts.extend(args),
                             "tags" => r.tags.extend(args),
                             "theme" => r.theme = joined,
+                            "font" => r.font = Some(joined).filter(|f| !f.is_empty()),
+                            "fontsize" => {
+                                r.font_size = first
+                                    .and_then(|v| v.parse::<f32>().ok())
+                                    .filter(|v| (4.0..=96.0).contains(v));
+                            }
                             "tint" => {
                                 let rgb = first.as_deref().and_then(hex_rgb);
                                 let amount = args.get(1).and_then(|a| a.parse::<u8>().ok());
@@ -1970,7 +1980,7 @@ impl Settings {
             }
         }
         s.theme_rules
-            .retain(|r| !r.theme.is_empty() && !(r.hosts.is_empty() && r.tags.is_empty()));
+            .retain(|r| r.sets_something() && !(r.hosts.is_empty() && r.tags.is_empty()));
         s.security_rules.retain(|r| !r.is_inert());
         s.highlight_rules
             .retain(|r| r.regex().is_some() && (r.styled() || r.stop));
@@ -2163,7 +2173,15 @@ impl Settings {
                 let tags: Vec<String> = r.tags.iter().map(|t| arg(t)).collect();
                 let _ = writeln!(out, "    Tags {}", tags.join(" "));
             }
-            let _ = writeln!(out, "    Theme {}", arg(&r.theme));
+            if !r.theme.is_empty() {
+                let _ = writeln!(out, "    Theme {}", arg(&r.theme));
+            }
+            if let Some(font) = &r.font {
+                let _ = writeln!(out, "    Font {}", arg(font));
+            }
+            if let Some(size) = r.font_size {
+                let _ = writeln!(out, "    FontSize {size}");
+            }
             if let Some(([red, green, blue], amount)) = r.tint {
                 let _ = writeln!(out, "    Tint {red:02x}{green:02x}{blue:02x} {amount}");
             }
@@ -3459,5 +3477,26 @@ DesktopShareSelection yes
         });
         assert!(p.log_session);
         assert!(s.policy(&Subject::default()).is_empty());
+    }
+
+    #[test]
+    fn theme_rules_keep_a_font_and_may_set_no_theme() {
+        let text = "ThemeRule\n    Tags lab \"my team\"\n    Font \"JetBrains Mono\"\n    FontSize 11.5\n\
+                    ThemeRule\n    Tags web\n    Theme Dracula\n\
+                    ThemeRule\n    Tags empty\n";
+        let s = Settings::parse(text);
+        assert_eq!(
+            s.theme_rules.len(),
+            2,
+            "a rule that sets nothing is dropped"
+        );
+        let lab = &s.theme_rules[0];
+        assert_eq!(lab.tags, ["lab", "my team"]);
+        assert_eq!(lab.theme, "");
+        assert_eq!(lab.font.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(lab.font_size, Some(11.5));
+        let again = Settings::parse(&s.to_text());
+        assert_eq!(again.theme_rules, s.theme_rules);
+        assert!(!s.to_text().contains("Theme \n"));
     }
 }

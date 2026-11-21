@@ -99,6 +99,8 @@ mod script_report;
 #[cfg(windows)]
 mod scripts_panel;
 #[cfg(windows)]
+mod theme_panel;
+#[cfg(windows)]
 mod toast;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -209,6 +211,8 @@ mod suggest;
 mod tabstrip;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod telnet;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod theme_view;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod tmux;
 #[cfg(all(test, unix))]

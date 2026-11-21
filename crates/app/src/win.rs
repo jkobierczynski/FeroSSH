@@ -175,6 +175,7 @@ use crate::statusbar;
 use crate::suggest;
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::telnet::{TelnetSession, TelnetTarget};
+use crate::theme_panel;
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
 use crate::tmux_keys::{self, Action as TmuxKey};
 use crate::toolpane::{self, RailItem};
@@ -619,6 +620,8 @@ mod cmd {
     pub const NEW_KEY: u32 = 639;
     /// Tools > Credential manager.
     pub const CREDENTIAL_MANAGER: u32 = 680;
+    /// Tools > Theme manager.
+    pub const THEME_MANAGER: u32 = 682;
     /// Session > Copy public key to this server.
     pub const COPY_ID: u32 = 640;
     /// Session > Logs and recordings > Record this pane (asciicast), and Play a recording.
@@ -1258,6 +1261,8 @@ enum SideView {
     Inventory,
     /// The credential manager (native controls only).
     Credentials,
+    /// The theme manager (native controls only).
+    Themes,
     /// The command palette, shown over whatever the side pane showed.
     Palette,
 }
@@ -2859,6 +2864,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
+                RailItem::Themes => cmd::THEME_MANAGER,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => cmd::TOOLS_PIN,
             });
@@ -2885,6 +2891,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = inventory_panel::create(hwnd, inventory_event, dpi);
         // The credential manager's, likewise.
         let _ = credential_panel::create(hwnd, credential_event, dpi);
+        // The theme manager's, likewise.
+        let _ = theme_panel::create(hwnd, theme_event, dpi);
         // The scripts pane's, likewise.
         let _ = scripts_panel::create(hwnd, scripts_event, dpi);
         // The script editor's, likewise.
@@ -2992,6 +3000,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || known_hosts_panel::pre_translate(&msg)
                 || inventory_panel::pre_translate(&msg)
                 || credential_panel::pre_translate(&msg)
+                || theme_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
                 || script_editor::pre_translate(&msg)
                 || script_args::pre_translate(&msg)
@@ -3357,6 +3366,7 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         separator(tools)?;
         item(tools, cmd::CREDENTIAL_MANAGER, "Cre&dential manager")?;
+        item(tools, cmd::THEME_MANAGER, "T&heme manager")?;
         item(tools, cmd::NEW_KEY, "New SSH &key...")?;
         item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
 
@@ -12149,6 +12159,7 @@ impl Window {
             SideView::KnownHosts => RailItem::KnownHosts,
             SideView::Inventory => RailItem::Inventory,
             SideView::Credentials => RailItem::Credentials,
+            SideView::Themes => RailItem::Themes,
             SideView::Palette => RailItem::Palette,
         });
         rail::Look {
@@ -12227,6 +12238,19 @@ impl Window {
     /// Whether the credential manager shows (always native controls).
     fn credentials_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::Credentials
+    }
+
+    /// Reads the theme rules, themes and fonts again for Tools > Theme
+    /// manager, and shows them: what another FeroSSH changed in a shared
+    /// settings file first, as a save would.
+    fn reload_themes(&mut self) {
+        self.pull_vault_settings();
+        theme_panel::set_rows(self.theme_rows());
+    }
+
+    /// Whether the theme manager shows (always native controls).
+    fn themes_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Themes
     }
 
     /// Whether port forwards show as native controls.
@@ -12333,6 +12357,8 @@ impl Window {
             inventory_panel::has_focus()
         } else if self.credentials_native() {
             credential_panel::has_focus()
+        } else if self.themes_native() {
+            theme_panel::has_focus()
         } else if self.scripts_native() {
             scripts_panel::has_focus()
         } else if self.script_editor_native() {
@@ -12419,6 +12445,11 @@ impl Window {
             credential_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             credential_panel::place(None, 0, self.dpi);
+        }
+        if self.themes_native() {
+            theme_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            theme_panel::place(None, 0, self.dpi);
         }
         if self.scripts_native() {
             scripts_panel::seed_folds(self.settings.expanded_script_cats.clone());
@@ -12525,6 +12556,7 @@ impl Window {
             || self.known_hosts_native()
             || self.inventory_native()
             || self.credentials_native()
+            || self.themes_native()
             || self.scripts_native()
             || self.script_editor_native()
             || self.script_args_native()
@@ -12626,11 +12658,12 @@ impl Window {
                     );
                 }
                 // Native controls (`files_panel`, `known_hosts_panel`,
-                // `inventory_panel`, `credential_panel`).
+                // `inventory_panel`, `credential_panel`, `theme_panel`).
                 SideView::Files
                 | SideView::KnownHosts
                 | SideView::Inventory
-                | SideView::Credentials => {}
+                | SideView::Credentials
+                | SideView::Themes => {}
             }
             self.invalidate_grid(side);
         }
@@ -13579,6 +13612,7 @@ impl Window {
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
+                RailItem::Themes => cmd::THEME_MANAGER,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => return String::new(),
             };
@@ -13919,6 +13953,11 @@ impl Window {
         self.side.visible && self.side.focused && self.side.view == SideView::Credentials
     }
 
+    /// Whether a paste is for the theme manager.
+    fn themes_paste(&self) -> bool {
+        self.side.visible && self.side.focused && self.side.view == SideView::Themes
+    }
+
     fn paste_side(&mut self, text: &str) -> bool {
         if self.side.visible
             && self.side.focused
@@ -13933,7 +13972,11 @@ impl Window {
         // event needs the window, so the paste comes after this borrow);
         // the list has nowhere to paste into, and the terminal behind must
         // not get it either.
-        if self.known_hosts_paste() || self.inventory_paste() || self.credentials_paste() {
+        if self.known_hosts_paste()
+            || self.inventory_paste()
+            || self.credentials_paste()
+            || self.themes_paste()
+        {
             return true;
         }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
@@ -15519,6 +15562,53 @@ impl Window {
     /// connections that pick it, and every password FeroSSH keeps (in the
     /// Windows Credential Manager or the vault) with the connections whose
     /// login keeps it there. No password is kept in a row.
+    /// Tools > Theme manager: the theme rules with the saved connections
+    /// each matches, then the built-in and custom themes and the fonts,
+    /// each with the connections that open with it.
+    fn theme_rows(&self) -> Vec<crate::theme_view::Row> {
+        use crate::theme_view::{Connection, Font, rows};
+        let all: Vec<Connection> = host_items(&ssh_env(), &self.settings)
+            .into_iter()
+            .map(|h| {
+                let hostname = h.hostname.clone().unwrap_or_else(|| h.name.clone());
+                // ssh_config's Tag comes first; the connection's own tags
+                // are added to it again by the look.
+                let (font, theme) =
+                    self.host_look(&h.name, &hostname, h.tags.first().map(String::as_str));
+                Connection {
+                    name: h.name,
+                    hostname: h.hostname,
+                    tags: h.tags,
+                    theme: theme.name.to_owned(),
+                    font: font.family,
+                }
+            })
+            .collect();
+        let builtin: Vec<(&str, &str)> = Theme::builtin()
+            .iter()
+            .map(|t| {
+                let kind = match t.group() {
+                    ThemeGroup::Dark => "Dark",
+                    ThemeGroup::Light => "Light",
+                    ThemeGroup::Warning => "Warning",
+                    ThemeGroup::Classic => "Classic",
+                };
+                (t.name, kind)
+            })
+            .collect();
+        let custom: Vec<&str> = self.custom_themes.iter().map(|c| c.theme.name).collect();
+        let fonts: Vec<Font> = FONT_CHOICES
+            .iter()
+            .enumerate()
+            .map(|(i, f)| Font {
+                family: (*f).to_owned(),
+                installed: self.renderer.has_family(f),
+                windows: i < WINDOWS_FONTS,
+            })
+            .collect();
+        rows(&self.settings.theme_rules, &builtin, &custom, &fonts, &all)
+    }
+
     fn credential_rows(&self) -> Vec<crate::credential_view::Row> {
         use crate::credential_view::{Place, credential_rows, password_row};
         let mut rows = credential_rows(&self.settings);
@@ -17270,6 +17360,7 @@ impl Window {
             SideView::KnownHosts => self.reload_known_hosts(),
             SideView::Inventory => self.reload_inventory(),
             SideView::Credentials => self.reload_credentials(),
+            SideView::Themes => self.reload_themes(),
             SideView::Live => {
                 let all = self.open_sessions();
                 self.live_view.reset(&all);
@@ -17311,6 +17402,7 @@ impl Window {
             cmd::KNOWN_HOSTS => SideView::KnownHosts,
             cmd::INVENTORY => SideView::Inventory,
             cmd::CREDENTIAL_MANAGER => SideView::Credentials,
+            cmd::THEME_MANAGER => SideView::Themes,
             _ => SideView::Sessions,
         };
         let open = self.side.visible && self.side.view == view;
@@ -19349,7 +19441,8 @@ impl Window {
     }
 
     /// A host's font and theme (`look::for_host`), with a custom theme's
-    /// own font and size where the connection sets none.
+    /// own font and size where neither the connection nor a theme rule
+    /// sets one.
     fn host_look(&self, alias: &str, hostname: &str, tag: Option<&str>) -> (FontSpec, Theme) {
         let (mut font, theme) = look::for_host(
             &self.settings,
@@ -19360,15 +19453,13 @@ impl Window {
             &self.default_theme,
         );
         if let Some(c) = self.custom_named(theme.name) {
-            let profile = self.settings.profile(alias);
-            let family = profile
-                .and_then(|p| p.font.clone())
+            // The connection's own font, then a theme rule's, then the
+            // custom theme's.
+            let (own, own_size) = look::own_font(&self.settings, alias, hostname, tag);
+            let family = own
                 .or_else(|| c.font.clone())
                 .unwrap_or_else(|| font.family.clone());
-            let size = profile
-                .and_then(|p| p.font_size)
-                .or(c.size)
-                .unwrap_or(font.size_pt);
+            let size = own_size.or(c.size).unwrap_or(font.size_pt);
             if self.renderer.has_family(&family) {
                 font = FontSpec::new(&family, size);
             }
@@ -19924,6 +20015,10 @@ impl Window {
                 (
                     cmd::CREDENTIAL_MANAGER,
                     self.side.visible && self.side.view == SideView::Credentials,
+                ),
+                (
+                    cmd::THEME_MANAGER,
+                    self.side.visible && self.side.view == SideView::Themes,
                 ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
@@ -22741,6 +22836,7 @@ fn tools_have_focus() -> bool {
         || known_hosts_panel::has_focus()
         || inventory_panel::has_focus()
         || credential_panel::has_focus()
+        || theme_panel::has_focus()
 }
 
 /// Carries out what the user did on a script run's report: its keys go
@@ -23408,6 +23504,245 @@ fn credential_event(hwnd: HWND, event: credential_panel::Event) {
     });
 }
 
+/// Carries out what the user did in the theme manager: New, Edit and
+/// Delete happen here, and the list is read again after.
+fn theme_event(hwnd: HWND, event: theme_panel::Event) {
+    use theme_panel::Event;
+    match event {
+        Event::New { theme, font } => edit_theme_rule(hwnd, None, theme, font),
+        Event::Edit(row) => {
+            if let Some(rule) = row.rule {
+                edit_theme_rule(hwnd, Some((row.index, rule)), None, None);
+            }
+        }
+        Event::Delete(row) => {
+            if let Some(rule) = row.rule {
+                save_theme_rules(hwnd, |rules| {
+                    // Only the rule asked about: the list may have changed
+                    // under it (a vault sync).
+                    if let Some(i) = find_theme_rule(rules, row.index, &rule) {
+                        rules.remove(i);
+                    }
+                });
+            }
+        }
+        Event::Reload => {}
+        Event::Focused => {
+            tools_focused();
+            return;
+        }
+        Event::Leave => {
+            with_window(Window::focus_terminal);
+            return;
+        }
+    }
+    with_window(|w| {
+        if w.themes_native() {
+            w.reload_themes();
+        }
+        w.refresh_chrome();
+    });
+}
+
+/// Changes the theme rules with `change` and saves them; on a failed
+/// save they stay as they were, and the user is told.
+fn save_theme_rules(hwnd: HWND, change: impl FnOnce(&mut Vec<ferossh_config::ThemeRule>)) -> bool {
+    let Some(result) = with_window(|w| {
+        w.pull_vault_settings();
+        let before = w.settings.theme_rules.clone();
+        change(&mut w.settings.theme_rules);
+        let saved = w.try_save_settings();
+        if saved.is_err() {
+            w.settings.theme_rules = before;
+        }
+        saved
+    }) else {
+        return false;
+    };
+    let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
+    run_commands(hwnd, next);
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+            false
+        }
+    }
+}
+
+/// Where `rule` is in `rules` now: at `index` as it was shown, or else
+/// the first one just like it (the list changed under it).
+fn find_theme_rule(
+    rules: &[ferossh_config::ThemeRule],
+    index: usize,
+    rule: &ferossh_config::ThemeRule,
+) -> Option<usize> {
+    if rules.get(index) == Some(rule) {
+        return Some(index);
+    }
+    rules.iter().position(|r| r == rule)
+}
+
+/// The note when a theme rule changed elsewhere before it could be saved.
+const THEME_RULE_CHANGED: &str = "This theme rule was changed or deleted elsewhere (another \
+                                  FeroSSH sharing the settings) while it was open. Nothing was \
+                                  saved; Reload shows the rules as they are now.";
+
+/// Opens theme rule `shown` (its place as listed, and the rule then), or
+/// a new one starting with `theme` and `font`, to change; saves it once
+/// it names some connections and sets something.
+fn edit_theme_rule(
+    hwnd: HWND,
+    shown: Option<(usize, ferossh_config::ThemeRule)>,
+    theme: Option<String>,
+    font: Option<String>,
+) {
+    use crate::theme_view::{Typed, check, words_text};
+    let index = shown.as_ref().map(|(i, _)| *i);
+    let original = shown.clone().map(|(_, rule)| rule);
+    if let Some((i, rule)) = &shown
+        && with_window(|w| find_theme_rule(&w.settings.theme_rules, *i, rule))
+            .flatten()
+            .is_none()
+    {
+        dialog(hwnd, THEME_RULE_CHANGED, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    let mut typed = match &original {
+        Some(r) => Typed {
+            hosts: words_text(&r.hosts),
+            tags: words_text(&r.tags),
+            theme: r.theme.clone(),
+            font: r.font.clone().unwrap_or_default(),
+            size: r.font_size.map(|s| s.to_string()).unwrap_or_default(),
+        },
+        None => Typed {
+            theme: theme.unwrap_or_default(),
+            font: font.unwrap_or_default(),
+            ..Typed::default()
+        },
+    };
+    let title = match index {
+        Some(i) => format!("Theme rule {}", i + 1),
+        None => "New theme rule".to_owned(),
+    };
+    let intro = "Which connections: tags and host name patterns, separated by spaces \
+                 (\"quotes\" around one with spaces; * and ? work). A connection with any of \
+                 them opens with the theme, font and size set here, unless the connection \
+                 sets its own. Leave any of the three empty to keep what it would get \
+                 anyway. The first rule that sets each wins. Names as the Theme manager \
+                 lists them; changes apply to connections opened from now on.";
+    loop {
+        if DIALOG_OPEN.get() {
+            return;
+        }
+        DIALOG_OPEN.set(true);
+        let answer = crate::fields_view::ask(
+            hwnd,
+            &crate::fields_view::Ask {
+                title: &title,
+                intro,
+                fields: &[
+                    ("Tags", &typed.tags),
+                    ("Hosts", &typed.hosts),
+                    ("Theme", &typed.theme),
+                    ("Font", &typed.font),
+                    ("Font size (points)", &typed.size),
+                ],
+                option: original.as_ref().map(|_| ("Delete this rule", false)),
+                ok: "Save",
+                cancel: "Cancel",
+            },
+        );
+        DIALOG_OPEN.set(false);
+        let Some(answer) = answer else {
+            return;
+        };
+        let mut f = answer.fields.into_iter();
+        typed = Typed {
+            tags: f.next().unwrap_or_default(),
+            hosts: f.next().unwrap_or_default(),
+            theme: f.next().unwrap_or_default(),
+            font: f.next().unwrap_or_default(),
+            size: f.next().unwrap_or_default(),
+        };
+        if answer.option
+            && let (Some(i), Some(o)) = (index, &original)
+        {
+            let question = with_window(|w| {
+                w.theme_rows()
+                    .into_iter()
+                    .find(|r| r.rule.as_ref() == Some(o) && r.index == i)
+                    .map(|r| crate::theme_view::delete_question(&r))
+            })
+            .flatten()
+            .unwrap_or_else(|| {
+                format!(
+                    "Delete theme rule {} ({})?",
+                    i + 1,
+                    crate::ssh::sanitize_line(&o.describe_match())
+                )
+            });
+            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+                continue;
+            }
+            let lost = std::cell::Cell::new(false);
+            let saved = save_theme_rules(hwnd, |rules| match find_theme_rule(rules, i, o) {
+                Some(at) => {
+                    rules.remove(at);
+                }
+                None => lost.set(true),
+            });
+            if lost.get() {
+                dialog(hwnd, THEME_RULE_CHANGED, MB_OK | MB_ICONWARNING);
+                return;
+            }
+            if saved {
+                return;
+            }
+            continue;
+        }
+        let checked = with_window(|w| {
+            let mut themes: Vec<&str> = Theme::builtin().iter().map(|t| t.name).collect();
+            themes.extend(w.custom_themes.iter().map(|c| c.theme.name));
+            check(&typed, original.as_ref(), &themes, &FONT_CHOICES, |f| {
+                w.renderer.has_family(f)
+            })
+        });
+        let rule = match checked {
+            Some(Ok(rule)) => rule,
+            Some(Err(why)) => {
+                dialog(hwnd, &why, MB_OK | MB_ICONWARNING);
+                continue;
+            }
+            None => return,
+        };
+        let old = original.clone();
+        let lost = std::cell::Cell::new(false);
+        let saved = save_theme_rules(hwnd, |rules| match (index, &old) {
+            // Edited where it is now; one changed or deleted elsewhere
+            // meanwhile is left alone (never added a second time).
+            (Some(i), Some(old)) => match find_theme_rule(rules, i, old) {
+                Some(at) => {
+                    if let Some(r) = rules.get_mut(at) {
+                        *r = rule;
+                    }
+                }
+                None => lost.set(true),
+            },
+            _ => rules.push(rule),
+        });
+        if lost.get() {
+            dialog(hwnd, THEME_RULE_CHANGED, MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if saved {
+            return;
+        }
+        // Not saved: the form again, with what was typed.
+    }
+}
+
 /// Opens credential `original` (or a new one) to change, rename or
 /// delete; saves what is typed once it checks out.
 fn edit_credential(hwnd: HWND, original: Option<String>) {
@@ -23844,6 +24179,7 @@ fn is_side_pane(id: u32) -> bool {
             | cmd::KNOWN_HOSTS
             | cmd::INVENTORY
             | cmd::CREDENTIAL_MANAGER
+            | cmd::THEME_MANAGER
     )
 }
 
@@ -24074,6 +24410,9 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
                 if with_window(|w| w.credentials_paste()) == Some(true) {
                     credential_panel::paste(&text);
+                }
+                if with_window(|w| w.themes_paste()) == Some(true) {
+                    theme_panel::paste(&text);
                 }
                 return;
             }
@@ -26701,6 +27040,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && with_window(|w| w.credentials_native()) == Some(true) => {
                         credential_panel::focus_search();
                     }
+                    1 if want && with_window(|w| w.themes_native()) == Some(true) => {
+                        theme_panel::focus_search();
+                    }
                     1 if want && scripts => scripts_panel::focus_first(),
                     1 if want && editor => script_editor::focus_first(),
                     1 if want && args => script_args::focus_first(),
@@ -26845,6 +27187,7 @@ mod tests {
             cmd::KNOWN_HOSTS,
             cmd::INVENTORY,
             cmd::CREDENTIAL_MANAGER,
+            cmd::THEME_MANAGER,
         ] {
             assert!(is_side_pane(id), "{id}");
         }

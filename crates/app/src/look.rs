@@ -1,6 +1,8 @@
 //! How a pane connected to a host looks: its session profile first, then
-//! the colour theme rules (host patterns, ssh_config `Tag` and the
-//! connection's own `Tags`), then the defaults.
+//! the theme rules (host patterns, ssh_config `Tag` and the connection's
+//! own `Tags`; Tools > Theme manager), then the defaults. A rule may set a
+//! theme, a font, a size or any of them; each comes from the first rule
+//! that sets it.
 
 use ferossh_config::Settings;
 use ferossh_render::{FontSpec, Rgb, Theme};
@@ -17,13 +19,10 @@ pub fn for_host(
     default_theme: &Theme,
 ) -> (FontSpec, Theme) {
     let profile = settings.profile(alias);
+    let (family, size) = own_font(settings, alias, hostname, tag);
     let font = FontSpec::new(
-        profile
-            .and_then(|p| p.font.as_deref())
-            .unwrap_or(&default_font.family),
-        profile
-            .and_then(|p| p.font_size)
-            .unwrap_or(default_font.size_pt),
+        family.as_deref().unwrap_or(&default_font.family),
+        size.unwrap_or(default_font.size_pt),
     );
     let all = ferossh_config::settings::host_tags(tag, profile);
     let tags: Vec<&str> = all.iter().map(String::as_str).collect();
@@ -43,6 +42,33 @@ pub fn for_host(
         })
         .unwrap_or_else(|| default_theme.clone());
     (font, theme)
+}
+
+/// The font family and size a host's connection or a theme rule sets:
+/// the connection's own first, then the first rule that sets each.
+/// `None` where neither does (the theme's or the window's then).
+pub fn own_font(
+    settings: &Settings,
+    alias: &str,
+    hostname: &str,
+    tag: Option<&str>,
+) -> (Option<String>, Option<f32>) {
+    let profile = settings.profile(alias);
+    let all = ferossh_config::settings::host_tags(tag, profile);
+    let tags: Vec<&str> = all.iter().map(String::as_str).collect();
+    let rules = settings.host_themes();
+    let family = profile.and_then(|p| p.font.clone()).or_else(|| {
+        rules
+            .font_for(alias, &tags)
+            .or_else(|| rules.font_for(hostname, &tags))
+            .map(str::to_owned)
+    });
+    let size = profile.and_then(|p| p.font_size).or_else(|| {
+        rules
+            .font_size_for(alias, &tags)
+            .or_else(|| rules.font_size_for(hostname, &tags))
+    });
+    (family, size)
 }
 
 #[cfg(test)]
@@ -118,5 +144,30 @@ Profile db
             "Production",
             "the first rule matching any tag wins, as with Tag alone"
         );
+    }
+
+    #[test]
+    fn a_rule_sets_the_font_unless_the_connection_does() {
+        let s = Settings::parse(
+            "ThemeRule\n    Tags lab\n    Font Hack\n    FontSize 14\n\
+             Profile box\n    Tags lab\n\
+             Profile own\n    Tags lab\n    Font Consolas\n",
+        );
+        let look = |alias| {
+            for_host(
+                &s,
+                alias,
+                "10.0.0.9",
+                None,
+                &FontSpec::default(),
+                &Theme::default(),
+            )
+        };
+        let (font, theme) = look("box");
+        assert_eq!((font.family.as_str(), font.size_pt), ("Hack", 14.0));
+        assert_eq!(theme, Theme::default(), "a font-only rule leaves the theme");
+        let (font, _) = look("own");
+        assert_eq!((font.family.as_str(), font.size_pt), ("Consolas", 14.0));
+        assert_eq!(own_font(&s, "other", "x", None), (None, None));
     }
 }

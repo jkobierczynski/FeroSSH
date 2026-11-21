@@ -92,6 +92,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Open scripts folder | | Opens `%APPDATA%\FeroSSH\scripts` in Explorer: one file per script, a folder per category, to copy to another PC or back up (see [The scripts folder](everyday-use.md#the-scripts-folder)). |
 | Command palette | Ctrl+Shift+A | One search box over every menu item, connection and script (see [Command palette](everyday-use.md#the-command-palette)). |
 | Credential manager | | Lists your named credentials and the passwords FeroSSH keeps, each with the connections that use it, to search, add, change, rename and delete (see [The credential manager](everyday-use.md#the-credential-manager)). |
+| Theme manager | | Lists the theme rules (tags or host patterns that pick a theme, font and size), the built-in themes, your own themes and the eighteen fonts, each with the connections that use it, to add, change and delete rules (see [The theme manager](everyday-use.md#the-theme-manager)). Also the palette on the tools rail. |
 | New SSH key... | | Makes an Ed25519 key file (with or without a passphrase) or a security key or Windows Hello key, and offers to copy it to the focused pane's host (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
 
 ## Window
@@ -318,6 +319,18 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Enter in the list, a double click or Edit... | Changes or renames the picked credential. |
 | New credential... | Makes a credential. |
 | Del or Delete... | Deletes the picked row, after asking. |
+| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
+
+### Theme manager
+
+| Key | Action |
+| --- | --- |
+| Typing | Searches themes, fonts, rules and connections; `-word` leaves rows out, `unused` finds what no connection uses. In the list it goes to the search box; Down there moves to the list. |
+| A click on a column heading | Sorts by that column within each group; again for the other way. |
+| A click on a group heading | Folds or unfolds the group. |
+| Enter in the list, a double click or Edit... | Changes the picked rule; on a theme or font (Use in a rule...), makes a new rule that starts with it. |
+| New rule... | Makes a rule. |
+| Del or Delete... | Deletes the picked rule, after asking. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 
 ### Scripts (Ctrl+Shift+Space)

@@ -30,7 +30,7 @@ const ID_OPTION: usize = 90;
 const SS_NOPREFIX: u32 = 0x80;
 const WIDTH: i32 = 480;
 /// Fields at most.
-const MAX_FIELDS: usize = 4;
+const MAX_FIELDS: usize = 5;
 
 /// What to ask.
 #[derive(Debug, Clone, Copy)]

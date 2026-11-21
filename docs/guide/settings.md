@@ -255,7 +255,7 @@ Only text in the terminal's own colours is recoloured. A rule that does not comp
 
 ## Theme rules
 
-Rules pick a theme from the host's name or its tags: ssh_config's `Tag` and the profile's own `Tags`. A host's profile wins over the rules, and the rules win over `--theme`.
+Rules pick a theme, a font and a font size from the host's name or its tags: ssh_config's `Tag` and the profile's own `Tags`. Tools > Theme manager edits these blocks for you. A host's profile wins over the rules, and the rules win over `--theme`. Each of theme, font and size comes from the first rule that sets it, so a rule may set only a font.
 
 ```
 ThemeRule
@@ -265,13 +265,19 @@ ThemeRule
     Tags staging
     Theme Nord
     Tint ffb000 40
+ThemeRule
+    Tags lab
+    Font "JetBrains Mono"
+    FontSize 11
 ```
 
 | Keyword | Meaning |
 | --- | --- |
 | `Hosts PATTERN...` | ssh_config-style host patterns; `!` excludes. |
 | `Tags TAG...` | Matches hosts with this tag, from ssh_config's `Tag` or the host's profile `Tags`. Patterns such as `prod*` work. |
-| `Theme NAME` | The theme to use. |
+| `Theme NAME` | The theme to use; optional when the rule sets a font. |
+| `Font FAMILY` | The font family to use, unless the connection sets its own. |
+| `FontSize POINTS` | The font size, 4 to 96 points, unless the connection sets its own. |
 | `Tint RRGGBB AMOUNT` | Mixes a colour into the theme by 0 to 255, for example a red tint over your usual theme. |
 
 Without any rules, hosts tagged `production`, `staging` or `development` get Production, Staging or Nord.
