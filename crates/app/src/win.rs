@@ -1531,6 +1531,9 @@ struct Window {
     /// Those of them no tab shows: they show only when the login needs
     /// an answer or fails.
     launch_hidden: HashSet<PaneId>,
+    /// Launch sessions shown because they got a security rule warning:
+    /// they stay in their tab when the desktop or app takes over.
+    launch_warned: HashSet<PaneId>,
     /// Remote Desktop Connections running on a connection's tunnel: the
     /// connection stays while they run.
     mstsc: Vec<(std::process::Child, ChannelId)>,
@@ -2850,6 +2853,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 clip_pane: None,
                 launches: HashMap::new(),
                 launch_hidden: HashSet::new(),
+                launch_warned: HashSet::new(),
                 mstsc: Vec::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
@@ -7244,10 +7248,20 @@ impl Window {
             return Policy::default();
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
-        // The folder the Connection manager shows it in: a FeroSSH
-        // connection's own, else the one its ssh_config (an import's
-        // file) gives it.
-        let folder = load_saved()
+        let folder = self.rule_folder(alias);
+        self.settings.policy(&Subject {
+            name: alias,
+            hostname,
+            tags: &tags,
+            folder: folder.as_deref(),
+        })
+    }
+
+    /// The folder the Connection manager shows connection `alias` in: a
+    /// FeroSSH connection's own, else the one its ssh_config (an
+    /// import's file) gives it.
+    fn rule_folder(&self, alias: &str) -> Option<String> {
+        load_saved()
             .into_iter()
             .find(|h| h.alias.eq_ignore_ascii_case(alias))
             .and_then(|h| h.folder)
@@ -7260,13 +7274,7 @@ impl Window {
                     .into_iter()
                     .find(|h| h.name.eq_ignore_ascii_case(alias))
                     .and_then(|h| h.folder)
-            });
-        self.settings.policy(&Subject {
-            name: alias,
-            hostname,
-            tags: &tags,
-            folder: folder.as_deref(),
-        })
+            })
     }
 
     /// Whether pane `id` may connect to `destination` now. A security
@@ -7521,7 +7529,70 @@ impl Window {
             self.show(id, &text);
             self.update_menu_checks();
         }
+        self.warn_rule_lines(id, alias, hostname, tag);
         policy
+    }
+
+    /// Says so in pane `id` when a rule for the connection has lines this
+    /// FeroSSH does not understand: a limit it may be meant to have, and
+    /// does not get.
+    fn warn_rule_lines(&mut self, id: PaneId, alias: &str, hostname: &str, tag: Option<&str>) {
+        self.warn_rule_lines_for(id, alias, hostname, tag, false);
+    }
+
+    /// [`Self::warn_rule_lines`] for connection `alias`, a jump host on the
+    /// way when `hop` (named in the warning).
+    fn warn_rule_lines_for(
+        &mut self,
+        id: PaneId,
+        alias: &str,
+        hostname: &str,
+        tag: Option<&str>,
+        hop: bool,
+    ) {
+        if self
+            .settings
+            .security_rules
+            .iter()
+            .all(|r| r.unknown.is_empty())
+        {
+            return;
+        }
+        let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
+        let folder = self.rule_folder(alias);
+        let lines = ferossh_config::host_policy::not_understood(
+            &self.settings.security_rules,
+            &Subject {
+                name: alias,
+                hostname: Some(hostname),
+                tags: &tags,
+                folder: folder.as_deref(),
+            },
+        );
+        if lines.is_empty() {
+            return;
+        }
+        let whose = if hop {
+            format!("jump host {}", crate::ssh::sanitize_line(alias))
+        } else {
+            "this connection".to_owned()
+        };
+        let text = format!(
+            "\x1b[0;33mA security rule for {whose} has lines this FeroSSH does not \
+             understand, so they are not applied: {}. See Tools > Security rules.\x1b[0m\r\n",
+            crate::ssh::sanitize_line(&lines.join("; "))
+        );
+        self.show(id, &text);
+        // The login session of a desktop or remote app is hidden and goes
+        // once the app holds the connection: shown in a tab instead, so
+        // the warning is seen and stays.
+        if self.launches.contains_key(&id) {
+            // Also one already shown (to confirm the connection, say).
+            self.launch_warned.insert(id);
+            if self.launch_hidden.contains(&id) {
+                self.reveal_launch(id);
+            }
+        }
     }
 
     /// Whether `destination` logs in over SSH: not a serial port, a
@@ -7686,6 +7757,12 @@ impl Window {
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
         let policy = self.apply_policy(id, &target.alias, &target.hostname, target.tag.as_deref());
+        // A jump host's rule lines not understood are said too, also when
+        // this pane shares a connection already open; its limits stay its
+        // own.
+        for j in &target.jumps {
+            self.warn_rule_lines_for(id, &j.alias, &j.hostname, j.tag.as_deref(), true);
+        }
         let x11 = target
             .forward_x11
             .then(|| self.x11_auth(id, shared))
@@ -7726,13 +7803,14 @@ impl Window {
             if !hops.is_empty() {
                 self.via.insert(channel, hops);
             }
-            let hop_policies: Vec<Policy> = session
+            let hop_targets: Vec<(String, String, Option<String>)> = session
                 .hops_mut()
                 .map(|hop| {
                     let t = &hop.target;
                     (t.alias.clone(), t.hostname.clone(), t.tag.clone())
                 })
-                .collect::<Vec<_>>()
+                .collect();
+            let hop_policies: Vec<Policy> = hop_targets
                 .into_iter()
                 .map(|(a, h, t)| self.policy_of(&a, Some(&h), t.as_deref()))
                 .collect();
@@ -16418,15 +16496,17 @@ impl Window {
                 self.end_host(id);
                 self.panes.remove(&id);
                 self.watches.remove(&id);
-            } else if self.ws.tabs.len() > 1
-                || self.ws.tab().is_some_and(|t| t.root.panes().len() > 1)
+            } else if !self.launch_warned.contains(&id)
+                && (self.ws.tabs.len() > 1
+                    || self.ws.tab().is_some_and(|t| t.root.panes().len() > 1))
             {
                 if let Some(c) = self.close_pane(id) {
                     self.queued.push(c);
                 }
             } else {
-                // The window's only tab: it stays, free for another
-                // connection.
+                // The window's only tab, or one showing a rule warning: it
+                // stays, free for another connection.
+                self.launch_warned.remove(&id);
                 self.end_host(id);
                 self.show(
                     id,
@@ -16439,6 +16519,7 @@ impl Window {
         let panes = &self.panes;
         self.launches.retain(|id, _| panes.contains_key(id));
         self.launch_hidden.retain(|id| panes.contains_key(id));
+        self.launch_warned.retain(|id| panes.contains_key(id));
         if self.mstsc.len() != before {
             self.prune_forwards();
         }
@@ -24054,6 +24135,17 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
                  work; a folder covers the folders inside it). A connection that matches \
                  any of them gets the limits ticked below, whatever its own settings say. \
                  Changes apply to connections opened from now on.";
+    let odd = original
+        .as_ref()
+        .filter(|r| !r.unknown.is_empty())
+        .map(|r| {
+            format!(
+                "{intro}\n\nThis rule also has lines this FeroSSH does not understand, kept in \
+                 the file as they are but not applied: {}.",
+                crate::ssh::sanitize_line(&r.unknown.join("; "))
+            )
+        });
+    let intro = odd.as_deref().unwrap_or(intro);
     loop {
         if DIALOG_OPEN.get() {
             return;
@@ -24092,8 +24184,16 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
             tags: words(f.next().map_or("", String::as_str)),
             folders: words(f.next().map_or("", String::as_str)),
             limits: Policy::from_flags(&answer.checks),
+            // Lines the form cannot show stay as they were.
+            unknown: rule.unknown.clone(),
         };
-        if rule.hosts.is_empty() && rule.tags.is_empty() && rule.folders.is_empty() {
+        // A rule kept with lines not understood (perhaps naming its
+        // connections in a newer way) may be saved as it is.
+        if rule.hosts.is_empty()
+            && rule.tags.is_empty()
+            && rule.folders.is_empty()
+            && rule.unknown.is_empty()
+        {
             dialog(
                 hwnd,
                 "Name the connections the rule is for: a host pattern, a tag or a folder.",
@@ -24101,7 +24201,9 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
             );
             continue;
         }
-        if rule.limits.is_empty() {
+        // A rule with lines not understood keeps them: it may still be
+        // saved with no limit ticked here.
+        if rule.limits.is_empty() && rule.unknown.is_empty() {
             dialog(hwnd, "Tick at least one limit.", MB_OK | MB_ICONWARNING);
             continue;
         }

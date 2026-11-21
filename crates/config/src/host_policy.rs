@@ -30,6 +30,11 @@ pub struct SecurityRule {
     /// so does every folder inside it.
     pub folders: Vec<String>,
     pub limits: Policy,
+    /// Lines of the rule this FeroSSH does not understand (a keyword
+    /// from a newer FeroSSH, a misspelling, a value like `KeysOnly 1`),
+    /// as written: kept and written back, never applied, and shown as a
+    /// warning so a limit is not lost without a word.
+    pub unknown: Vec<String>,
 }
 
 /// What a connection may not do. `Default` is no limit at all.
@@ -131,9 +136,22 @@ pub struct Subject<'a> {
 
 impl SecurityRule {
     /// Whether the rule names nothing to match, or limits nothing.
+    /// A rule with a line FeroSSH does not understand is never inert:
+    /// that line may be the one that names its connections or sets its
+    /// limit, and dropping the rule would lose it.
     pub fn is_inert(&self) -> bool {
-        (self.hosts.is_empty() && self.tags.is_empty() && self.folders.is_empty())
-            || self.limits.is_empty()
+        ((self.hosts.is_empty() && self.tags.is_empty() && self.folders.is_empty())
+            || self.limits.is_empty())
+            && self.unknown.is_empty()
+    }
+
+    /// The rule's lines FeroSSH does not understand, in words for a
+    /// warning: `not understood: KeysOnly 1; X11 no`. Empty when none.
+    pub fn describe_unknown(&self) -> String {
+        if self.unknown.is_empty() {
+            return String::new();
+        }
+        format!("not understood: {}", self.unknown.join("; "))
     }
 
     pub fn matches(&self, s: &Subject<'_>) -> bool {
@@ -246,6 +264,22 @@ pub fn words_text(list: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The lines FeroSSH does not understand in the rules that match
+/// `subject` (each once): limits it may be missing.
+pub fn not_understood<'a>(rules: &'a [SecurityRule], subject: &Subject<'_>) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for line in rules
+        .iter()
+        .filter(|r| r.matches(subject))
+        .flat_map(|r| r.unknown.iter())
+    {
+        if !out.contains(&line.as_str()) {
+            out.push(line);
+        }
+    }
+    out
 }
 
 /// The limits every matching rule adds up to.
@@ -386,5 +420,23 @@ mod tests {
             crate::settings::clipboard_ways(rule.clipboard_limit(Some("to-host")).as_deref()),
             (true, false)
         );
+    }
+
+    #[test]
+    fn a_rule_with_lines_not_understood_is_kept() {
+        let mut r = rule();
+        r.unknown.push("KeysOnly 1".into());
+        assert!(!r.is_inert());
+        assert_eq!(r.describe_unknown(), "not understood: KeysOnly 1");
+        r.tags.push("prod".into());
+        let tags = vec!["prod".to_owned()];
+        let subject = Subject {
+            name: "db",
+            tags: &tags,
+            ..Subject::default()
+        };
+        let rules = [r.clone(), r];
+        assert_eq!(not_understood(&rules, &subject), ["KeysOnly 1"]);
+        assert!(not_understood(&rules, &Subject::default()).is_empty());
     }
 }
