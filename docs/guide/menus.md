@@ -68,6 +68,7 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 | Hide menu bar (Alt shows it) | Ctrl+Shift+M | Hides the menu bar. Pressing Alt shows it again. |
 | Full screen | F11 | ✓ while on. The window drops its title bar, frame and menu bar and covers the whole monitor, taskbar too. F11 again (or this item) puts it back as it was, maximized or not. Alt still shows the menu bar; it hides again once a menu closes. |
 | F11 switches full screen | ✓ on | Off, F11 goes to the terminal like the other function keys, for programs that use it; Full screen stays in this menu and the command palette. With another key for Full screen (Key bindings), the item names that key. `FullScreenKey`. |
+| Allow deleting connection log entries | ✓ while on | Off until you turn it on. On, Tools > Connection log shows Delete..., which forgets what the log holds about one connection. `ConnectionLogDelete`. |
 | Key bindings... | | A window listing every action of the menus with its shortcuts and its default ones: change them, add a second key, take a key away, or reset one action or all of them. See [Key bindings](#key-bindings). `KeyBinding`. |
 | Open links > Open ssh:// links with FeroSSH, Open sftp:// links with FeroSSH | ✓ while on | Off until you turn them on. On, `ssh://` and `sftp://` links (in a browser, a wiki, an inventory) open in this `ferossh.exe`; written for your Windows account only, and taken out again when you turn it off. When another program opens them, FeroSSH offers itself in Windows' Default apps instead of taking over. See [Opening ssh:// links](everyday-use.md#opening-ssh-links). |
 | Master password > Set a master password... | | Moves your connections, settings and (if ticked) saved passwords into an encrypted vault, `connections.vault`. FeroSSH then asks for the master password when it starts. |
@@ -88,7 +89,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Port forwards | Ctrl+Shift+P | Lists, adds, changes and stops port forwards on live connections (see [Port forwards](everyday-use.md#port-forwards)). |
 | Scripts | Ctrl+Shift+Space | Lists your scripts by category, to type one into the pane or edit them (see [Scripts](everyday-use.md#scripts)). |
 | Known hosts | Ctrl+Shift+K | Lists the host keys in `known_hosts` to search, copy and remove, `@cert-authority` and `@revoked` lines and hashed host names included (see [Known hosts](everyday-use.md#known-hosts)). |
-| Inventory | Ctrl+Shift+I | Lists every connection with its last login, host key and, where read, OS and kernel, to search, sort, save as CSV and connect (see [Inventory](everyday-use.md#inventory)). |
+| Hosts | | One row per machine: the connections that reach the same address, with their users, ports, tags, latest login, host key and OS, to search, sort, connect and show in the connection manager (see [Hosts](everyday-use.md#hosts)). |
+| Connection log | Ctrl+Shift+I | Lists every connection with its last login, host key and, where read, OS and kernel, to search, sort, save as CSV and connect (see [Connection log](everyday-use.md#connection-log)). |
 | Open scripts folder | | Opens `%APPDATA%\FeroSSH\scripts` in Explorer: one file per script, a folder per category, to copy to another PC or back up (see [The scripts folder](everyday-use.md#the-scripts-folder)). |
 | Command palette | Ctrl+Shift+A | One search box over every menu item, connection and script (see [Command palette](everyday-use.md#the-command-palette)). |
 | Credential manager | | Lists your named credentials and the passwords FeroSSH keeps, each with the connections that use it, to search, add, change, rename and delete (see [The credential manager](everyday-use.md#the-credential-manager)). |
@@ -301,7 +303,18 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Right click or Shift+F10 | Copy fingerprint, Copy line and Remove for the entry. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 
-### Inventory (Ctrl+Shift+I)
+### Hosts
+
+| Key | Action |
+| --- | --- |
+| Typing | Searches with the connection manager's search words; a host shows when one of its connections matches. Plain words also look at the address, OS, kernel and fingerprints. In the list it goes to the search box; Down there moves to the list. |
+| A click on a column heading | Sorts by that column; again for the other way. |
+| Enter in the list, a double click or Connect | Opens the host's connection used last. |
+| Connections | Shows the host's connections in the connection manager (searched with `addr:`). |
+| F5 or Reload | Reads the connection log again. |
+| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
+
+### Connection log (Ctrl+Shift+I)
 
 | Key | Action |
 | --- | --- |
@@ -309,7 +322,8 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | A click on a column heading | Sorts by that column; again for the other way. |
 | Enter in the list, a double click or Connect | Opens the picked connection. |
 | Save CSV | Writes the rows shown, in their order, to the download folder. |
-| F5 or Reload | Reads the inventory again. |
+| Delete... or the Delete key | Only with Settings > Allow deleting connection log entries on: asks, then forgets the picked connection's last login, host key and OS. The connection stays. |
+| F5 or Reload | Reads the connection log again. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 
 ### Credential manager

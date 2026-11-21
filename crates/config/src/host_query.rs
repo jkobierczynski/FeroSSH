@@ -7,6 +7,8 @@
 //! ```
 //!
 //! - `name:`, `host:`, `user:` and `folder:` match part of the field.
+//! - `addr:` matches the whole host name (an IP address however it is
+//!   written: `2001:db8::1` is `2001:0db8:0:0:0:0:0:1`); `*` and `?` work.
 //! - `tag:` and `type:` match a whole tag or connection type; `*` and `?`
 //!   work as in `Host` patterns (`tag:prod*`).
 //! - `port:` matches the port number.
@@ -24,6 +26,8 @@ use crate::pattern::match_pattern;
 pub enum Field {
     Name,
     Host,
+    /// The whole host name, as [`canonical_address`] writes it.
+    Addr,
     User,
     Port,
     Folder,
@@ -36,6 +40,7 @@ impl Field {
         Some(match name.to_ascii_lowercase().as_str() {
             "name" => Self::Name,
             "host" | "hostname" => Self::Host,
+            "addr" | "address" => Self::Addr,
             "user" => Self::User,
             "port" => Self::Port,
             "folder" => Self::Folder,
@@ -195,6 +200,15 @@ impl Term {
             }
             Some(Field::Name) => has(h.name, v),
             Some(Field::Host) => h.hostname.is_some_and(|x| has(x, v)),
+            Some(Field::Addr) => {
+                let at = h.hostname.filter(|x| !x.is_empty()).unwrap_or(h.name);
+                let at = canonical_address(at);
+                if v.contains(['*', '?']) {
+                    match_pattern(&at, v)
+                } else {
+                    at == canonical_address(v)
+                }
+            }
             Some(Field::User) => h.user.is_some_and(|x| has(x, v)),
             Some(Field::Port) => h.port.is_some_and(|p| p.to_string() == v),
             Some(Field::Folder) => h.folder.is_some_and(|x| has(x, v)),
@@ -204,6 +218,19 @@ impl Term {
             }
             Some(Field::Type) => whole(h.kind, v),
         }
+    }
+}
+
+/// A host name as one machine's address: an IP address in its usual
+/// form (no brackets, IPv6 shortened), anything else in lower case.
+pub fn canonical_address(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => host.to_lowercase(),
     }
 }
 
@@ -239,6 +266,29 @@ mod tests {
             .filter(|h| q.matches(h))
             .map(|h| h.name.to_owned())
             .collect()
+    }
+
+    #[test]
+    fn addr_matches_the_whole_address() {
+        let none = Vec::new();
+        let host = |name, hostname| HostFacts {
+            name,
+            hostname: Some(hostname),
+            kind: "ssh",
+            tags: &none,
+            ..HostFacts::default()
+        };
+        let hosts = [
+            host("db", "db.example"),
+            host("backup", "db.example.backup"),
+            host("v6", "[2001:0db8:0:0:0:0:0:1]"),
+        ];
+        assert_eq!(found("addr:db.example", &hosts), ["db"]);
+        assert_eq!(found("addr:DB.example*", &hosts), ["db", "backup"]);
+        assert_eq!(found("addr:2001:db8::1", &hosts), ["v6"]);
+        assert_eq!(found("host:db.example", &hosts), ["db", "backup"]);
+        assert_eq!(canonical_address("[2001:DB8:0::1]"), "2001:db8::1");
+        assert_eq!(canonical_address("Web.Example"), "web.example");
     }
 
     #[test]

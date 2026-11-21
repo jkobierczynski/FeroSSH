@@ -137,6 +137,7 @@ use crate::forwards::{
 use crate::fwd_panel;
 use crate::fwdview::{ForwardsView, FwdAction};
 use crate::highlight;
+use crate::hosts_panel;
 use crate::import_panel;
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
@@ -420,6 +421,7 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::FORWARDS, Always, &["Ctrl+Shift+P"]),
         d(cmd::KNOWN_HOSTS, Always, &["Ctrl+Shift+K"]),
         d(cmd::INVENTORY, Always, &["Ctrl+Shift+I"]),
+        d(cmd::HOSTS, Always, &[]),
         d(cmd::SNIPPETS, Always, &["Ctrl+Shift+Space"]),
         d(cmd::PALETTE, Always, &["Ctrl+Shift+A"]),
         d(
@@ -541,8 +543,12 @@ mod cmd {
     pub const FULL_SCREEN_KEY: u32 = 219;
     /// Tools > Known hosts.
     pub const KNOWN_HOSTS: u32 = 220;
-    /// Tools > Inventory.
+    /// Tools > Connection log.
     pub const INVENTORY: u32 = 222;
+    /// Tools > Hosts.
+    pub const HOSTS: u32 = 690;
+    /// Settings > Allow deleting connection log entries.
+    pub const CONNECTION_LOG_DELETE: u32 = 691;
     /// Settings > Font ligatures.
     pub const FONT_LIGATURES: u32 = 221;
     /// Settings > Server status bar.
@@ -1264,6 +1270,8 @@ enum SideView {
     KnownHosts,
     /// The connection inventory (native controls only).
     Inventory,
+    /// The hosts, one row per machine (native controls only).
+    Hosts,
     /// The credential manager (native controls only).
     Credentials,
     /// The security rules (native controls only).
@@ -2883,6 +2891,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
+                RailItem::Hosts => cmd::HOSTS,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
                 RailItem::SecurityRules => cmd::SECURITY_RULES,
                 RailItem::ThemeRules => cmd::THEME_RULES,
@@ -2911,6 +2920,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = known_hosts_panel::create(hwnd, known_hosts_event, dpi);
         // The inventory's, likewise.
         let _ = inventory_panel::create(hwnd, inventory_event, dpi);
+        // The hosts', likewise.
+        let _ = hosts_panel::create(hwnd, hosts_event, dpi);
         // The credential manager's, likewise.
         let _ = credential_panel::create(hwnd, credential_event, dpi);
         // The security rules', likewise.
@@ -3023,6 +3034,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || fwd_panel::pre_translate(&msg)
                 || known_hosts_panel::pre_translate(&msg)
                 || inventory_panel::pre_translate(&msg)
+                || hosts_panel::pre_translate(&msg)
                 || credential_panel::pre_translate(&msg)
                 || rules_panel::pre_translate(&msg)
                 || theme_panel::pre_translate(&msg)
@@ -3387,7 +3399,8 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
         item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
         item(tools, cmd::KNOWN_HOSTS, "Known &hosts\tCtrl+Shift+K")?;
-        item(tools, cmd::INVENTORY, "&Inventory\tCtrl+Shift+I")?;
+        item(tools, cmd::INVENTORY, "Connection &log\tCtrl+Shift+I")?;
+        item(tools, cmd::HOSTS, "Ho&sts")?;
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         separator(tools)?;
         item(tools, cmd::CREDENTIAL_MANAGER, "Cre&dential manager")?;
@@ -3472,6 +3485,12 @@ fn build_menu() -> Result<HMENU> {
         )?;
         item(view, cmd::FULL_SCREEN, "F&ull screen\tF11")?;
         item(view, cmd::FULL_SCREEN_KEY, "F11 switches full scree&n")?;
+        separator(view)?;
+        item(
+            view,
+            cmd::CONNECTION_LOG_DELETE,
+            "Allow deleting connection log entries",
+        )?;
         separator(view)?;
         item(view, cmd::KEY_BINDINGS, "Key bin&dings...")?;
         let links = CreatePopupMenu()?;
@@ -5368,7 +5387,7 @@ impl Window {
         let profile = self.settings.profile(&s.target.alias);
         let label = s.target.label();
         let size = self.fixed_desktop_size(&s.target.alias);
-        let clip_limit = self.desktop_clip_limit(&[&s.target.alias]);
+        let clip_limit = self.desktop_clip_limit(&[&s.target.alias], self.launch_rules(pane, None));
         let rdp_port = profile
             .and_then(|p| p.desktop_port)
             .unwrap_or(DEFAULT_DESKTOP_PORT);
@@ -5540,12 +5559,29 @@ impl Window {
     /// The most the connections `names` let copied text travel to and
     /// from their desktops: each connection's `DesktopClipboard` only
     /// narrows it.
-    fn desktop_clip_limit(&self, names: &[&str]) -> (bool, bool) {
-        names
+    fn desktop_clip_limit(&self, names: &[&str], rules: Policy) -> (bool, bool) {
+        let (to_host, from_host) = names
             .iter()
             .filter_map(|n| self.settings.profile(n))
             .map(|p| ferossh_config::settings::clipboard_ways(p.desktop_clipboard.as_deref()))
-            .fold((true, true), |(a, b), (x, y)| (a && x, b && y))
+            .fold((true, true), |(a, b), (x, y)| (a && x, b && y));
+        // A security rule's `Clipboard no`: nothing from the host.
+        (to_host, from_host && !rules.no_clipboard)
+    }
+
+    /// The security rules on pane `pane`'s connection, with those of
+    /// connection `from` (a saved desktop or remote app opened through
+    /// it, reaching `hostname`) added.
+    fn launch_rules(&self, pane: PaneId, from: Option<(&str, Option<&str>)>) -> Policy {
+        let own = self
+            .panes
+            .get(&self.host_pane(pane))
+            .map(|p| p.policy)
+            .unwrap_or_default();
+        match from {
+            Some((name, hostname)) => own.tightened(&self.policy_of(name, hostname, None)),
+            None => own,
+        }
     }
 
     /// Which ways copied text travels for a desktop: the global
@@ -5781,7 +5817,7 @@ impl Window {
         if let Err(e) = result {
             self.inventory_pending = fixes;
             self.queued.push(Command::Notice(format!(
-                "Could not update the inventory: {e}"
+                "Could not update the connection log: {e}"
             )));
         }
     }
@@ -5988,7 +6024,8 @@ impl Window {
         });
         let follow = fixed.is_none();
         let password = vdesk::password();
-        let clip_limit = self.desktop_clip_limit(&[&alias, &s.target.alias]);
+        let rules = self.launch_rules(pane, from.map(|f| (f, None)));
+        let clip_limit = self.desktop_clip_limit(&[&alias, &s.target.alias], rules);
         let (to_host, from_host) = self.desktop_clip(clip_limit);
         let clip = vdesk::Clip {
             to_host,
@@ -6141,7 +6178,10 @@ impl Window {
                 )));
             }
         };
-        let clip_limit = own.and_then(|p| p.remote_app_clipboard.clone());
+        // A security rule's `Clipboard no` lets nothing come from the host.
+        let clip_limit = self
+            .launch_rules(pane, from.map(|f| (f, None)))
+            .clipboard_limit(own.and_then(|p| p.remote_app_clipboard.as_deref()));
         let clipboard = crate::stream::app_clipboard(&self.settings, clip_limit.as_deref());
         let files = if copy {
             crate::remote_app::agent_files()
@@ -12185,6 +12225,7 @@ impl Window {
             SideView::Snippets => RailItem::Snippets,
             SideView::KnownHosts => RailItem::KnownHosts,
             SideView::Inventory => RailItem::Inventory,
+            SideView::Hosts => RailItem::Hosts,
             SideView::Credentials => RailItem::Credentials,
             SideView::SecurityRules => RailItem::SecurityRules,
             SideView::Themes => RailItem::Themes,
@@ -12244,18 +12285,43 @@ impl Window {
         let inventory = match crate::inventory_view::read() {
             Ok(inventory) => inventory,
             Err(e) => {
-                inventory_panel::set_status(format!("Could not read the inventory: {e}"));
+                inventory_panel::set_status(format!("Could not read the connection log: {e}"));
                 return;
             }
         };
         let items = host_items(&ssh_env(), &self.settings);
         let rows = crate::inventory_view::rows(&items, &inventory, &self.settings);
-        inventory_panel::set_rows(rows, self.download_dir());
+        inventory_panel::set_rows(
+            rows,
+            self.download_dir(),
+            self.settings.connection_log_delete,
+        );
     }
 
     /// Whether the inventory shows (always native controls).
     fn inventory_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::Inventory
+    }
+
+    /// Reads the inventory and the connections again for Tools > Hosts,
+    /// and shows them taken together by machine.
+    fn reload_hosts(&mut self) {
+        // As for Inventory: a file that cannot be read leaves the list.
+        let inventory = match crate::inventory_view::read() {
+            Ok(inventory) => inventory,
+            Err(e) => {
+                hosts_panel::set_status(format!("Could not read the connection log: {e}"));
+                return;
+            }
+        };
+        let items = host_items(&ssh_env(), &self.settings);
+        let rows = crate::inventory_view::rows(&items, &inventory, &self.settings);
+        hosts_panel::set_rows(crate::hosts_view::hosts(&rows));
+    }
+
+    /// Whether the hosts show (always native controls).
+    fn hosts_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Hosts
     }
 
     /// Reads the credentials and saved passwords again for Tools >
@@ -12416,6 +12482,8 @@ impl Window {
             known_hosts_panel::has_focus()
         } else if self.inventory_native() {
             inventory_panel::has_focus()
+        } else if self.hosts_native() {
+            hosts_panel::has_focus()
         } else if self.credentials_native() {
             credential_panel::has_focus()
         } else if self.rules_native() {
@@ -12503,6 +12571,11 @@ impl Window {
             inventory_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             inventory_panel::place(None, 0, self.dpi);
+        }
+        if self.hosts_native() {
+            hosts_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            hosts_panel::place(None, 0, self.dpi);
         }
         if self.credentials_native() {
             credential_panel::place(self.areas.side, self.areas.side_width, self.dpi);
@@ -12623,6 +12696,7 @@ impl Window {
             || self.fwd_native()
             || self.known_hosts_native()
             || self.inventory_native()
+            || self.hosts_native()
             || self.credentials_native()
             || self.rules_native()
             || self.themes_native()
@@ -12727,11 +12801,12 @@ impl Window {
                     );
                 }
                 // Native controls (`files_panel`, `known_hosts_panel`,
-                // `inventory_panel`, `credential_panel`, `rules_panel`,
-                // `theme_panel`).
+                // `inventory_panel`, `hosts_panel`, `credential_panel`,
+                // `rules_panel`, `theme_panel`).
                 SideView::Files
                 | SideView::KnownHosts
                 | SideView::Inventory
+                | SideView::Hosts
                 | SideView::Credentials
                 | SideView::SecurityRules
                 | SideView::Themes
@@ -13683,6 +13758,7 @@ impl Window {
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
+                RailItem::Hosts => cmd::HOSTS,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
                 RailItem::SecurityRules => cmd::SECURITY_RULES,
                 RailItem::ThemeRules => cmd::THEME_RULES,
@@ -14022,6 +14098,11 @@ impl Window {
         self.side.visible && self.side.focused && self.side.view == SideView::Inventory
     }
 
+    /// Whether a paste is for the Hosts tool.
+    fn hosts_paste(&self) -> bool {
+        self.side.visible && self.side.focused && self.side.view == SideView::Hosts
+    }
+
     /// Whether a paste is for the credential manager.
     fn credentials_paste(&self) -> bool {
         self.side.visible && self.side.focused && self.side.view == SideView::Credentials
@@ -14055,6 +14136,7 @@ impl Window {
         // not get it either.
         if self.known_hosts_paste()
             || self.inventory_paste()
+            || self.hosts_paste()
             || self.credentials_paste()
             || self.rules_paste()
             || self.themes_paste()
@@ -16134,14 +16216,15 @@ impl Window {
             } else {
                 format!("{host}:{port}")
             };
-            let clipboard = self.desktop_clip(self.desktop_clip_limit(&[name])) == (true, true);
+            let rules = self.policy_of(name, Some(&host), cfg.tag.as_deref());
+            // Remote Desktop Connection shares the clipboard both ways or
+            // not at all: `Clipboard no` turns it off.
+            let clipboard =
+                self.desktop_clip(self.desktop_clip_limit(&[name], rules)) == (true, true);
             let size = self.fixed_desktop_size(name);
             // No pane to ask in: a security rule that asks before
             // connecting asks in a message box before mstsc starts.
-            if self
-                .policy_of(name, Some(&host), cfg.tag.as_deref())
-                .confirm_connect
-            {
+            if rules.confirm_connect {
                 self.workspace_asks.push(Command::ConfirmRdp {
                     name: name.to_owned(),
                     addr,
@@ -16377,7 +16460,8 @@ impl Window {
             return;
         }
         let size = self.fixed_desktop_size(&p.label);
-        let clip_limit = self.desktop_clip_limit(&[&p.label, &s.target.alias]);
+        let rules = self.launch_rules(id, Some((&p.label, Some(&p.host))));
+        let clip_limit = self.desktop_clip_limit(&[&p.label, &s.target.alias], rules);
         let (local, want) = match p.kind {
             SessionKind::Vnc => (
                 0,
@@ -17523,6 +17607,7 @@ impl Window {
             SideView::Forwards | SideView::Palette => {}
             SideView::KnownHosts => self.reload_known_hosts(),
             SideView::Inventory => self.reload_inventory(),
+            SideView::Hosts => self.reload_hosts(),
             SideView::Credentials => self.reload_credentials(),
             SideView::SecurityRules => self.reload_rules(),
             SideView::Themes | SideView::ThemeRules => self.reload_themes(),
@@ -17566,6 +17651,7 @@ impl Window {
             cmd::LIVE => SideView::Live,
             cmd::KNOWN_HOSTS => SideView::KnownHosts,
             cmd::INVENTORY => SideView::Inventory,
+            cmd::HOSTS => SideView::Hosts,
             cmd::CREDENTIAL_MANAGER => SideView::Credentials,
             cmd::SECURITY_RULES => SideView::SecurityRules,
             cmd::THEME_MANAGER => SideView::Themes,
@@ -18783,6 +18869,16 @@ impl Window {
                 self.settings.full_screen_key = !self.settings.full_screen_key;
                 self.save_settings();
                 self.update_menu_checks();
+            }
+            cmd::CONNECTION_LOG_DELETE => {
+                self.settings.connection_log_delete = !self.settings.connection_log_delete;
+                self.save_settings();
+                self.update_menu_checks();
+                if self.inventory_native() {
+                    // Delete... shows or goes.
+                    self.reload_inventory();
+                    self.refresh_chrome();
+                }
             }
             cmd::FONT_LIGATURES => {
                 self.settings.font_ligatures = !self.settings.font_ligatures;
@@ -20154,6 +20250,7 @@ impl Window {
                 (cmd::FULL_SCREEN, self.full_screen.is_some()),
                 (cmd::FULL_SCREEN_KEY, s.full_screen_key),
                 (cmd::FONT_LIGATURES, s.font_ligatures),
+                (cmd::CONNECTION_LOG_DELETE, s.connection_log_delete),
                 (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),
                 (
@@ -20183,6 +20280,10 @@ impl Window {
                 (
                     cmd::INVENTORY,
                     self.side.visible && self.side.view == SideView::Inventory,
+                ),
+                (
+                    cmd::HOSTS,
+                    self.side.visible && self.side.view == SideView::Hosts,
                 ),
                 (
                     cmd::CREDENTIAL_MANAGER,
@@ -23022,6 +23123,7 @@ fn tools_have_focus() -> bool {
         || script_report::has_focus()
         || known_hosts_panel::has_focus()
         || inventory_panel::has_focus()
+        || hosts_panel::has_focus()
         || credential_panel::has_focus()
         || rules_panel::has_focus()
         || theme_panel::has_focus()
@@ -23623,6 +23725,62 @@ fn inventory_event(hwnd: HWND, event: inventory_panel::Event) {
                 w.refresh_chrome();
             });
         }
+        Event::Delete(name) => {
+            if with_window(|w| w.settings.connection_log_delete) != Some(true) {
+                return;
+            }
+            let question = format!(
+                "Forget what the connection log holds about {}: when you last connected, the \
+                 host key it showed, and its OS and kernel? The connection itself stays; the \
+                 next login logs it again.",
+                crate::ssh::sanitize_line(&name)
+            );
+            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+                return;
+            }
+            let next = with_window(|w| {
+                // A read still under way would write its OS back.
+                w.system_reads
+                    .retain(|_, r| !r.alias.eq_ignore_ascii_case(&name));
+                w.update_inventory(Some(InventoryFix::Remove(vec![name])), |_| {});
+                w.reload_inventory();
+                std::mem::take(&mut w.queued)
+            })
+            .unwrap_or_default();
+            run_commands(hwnd, next);
+        }
+        Event::Focused => tools_focused(),
+        Event::Leave => {
+            with_window(Window::focus_terminal);
+        }
+    }
+}
+
+/// Carries out what the user did in Tools > Hosts.
+fn hosts_event(hwnd: HWND, event: hosts_panel::Event) {
+    use hosts_panel::Event;
+    match event {
+        Event::Connect(host) => {
+            if let Some(Some(command)) =
+                with_window(|w| w.side_action(Some(SideAction::Open { host, split: false })))
+            {
+                run_command(hwnd, command);
+            }
+        }
+        // The connection manager, searched for the host's address.
+        Event::Connections(address) => {
+            with_window(|w| {
+                w.show_side(SideView::Sessions, true);
+                w.update_menu_checks();
+            });
+            conn_view::set_search(&crate::hosts_view::connections_search(&address));
+        }
+        Event::Reload => {
+            with_window(|w| {
+                w.reload_hosts();
+                w.refresh_chrome();
+            });
+        }
         Event::Focused => tools_focused(),
         Event::Leave => {
             with_window(Window::focus_terminal);
@@ -23821,7 +23979,7 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
                 intro,
                 fields: &[("Hosts", &hosts), ("Tags", &tags), ("Folders", &folders)],
                 checks: &checks,
-                option: original.as_ref().map(|_| ("Delete this rule", false)),
+                option: None,
                 ok: "Save",
                 cancel: "Cancel",
             },
@@ -23837,44 +23995,6 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
             folders: words(f.next().map_or("", String::as_str)),
             limits: Policy::from_flags(&answer.checks),
         };
-        if answer.option
-            && let (Some(i), Some(o)) = (index, &original)
-        {
-            // The same question as the page's Delete..., naming the
-            // connections that lose the limits.
-            let question = with_window(|w| {
-                w.rule_rows()
-                    .into_iter()
-                    .find(|r| r.index == i && &r.rule == o)
-                    .map(|r| crate::rules_view::delete_question(&r))
-            })
-            .flatten()
-            .unwrap_or_else(|| {
-                format!(
-                    "Delete security rule {} ({})?",
-                    i + 1,
-                    crate::ssh::sanitize_line(&o.describe_match())
-                )
-            });
-            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
-                continue;
-            }
-            let lost = std::cell::Cell::new(false);
-            let saved = save_rules(hwnd, |rules| match find_rule(rules, i, o) {
-                Some(at) => {
-                    rules.remove(at);
-                }
-                None => lost.set(true),
-            });
-            if lost.get() {
-                dialog(hwnd, RULE_CHANGED, MB_OK | MB_ICONWARNING);
-                return;
-            }
-            if saved {
-                return;
-            }
-            continue;
-        }
         if rule.hosts.is_empty() && rule.tags.is_empty() && rule.folders.is_empty() {
             dialog(
                 hwnd,
@@ -24633,6 +24753,7 @@ fn is_side_pane(id: u32) -> bool {
             | cmd::SNIPPETS
             | cmd::KNOWN_HOSTS
             | cmd::INVENTORY
+            | cmd::HOSTS
             | cmd::CREDENTIAL_MANAGER
             | cmd::SECURITY_RULES
             | cmd::THEME_MANAGER
@@ -24864,6 +24985,9 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
                 if with_window(|w| w.inventory_paste()) == Some(true) {
                     inventory_panel::paste(&text);
+                }
+                if with_window(|w| w.hosts_paste()) == Some(true) {
+                    hosts_panel::paste(&text);
                 }
                 if with_window(|w| w.credentials_paste()) == Some(true) {
                     credential_panel::paste(&text);
@@ -27536,6 +27660,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && with_window(|w| w.inventory_native()) == Some(true) => {
                         inventory_panel::focus_search();
                     }
+                    1 if want && with_window(|w| w.hosts_native()) == Some(true) => {
+                        hosts_panel::focus_search();
+                    }
                     1 if want && with_window(|w| w.credentials_native()) == Some(true) => {
                         credential_panel::focus_search();
                     }
@@ -27688,6 +27815,7 @@ mod tests {
             cmd::SNIPPETS,
             cmd::KNOWN_HOSTS,
             cmd::INVENTORY,
+            cmd::HOSTS,
             cmd::CREDENTIAL_MANAGER,
             cmd::SECURITY_RULES,
             cmd::THEME_MANAGER,

@@ -55,7 +55,7 @@ fn lock(dir: &std::path::Path) -> std::io::Result<Lock> {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    Err(last.unwrap_or_else(|| std::io::Error::other("the inventory is busy")))
+    Err(last.unwrap_or_else(|| std::io::Error::other("the connection log is busy")))
 }
 
 /// Writes `text` through a temporary file of this write's own beside

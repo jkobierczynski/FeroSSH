@@ -1,4 +1,4 @@
-//! Tools > Inventory as native Windows controls, on a panel over the
+//! Tools > Connection log (the inventory) as native Windows controls, on a panel over the
 //! uncovered part of the tools pane like Known hosts: every connection
 //! with when it was last connected to, its host key and, where switched
 //! on, the server's OS and kernel (see `inventory_view.rs`).
@@ -7,7 +7,9 @@
 //! on a column heading sorts by it (again: the other way). Save CSV
 //! writes the rows shown, in their order, to the download folder.
 //! Connect (Enter in the list, a double click) opens the picked
-//! connection; Reload (F5) reads the inventory again. Keys work as in
+//! connection; Reload (F5) reads the inventory again. Delete... (the
+//! Delete key), shown only when Settings > Allow deleting connection log
+//! entries is on, forgets what the log holds about the picked one. Keys work as in
 //! `known_hosts_panel`: [`pre_translate`] runs in the message loop,
 //! passes Ctrl+Shift shortcuts on to the main window, turns typing in the
 //! list into a search, and gives Tab, Enter and Escape their dialog
@@ -35,7 +37,7 @@ use windows::Win32::UI::Controls::{
     SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, SetFocus, VK_CONTROL, VK_DOWN, VK_F5, VK_RETURN, VK_SHIFT,
+    GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F5, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, EN_CHANGE, EN_SETFOCUS,
@@ -59,6 +61,9 @@ pub enum Event {
     Connect(String),
     /// Read the inventory again (F5, the Reload button).
     Reload,
+    /// Forget what the log holds about this connection (Delete...,
+    /// the Delete key), when the setting allows it.
+    Delete(String),
     /// One of the controls got the keyboard.
     Focused,
     /// Escape with no search: back to the terminal.
@@ -73,9 +78,11 @@ const ID_LIST: usize = 201;
 const ID_CONNECT: usize = 210;
 const ID_CSV: usize = 211;
 const ID_RELOAD: usize = 212;
+const ID_DELETE: usize = 213;
 
-/// Buttons: width in DIPs.
-const BUTTONS: [i32; 3] = [80, 88, 64];
+/// Buttons: width in DIPs. The last, Delete..., shows only when the
+/// setting allows it.
+const BUTTONS: [i32; 4] = [80, 88, 64, 72];
 
 /// The height of the summary line above the buttons, in DIPs.
 const STATUS_DIP: i32 = 22;
@@ -86,7 +93,7 @@ struct Handles {
     panel: HWND,
     search: HWND,
     list: HWND,
-    buttons: [HWND; 3],
+    buttons: [HWND; 4],
 }
 
 struct State {
@@ -107,6 +114,9 @@ struct State {
     status_bottom: i32,
     /// Where Save CSV writes.
     save_dir: PathBuf,
+    /// Whether Delete... shows (Settings > Allow deleting connection
+    /// log entries).
+    can_delete: bool,
 }
 
 thread_local! {
@@ -154,7 +164,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             None,
         )?;
         // A control that cannot be made takes the panel down with it.
-        let made = (|| -> windows::core::Result<(HWND, HWND, [HWND; 3])> {
+        let made = (|| -> windows::core::Result<(HWND, HWND, [HWND; 4])> {
             let child = |class: PCWSTR, text: PCWSTR, style: u32, id: usize| {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
@@ -219,6 +229,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 child(WC_BUTTONW, w!("Connect"), BS_PUSHBUTTON as u32, ID_CONNECT)?,
                 child(WC_BUTTONW, w!("Save CSV"), BS_PUSHBUTTON as u32, ID_CSV)?,
                 child(WC_BUTTONW, w!("Reload"), BS_PUSHBUTTON as u32, ID_RELOAD)?,
+                child(WC_BUTTONW, w!("Delete..."), BS_PUSHBUTTON as u32, ID_DELETE)?,
             ];
             Ok((search, list, buttons))
         })();
@@ -253,6 +264,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 status: String::new(),
                 status_bottom: 0,
                 save_dir: PathBuf::new(),
+                can_delete: false,
             });
         });
     }
@@ -319,9 +331,15 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let list_y = title + field + gap;
     // The buttons in a row, wrapped onto more rows when the tool is too
     // narrow for one.
-    let mut spots = Vec::with_capacity(BUTTONS.len());
+    let can_delete = with(|s| s.can_delete).unwrap_or(false);
+    let count = if can_delete {
+        BUTTONS.len()
+    } else {
+        BUTTONS.len() - 1
+    };
+    let mut spots = Vec::with_capacity(count);
     let (mut x, mut row) = (pad, 0);
-    for w in BUTTONS {
+    for w in BUTTONS.into_iter().take(count) {
         // Never wider than the tool: a very narrow one squeezes them.
         let w = scale(w, dpi).min(inner.max(1));
         if x > pad && x + w > pad + inner {
@@ -345,6 +363,8 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
             let y = buttons_y + row * (button + gap);
             let _ = MoveWindow(*b, x, y, w, button, true);
         }
+        let [.., delete] = h.buttons;
+        let _ = ShowWindow(delete, if can_delete { SW_SHOWNA } else { SW_HIDE });
         let _ = ShowWindow(h.panel, SW_SHOWNA);
     }
 }
@@ -385,11 +405,12 @@ pub fn paste(text: &str) {
 
 /// Shows `rows` (read afresh), with Save CSV writing to `save_dir`. The
 /// picked connection stays picked when it is still listed.
-pub fn set_rows(rows: Vec<Row>, save_dir: PathBuf) {
+pub fn set_rows(rows: Vec<Row>, save_dir: PathBuf, can_delete: bool) {
     let keep = selected();
     with(|s| {
         s.rows = rows;
         s.save_dir = save_dir;
+        s.can_delete = can_delete;
     });
     fill(keep.as_deref());
 }
@@ -580,7 +601,7 @@ fn save_csv() {
         .replace(['-', ':'], "")
         .replace('T', "-")
         .replace('Z', "");
-    let stem = format!("ferossh-inventory-{stamp}");
+    let stem = format!("ferossh-connection-log-{stamp}");
     let note = match inventory_view::write_new(&dir, &stem, "csv", &text) {
         Ok(path) => format!("Saved the list as {}.", path.display()),
         Err(e) => format!("Could not save the list in {}: {e}", dir.display()),
@@ -608,6 +629,14 @@ fn emit(e: Event) {
 fn connect() {
     if let Some(name) = selected() {
         emit(Event::Connect(name));
+    }
+}
+
+fn delete() {
+    if with(|s| s.can_delete) == Some(true)
+        && let Some(name) = selected()
+    {
+        emit(Event::Delete(name));
     }
 }
 
@@ -640,6 +669,10 @@ pub fn pre_translate(msg: &MSG) -> bool {
                 }
                 if msg.hwnd == h.list && vk == VK_RETURN.0 {
                     connect();
+                    return true;
+                }
+                if msg.hwnd == h.list && vk == VK_DELETE.0 && with(|s| s.can_delete) == Some(true) {
+                    delete();
                     return true;
                 }
                 if vk == VK_F5.0 {
@@ -691,6 +724,7 @@ fn command(h: Handles, id: usize, code: u32) {
         (ID_CONNECT, BN_CLICKED) => connect(),
         (ID_CSV, BN_CLICKED) => save_csv(),
         (ID_RELOAD, BN_CLICKED) => emit(Event::Reload),
+        (ID_DELETE, BN_CLICKED) => delete(),
         _ => {}
     }
 }
@@ -767,7 +801,7 @@ fn paint(h: Handles) {
             windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT));
         let grey = windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT));
         SetTextColor(dc, text_colour);
-        let mut text: Vec<u16> = "Inventory".encode_utf16().collect();
+        let mut text: Vec<u16> = "Connection log".encode_utf16().collect();
         DrawTextW(
             dc,
             &mut text,

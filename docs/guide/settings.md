@@ -23,6 +23,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `Notifications yes` | no | Tab badges and Windows notifications when a pane asks for attention. Settings > Desktop notifications. |
 | `NotifyBell no` | yes | Whether the bell counts as asking for attention. Settings > Notify on the bell too. |
 | `AgentCommand claude --model opus` | claude, codex, aider | One coding agent command for Session > Coding agents, typed at the server's shell exactly as written (the rest of the line, quotes and `#` included). Repeat the line for more, up to 16, in menu order; any non-empty line replaces the built-in three; empty lines and lines with control characters are ignored. |
+| `ConnectionLogDelete yes` | no | Tools > Connection log offers Delete..., which forgets what the log holds about one connection. Settings > Allow deleting connection log entries. |
 | `DefaultTheme NAME` | Nord | The theme new tabs open with (Theme manager > Set as default). `--theme` and theme rules come before it. |
 | `DefaultFont FAMILY` | Cascadia Mono | The font new tabs open with, when it is installed (Theme manager > Set as default on a font). |
 | `DefaultFontSize POINTS` | | The font size new tabs open with, 4 to 96 points. |
@@ -120,7 +121,7 @@ Profile web1
 | `FontSize N` | Text size in points. |
 | `Theme NAME` | Colour theme, for example `Nord`, `Dracula` or `Production`. |
 | `Tags TAG...` | The connection's own tags (Tags in the connection form), separated by spaces: shown and searched in the connection manager and matched by theme rules, on top of ssh_config's `Tag`. Up to 16, each up to 32 letters, digits, `-`, `_`, `.`, `/` and `:`; others are left out. |
-| `SystemInfo yes` | After each SSH login, reads the server's OS and kernel for the [inventory](everyday-use.md#inventory) (Inventory in the connection form's Extras). |
+| `SystemInfo yes` | After each SSH login, reads the server's OS and kernel for the [connection log](everyday-use.md#connection-log) (Log OS in the connection form's Extras). |
 | `Credential NAME` | The named credential the connection uses (see [Credentials](#credentials)): its user, key file and password source win over the connection's own. |
 | `Scrollback N` | Lines of scrollback for this host's panes. |
 | `Tmux SESSION` | Attaches to this tmux session after every login. `off`, `no` or `none` (or leaving it out) means no tmux; `on`, `yes` or `true` attaches to `main`. |
@@ -309,7 +310,7 @@ SecurityRule
 | `KeysOnly yes` | SSH logins use a key, the agent or a security key. A password prompt ends the login, also inside a keyboard-interactive round. A one-time code is still asked, also one labelled "one-time password". Kerberos (GSSAPI) is not used, and the connection (or one through a jump host under this rule) is never shared with another pane's login. WinRM, which only has passwords, is not affected. |
 | `SavePassword no` | No password is read from or kept in the Windows Credential Manager, for the login, a proxy (also when only a jump host on the way has the rule) or a login script, including its named secrets. A password manager command still works. |
 | `ForwardAgent no` | No agent forwarding, even when the connection or ssh_config asks for it. |
-| `Clipboard no` | The server cannot set this PC's clipboard (OSC 52). |
+| `Clipboard no` | The server cannot set this PC's clipboard: no OSC 52 in the terminal, and no text from the host in a Remote Desktop, VNC or virtual desktop viewer or a remote app, whatever the connection's or the menu's clipboard setting says (text can still go to the host where those allow it). A Remote Desktop Connection window shares the clipboard both ways or not at all, so it gets none. |
 | `ConfirmConnect yes` | FeroSSH asks before connecting, also when only a jump host on the way matches. The question names the user, host and port (a saved Telnet or WinRM connection's own port) and the route there, and if any of that changes before the connection starts, it asks again. A reconnect or a split of a connected pane does not ask again. A direct Remote Desktop connection (one without Via SSH) asks in a message box before Remote Desktop Connection starts. |
 | `LogSession yes` | The session is logged, and Session > Log this session cannot turn it off. If the log cannot be opened, nothing starts on the session (no login script, forwards or tmux) and it disconnects; if a write fails later, it disconnects too. Once the connection ends or you disconnect, Log this session goes back to how you had it. |
 

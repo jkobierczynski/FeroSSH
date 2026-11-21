@@ -87,12 +87,12 @@ Fields that need the whole form (host, port, forwards, login script) stay one co
 
 **What FeroSSH had.** The status bar shows live CPU, memory and disk for the focused pane; script runs give a CSV report.
 
-**What was built.** **Tools > Inventory** (Ctrl+Shift+I, a rail icon, or **Inventory** in the connection manager's right-click menu) shows a list of every connection in the tools pane:
+**What was built.** **Tools > Inventory**, since renamed **Tools > Connection log** (Ctrl+Shift+I or a rail icon), shows a list of every connection in the tools pane:
 
 - **Columns:** name, address, type, folder, tags, last connected, host key type, SHA-256 fingerprint, OS and kernel. A click on a heading sorts by it.
 - **Search:** the connection manager's search words, starting from its current search; plain words also match the OS, kernel and fingerprint.
 - **Save CSV** writes the rows shown to the download folder, times in UTC, with formula-looking cells made safe for spreadsheets. **Connect** opens the picked one.
-- **What is kept:** each login of a listed SSH connection records the time and the host key the server showed. With **Inventory** on in the form (`SystemInfo yes`, or **Change a field**), one fixed read-only command (`uname -sr`, `/etc/os-release` or `sw_vers`) runs on its own channel after login, and the OS and kernel are kept, cleaned of control characters and cut short.
+- **What is kept:** each login of a listed SSH connection records the time and the host key the server showed. With **Log OS** on in the form (`SystemInfo yes`, or **Change a field** > **Connection log: OS and kernel**), one fixed read-only command (`uname -sr`, `/etc/os-release` or `sw_vers`) runs on its own channel after login, and the OS and kernel are kept, cleaned of control characters and cut short.
 - **Where:** `inventory.conf` on this PC only (`%LOCALAPPDATA%\FeroSSH`), read and written again on each change so several windows agree. Renames and deletes follow.
 
 Telnet and WinRM logins are not recorded yet.
