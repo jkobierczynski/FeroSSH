@@ -14042,6 +14042,11 @@ impl Window {
             Some(view) => {
                 self.side.view = view;
                 self.side.focused = false;
+                // A save while the palette was open may have merged in
+                // rules from another window or PC.
+                if view == SideView::SecurityRules && self.rules_native() {
+                    rules_panel::set_rows(self.rule_rows());
+                }
                 self.refresh_chrome();
                 self.request_full_redraw();
                 self.refresh(self.focused_id());
@@ -18693,7 +18698,18 @@ impl Window {
         // merges and writes the settings, so neither drops what the other
         // added. (A file of its own, not the vault's lock, which the vault
         // takes itself for each read and write.)
-        let _lock = crate::vault::lock_file(&settings_path());
+        let Some(_lock) = crate::vault::lock_file(&settings_path()) else {
+            // Saving anyway could write over what the other window is
+            // merging in; this window's settings stay as they are and the
+            // next save tries again.
+            let e = "Could not save settings: another FeroSSH window is \
+                     saving them. Try again in a moment."
+                .to_owned();
+            let id = self.focused_id();
+            self.show(id, &format!("\r\n\x1b[0;31m{e}\x1b[0m\r\n"));
+            self.refresh(id);
+            return Err(e);
+        };
         let rules = self.settings.security_rules.clone();
         vault_ui::sync_settings(&mut self.settings);
         // Rules the merge brought in show at once: the next focus finds

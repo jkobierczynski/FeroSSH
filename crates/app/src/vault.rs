@@ -68,7 +68,8 @@ fn hold(path: &Path) -> Option<ProcessLock> {
 /// temporary folder) until the value returned is dropped: another FeroSSH
 /// process on this PC that asks for it waits, so a read, merge and write
 /// of a settings file never interleaves with its own. `None` when it
-/// cannot be had within about two seconds; the caller goes on without.
+/// cannot be had within about two seconds; the caller then does not
+/// merge or write.
 pub fn lock_file(file: &Path) -> Option<impl Sized + use<>> {
     ProcessLock::take(file, 200)
 }
