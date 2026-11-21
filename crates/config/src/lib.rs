@@ -41,7 +41,7 @@ pub mod workspace;
 
 pub use forward::{ForwardKind, ForwardSpec};
 pub use highlight::{HighlightColour, HighlightRule};
-pub use host_theme::{HostThemes, ThemeRule};
+pub use host_theme::{Enforced, HostThemes, ThemeRule};
 pub use password::PasswordSource;
 pub use pattern::{match_host, match_pattern};
 pub use proxy::{ProxyKind, ProxyServer};

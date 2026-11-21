@@ -647,6 +647,36 @@ fn watched(text: &str) -> Vec<(String, String)> {
     out
 }
 
+/// A list without names (security rules, theme rules, saved searches)
+/// after two PCs or windows changed it from the same `base`: an entry one
+/// side removed (or changed, which is a removal and an addition) goes, an
+/// entry either side added stays. So when both sides changed the same
+/// rule, both versions stay: for security rules the stricter result, as
+/// a rule can only tighten. In `theirs`'s order, with our new ones after.
+pub fn merge_set3<T: PartialEq + Clone>(base: &[T], ours: &[T], theirs: &[T]) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    let mut keep = |x: &T| {
+        if !out.contains(x) {
+            out.push(x.clone());
+        }
+    };
+    for x in theirs {
+        // Taken out on our side since base.
+        if base.contains(x) && !ours.contains(x) {
+            continue;
+        }
+        keep(x);
+    }
+    for x in ours {
+        // Taken out on their side since base.
+        if base.contains(x) && !theirs.contains(x) {
+            continue;
+        }
+        keep(x);
+    }
+    out
+}
+
 fn is_host_line(line: &str) -> bool {
     keyword_value(line.trim()).is_some_and(|(k, _)| k == "host")
 }
@@ -880,6 +910,57 @@ pub fn import_profiles(local: &mut Settings, incoming: &Settings) -> (Merged, Ve
         }
     }
     (merged, reviews)
+}
+
+/// What two windows on one PC, or two PCs sharing a vault, keep in common
+/// in `ferossh.conf`, merged from `base` (what `ours` started from) and
+/// `theirs` (the file as it is now) into `ours`: host profiles and
+/// credentials ([`merge_logins3`]), security rules, theme rules, saved
+/// searches and login-script secrets. The rest (window, fonts, recent
+/// connections) belongs to the window that saves.
+pub fn merge_shared3(base: &Settings, ours: &mut Settings, theirs: &Settings) {
+    let (profiles, credentials) = merge_logins3(base, ours, theirs);
+    ours.profiles = profiles;
+    ours.credentials = credentials;
+    ours.security_rules = merge_set3(
+        &base.security_rules,
+        &ours.security_rules,
+        &theirs.security_rules,
+    );
+    ours.theme_rules = merge_set3(&base.theme_rules, &ours.theme_rules, &theirs.theme_rules);
+    ours.saved_searches = merge_set3(
+        &base.saved_searches,
+        &ours.saved_searches,
+        &theirs.saved_searches,
+    );
+    ours.secrets = merge_secrets3(&base.secrets, &ours.secrets, &theirs.secrets);
+}
+
+/// Login-script secrets by name, as [`merge_credentials3`] does for
+/// credentials: ours where we changed, added or removed one, else theirs.
+fn merge_secrets3(
+    base: &[crate::login::SecretSource],
+    ours: &[crate::login::SecretSource],
+    theirs: &[crate::login::SecretSource],
+) -> Vec<crate::login::SecretSource> {
+    let find = |list: &[crate::login::SecretSource], name: &str| {
+        list.iter()
+            .find(|x| x.name.eq_ignore_ascii_case(name))
+            .cloned()
+    };
+    let mut names: Vec<String> = Vec::new();
+    for x in theirs.iter().chain(ours).chain(base) {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(&x.name)) {
+            names.push(x.name.clone());
+        }
+    }
+    names
+        .iter()
+        .filter_map(|n| {
+            let (b, o) = (find(base, n), find(ours, n));
+            if o == b { find(theirs, n) } else { o }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1309,6 +1390,65 @@ mod tests {
                 "kept your Production theme",
                 "allows NTLM over plain HTTP"
             ]
+        );
+    }
+
+    #[test]
+    fn rules_from_both_sides_survive_a_save() {
+        let rule = |tag: &str| {
+            let mut r = crate::host_policy::SecurityRule::default();
+            r.tags.push(tag.into());
+            r.limits.keys_only = true;
+            r
+        };
+        let base = Settings {
+            security_rules: vec![rule("old"), rule("gone")],
+            saved_searches: vec!["tag:a".into()],
+            ..Settings::default()
+        };
+        // The other PC added a rule and removed one.
+        let mut theirs = base.clone();
+        theirs.security_rules = vec![rule("old"), rule("prod")];
+        // This window, which never saw that, changed its font and added
+        // a rule of its own.
+        let mut ours = base.clone();
+        ours.recent = vec!["web".into()];
+        ours.security_rules.push(rule("lab"));
+        ours.saved_searches.push("tag:b".into());
+        merge_shared3(&base, &mut ours, &theirs);
+        let tags: Vec<&str> = ours
+            .security_rules
+            .iter()
+            .map(|r| r.tags[0].as_str())
+            .collect();
+        assert_eq!(tags, ["old", "prod", "lab"]);
+        assert_eq!(ours.saved_searches, ["tag:a", "tag:b"]);
+        assert_eq!(ours.recent, ["web"]);
+    }
+
+    #[test]
+    fn a_rule_removed_or_changed_on_one_side_stays_so() {
+        let base = vec![1, 2, 3];
+        // We removed 2; they changed 3 into 4.
+        assert_eq!(merge_set3(&base, &[1, 3], &[1, 2, 4]), [1, 4]);
+        // Both changed 1, differently: both stay (only tighter).
+        assert_eq!(merge_set3(&[1], &[5], &[6]), [6, 5]);
+        // Nothing to merge from.
+        assert_eq!(merge_set3::<u8>(&[], &[], &[7]), [7]);
+    }
+
+    #[test]
+    fn secrets_merge_by_name() {
+        let s = |n: &str, c: &str| crate::login::SecretSource {
+            name: n.into(),
+            command: c.into(),
+        };
+        let base = vec![s("a", "1"), s("b", "1")];
+        let ours = vec![s("a", "2"), s("b", "1")];
+        let theirs = vec![s("a", "1"), s("b", "3"), s("c", "1")];
+        assert_eq!(
+            merge_secrets3(&base, &ours, &theirs),
+            [s("a", "2"), s("b", "3"), s("c", "1")]
         );
     }
 }
