@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::Dialogs::{CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, EM_LIMITTEXT, ODS_FOCUS, WC_BUTTONW, WC_EDITW, WC_STATICW,
+    DRAWITEMSTRUCT, EM_LIMITTEXT, EM_SETSEL, ODS_FOCUS, WC_BUTTONW, WC_EDITW, WC_STATICW,
 };
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
@@ -640,6 +640,29 @@ fn paint(dlg: HWND) {
 }
 
 fn finish(choice: Choice) {
+    // A field still holding text that is no colour stops both saves:
+    // the colour it shows would not be the one written.
+    let bad = with(|s| {
+        s.hexes
+            .iter()
+            .enumerate()
+            .find(|(_, h)| edit_view::parse(&text_of(**h)).is_none())
+            .map(|(i, h)| (i, *h, s.status))
+    })
+    .flatten();
+    if let Some((slot, field, status)) = bad {
+        let name = NAMES.get(slot).copied().unwrap_or("A colour");
+        let text = wide(&format!(
+            "{name} is not a colour: type #RRGGBB, or press Esc to cancel."
+        ));
+        // SAFETY: our own controls and a terminated string.
+        unsafe {
+            let _ = SetWindowTextW(status, PCWSTR(text.as_ptr()));
+            let _ = SetFocus(Some(field));
+            SendMessageW(field, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        }
+        return;
+    }
     with(|s| s.done = Some(Some((s.theme.clone(), choice))));
 }
 
@@ -672,9 +695,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             changed(hwnd, slot, c, true);
                         }
                     } else if code == EN_KILLFOCUS {
-                        // What was typed reads back as the colour it set.
-                        let c = with(|s| edit_view::get(&s.theme, slot)).flatten();
-                        if let Some(c) = c {
+                        // A colour typed reads back in the usual form; text
+                        // that is no colour stays, for Save to point at.
+                        if let Some(c) = edit_view::parse(&text_of(field)) {
                             changed(hwnd, slot, c, false);
                         }
                     }
