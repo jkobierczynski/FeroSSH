@@ -492,7 +492,11 @@ pub(super) fn import(hwnd: HWND) {
     let Some(incoming) = open_sealed(hwnd, &path, &text, "Import encrypted connections") else {
         return;
     };
-    let Some(current) = with_window(|w| w.settings.clone()) else {
+    let Some(current) = with_window(|w| {
+        // What another PC saved to a shared vault counts too.
+        w.pull_vault_settings();
+        w.settings.clone()
+    }) else {
         return;
     };
     let plan = plan(&incoming, &current);
@@ -571,7 +575,11 @@ pub(super) fn import(hwnd: HWND) {
     // again before anything is written.
     let mut approved = (plan.reviews, credentials_replaced(&incoming, &current));
     let plan = loop {
-        let Some(current) = with_window(|w| w.settings.clone()) else {
+        let Some(current) = with_window(|w| {
+            // What another PC saved to a shared vault counts too.
+            w.pull_vault_settings();
+            w.settings.clone()
+        }) else {
             return;
         };
         let plan = self::plan(&incoming, &current);
