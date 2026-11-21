@@ -12241,8 +12241,10 @@ impl Window {
     }
 
     /// Reads the security rules again for Tools > Security rules, and
-    /// shows them.
+    /// shows them: what another FeroSSH changed in a shared settings file
+    /// first, as a save would.
     fn reload_rules(&mut self) {
+        self.pull_vault_settings();
         rules_panel::set_rows(self.rule_rows());
     }
 
