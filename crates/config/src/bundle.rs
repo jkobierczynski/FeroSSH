@@ -18,6 +18,7 @@
 use zeroize::Zeroizing;
 
 use crate::Settings;
+use crate::settings::MAX_TAGS;
 
 const MAGIC: &str = "FeroSSH connections v1";
 
@@ -659,16 +660,45 @@ fn keyword_value(line: &str) -> Option<(String, String)> {
     Some((k.to_ascii_lowercase(), v.trim().to_owned()))
 }
 
-/// Whether a `StrictHostKeyChecking` value trusts a new key without
-/// asking.
-fn trusts_any_key(value: &str) -> bool {
-    let v = value
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(v.as_str(), "no" | "off" | "accept-new")
+/// The value of a `StrictHostKeyChecking` line that trusts a new key
+/// without asking (`no`, `off`, `false` or `accept-new`, quoted or not,
+/// read as [`crate::ssh_config`] reads it); `None` for any other line.
+fn trusts_any_key(line: &str) -> Option<String> {
+    let (k, args) = crate::ssh_config::split_line(line)?;
+    let v = args.first()?.to_ascii_lowercase();
+    (k == "stricthostkeychecking" && matches!(v.as_str(), "no" | "off" | "false" | "accept-new"))
+        .then_some(v)
 }
+
+/// `lines` without each `StrictHostKeyChecking` line that trusts new
+/// keys, unless `mine` has that very line; each one left out is noted
+/// under `name`.
+fn drop_trust_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    mine: &[String],
+    name: &str,
+    reviews: &mut Vec<Review>,
+) -> String {
+    let mut text = String::new();
+    for line in lines {
+        if let Some(v) = trusts_any_key(line)
+            && !mine.iter().any(|l| l == line.trim())
+        {
+            review(
+                reviews,
+                name,
+                format!("left out \"StrictHostKeyChecking {v}\": new host keys are asked about"),
+            );
+            continue;
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
+}
+
+/// What the import notes settings above the first `Host` line under.
+pub const ALL_CONNECTIONS: &str = "(all connections)";
 
 /// `incoming`'s `Host` blocks for an import into `local`
 /// ([`merge_hosts`] after this), made safe and with what changes said:
@@ -680,40 +710,29 @@ fn trusts_any_key(value: &str) -> bool {
 /// - for a block replacing one of ours, each changed address, route,
 ///   forwarding, key file or known_hosts file is named.
 pub fn import_hosts(local: &str, incoming: &str) -> (String, Vec<Review>) {
-    let (_, ours) = host_blocks(local);
+    let (my_head, ours) = host_blocks(local);
     let (in_head, theirs) = host_blocks(incoming);
     let mut reviews = Vec::new();
-    let mut out = in_head;
+    // Settings above the first Host line apply to every connection, so
+    // they get the same check as a block's.
+    let my_head: Vec<String> = my_head.lines().map(|l| l.trim().to_owned()).collect();
+    let mut out = drop_trust_lines(in_head.lines(), &my_head, ALL_CONNECTIONS, &mut reviews);
     for b in theirs {
         let name = b.key.clone();
         let mine = ours.iter().find(|o| o.key == b.key);
         let my_lines: Vec<String> = mine
             .map(|m| m.text.lines().map(|l| l.trim().to_owned()).collect())
             .unwrap_or_default();
-        let mut text = String::new();
-        let mut in_host = false;
-        for line in b.text.lines() {
-            if is_host_line(line) {
-                in_host = true;
-            }
-            if in_host
-                && let Some((k, v)) = keyword_value(line.trim())
-                && k == "stricthostkeychecking"
-                && trusts_any_key(&v)
-                && !my_lines.iter().any(|l| l == line.trim())
-            {
-                review(
-                    &mut reviews,
-                    &name,
-                    format!(
-                        "left out \"StrictHostKeyChecking {v}\": new host keys are asked about"
-                    ),
-                );
-                continue;
-            }
-            text.push_str(line);
-            text.push('\n');
-        }
+        // The comments above the Host line (a folder) are kept as they
+        // are; only the block's own lines are checked.
+        let head: String = b
+            .text
+            .lines()
+            .take_while(|l| !is_host_line(l))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let body = b.text.lines().skip_while(|l| !is_host_line(l));
+        let mut text = head + &drop_trust_lines(body, &my_lines, &name, &mut reviews);
         if let Some(m) = mine {
             // Our folder (and comments) above the Host line stay.
             let head = |t: &str| -> String {
@@ -792,12 +811,37 @@ pub fn import_profiles(local: &mut Settings, incoming: &Settings) -> (Merged, Ve
             .cloned()
             .collect();
         if !dropped.is_empty() {
-            p.tags.extend(dropped.iter().cloned());
+            // Ours first: only MAX_TAGS are read back, and a lost tag
+            // could take the connection out of a rule.
+            let theirs = std::mem::take(&mut p.tags);
+            p.tags = old.tags.clone();
+            p.tags.truncate(MAX_TAGS);
+            let mut left_out = Vec::new();
+            for t in theirs {
+                if p.tags.iter().any(|n| n.eq_ignore_ascii_case(&t)) {
+                    continue;
+                }
+                if p.tags.len() < MAX_TAGS {
+                    p.tags.push(t);
+                } else {
+                    left_out.push(t);
+                }
+            }
             review(
                 &mut reviews,
                 &p.host,
                 format!("kept your tags {}", dropped.join(" ")),
             );
+            if !left_out.is_empty() {
+                review(
+                    &mut reviews,
+                    &p.host,
+                    format!(
+                        "left out its tags {} (at most {MAX_TAGS})",
+                        left_out.join(" ")
+                    ),
+                );
+            }
         }
         let warning = |t: &Option<String>| {
             t.as_deref().is_some_and(|t| {
@@ -815,7 +859,8 @@ pub fn import_profiles(local: &mut Settings, incoming: &Settings) -> (Merged, Ve
                 ),
             );
         }
-        if p.winrm_ntlm && !old.winrm_ntlm {
+        let ntlm_over_http = |p: &crate::Profile| p.winrm_ntlm && !p.winrm_https;
+        if ntlm_over_http(p) && !ntlm_over_http(old) {
             review(&mut reviews, &p.host, "allows NTLM over plain HTTP".into());
         }
         let checks: [(&str, bool); 5] = [
@@ -1166,6 +1211,67 @@ mod tests {
     }
 
     #[test]
+    fn an_import_checks_quoted_values_and_the_top_of_the_file() {
+        let incoming = "StrictHostKeyChecking \"no\"\nUser ops\n\n\
+                        Host web\n    StrictHostKeyChecking \"False\"\n    HostName web\n";
+        let (text, reviews) = import_hosts("", incoming);
+        assert!(!text.to_ascii_lowercase().contains("stricthostkeychecking"));
+        assert!(text.starts_with("User ops\n"));
+        assert!(text.contains("Host web\n    HostName web\n"));
+        assert!(reviews.iter().any(|r| r.name == ALL_CONNECTIONS));
+        assert!(reviews.iter().any(|r| r.name == "web"));
+        // Ours at the top stays when it has that very line.
+        let mine = "StrictHostKeyChecking \"no\"\n";
+        let (text, reviews) = import_hosts(mine, incoming);
+        assert!(text.starts_with("StrictHostKeyChecking \"no\"\n"));
+        assert!(!reviews.iter().any(|r| r.name == ALL_CONNECTIONS));
+    }
+
+    #[test]
+    fn an_import_keeps_our_tags_within_the_limit_and_sees_ntlm_over_http() {
+        let mine = crate::Profile {
+            host: "w1".into(),
+            tags: vec!["prod".into()],
+            winrm_ntlm: true,
+            winrm_https: true,
+            ..crate::Profile::default()
+        };
+        let mut local = Settings {
+            profiles: vec![mine],
+            ..Settings::default()
+        };
+        let many: Vec<String> = (0..MAX_TAGS).map(|i| format!("t{i}")).collect();
+        let incoming = Settings {
+            profiles: vec![crate::Profile {
+                host: "w1".into(),
+                tags: many,
+                winrm_ntlm: true,
+                winrm_https: false,
+                ..crate::Profile::default()
+            }],
+            ..Settings::default()
+        };
+        let (_, reviews) = import_profiles(&mut local, &incoming);
+        let p = &local.profiles[0];
+        assert_eq!(p.tags.len(), MAX_TAGS);
+        assert_eq!(p.tags[0], "prod");
+        let notes = &reviews[0].notes;
+        assert!(notes.iter().any(|n| n.starts_with("left out its tags t15")));
+        assert!(notes.contains(&"allows NTLM over plain HTTP".to_owned()));
+        // HTTPS kept: no warning.
+        let mut https = incoming.clone();
+        https.profiles[0].winrm_https = true;
+        local.profiles[0].winrm_https = true;
+        let (_, reviews) = import_profiles(&mut local, &https);
+        assert!(
+            !reviews
+                .iter()
+                .flat_map(|r| &r.notes)
+                .any(|n| n.contains("NTLM"))
+        );
+    }
+
+    #[test]
     fn an_import_keeps_our_tags_and_warning_theme() {
         let mine = crate::Profile {
             host: "db1".into(),
@@ -1190,7 +1296,7 @@ mod tests {
         let (m, reviews) = import_profiles(&mut local, &incoming);
         assert_eq!(m.replaced, 1);
         let p = &local.profiles[0];
-        assert_eq!(p.tags, ["web", "prod"]);
+        assert_eq!(p.tags, ["prod", "web"]);
         assert_eq!(p.theme.as_deref(), Some("Production"));
         assert_eq!(reviews.len(), 1);
         assert_eq!(

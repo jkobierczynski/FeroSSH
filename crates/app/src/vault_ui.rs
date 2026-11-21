@@ -533,7 +533,8 @@ pub(super) fn import(hwnd: HWND) {
         question.push_str(
             "\n\nLook these over: a connection that now goes somewhere else gets the password \
              you type for it. Your tags, folders and Production or Staging themes stay, and new \
-             host keys are always asked about.",
+             host keys are asked about, unless your own connection already had \
+             StrictHostKeyChecking no.",
         );
         question.push_str(&reviews_text(&plan.reviews));
     }
@@ -543,11 +544,31 @@ pub(super) fn import(hwnd: HWND) {
     }
     // Merged again with the files and settings as they are now: another
     // PC (through a shared vault) may have changed them while the
-    // question was open.
-    let Some(current) = with_window(|w| w.settings.clone()) else {
-        return;
+    // question was open. What that changes is shown and asked about
+    // again before anything is written.
+    let mut approved = plan.reviews;
+    let plan = loop {
+        let Some(current) = with_window(|w| w.settings.clone()) else {
+            return;
+        };
+        let plan = self::plan(&incoming, &current);
+        if plan.reviews == approved {
+            break plan;
+        }
+        let question = format!(
+            "Your connections changed while the question was open (another window or PC), so \
+             the import now changes this:{}\n\nImport?",
+            if plan.reviews.is_empty() {
+                "\n- nothing more to look over".to_owned()
+            } else {
+                reviews_text(&plan.reviews)
+            }
+        );
+        if dialog(hwnd, &question, MB_YESNO | MB_ICONINFORMATION) != Some(IDYES) {
+            return;
+        }
+        approved = plan.reviews;
     };
-    let plan = self::plan(&incoming, &current);
     let mut problems = Vec::new();
     for (p, t) in &plan.files {
         if let Err(e) = write_app_file(p, t) {
