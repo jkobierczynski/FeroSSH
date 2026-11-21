@@ -166,6 +166,9 @@ fn from_cache(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> 
     let rest = rest.get(1..)?;
     let (len, rest) = rest.split_at(rest.iter().position(|b| *b == b'\n')?);
     let len: usize = std::str::from_utf8(len).ok()?.parse().ok()?;
+    if len > MAX_SIG_LEN {
+        return None;
+    }
     let rest = rest.get(1..)?;
     let sig = std::str::from_utf8(rest.get(..len)?).ok()?;
     let bytes = rest.get(len..)?;
