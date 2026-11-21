@@ -335,6 +335,21 @@ pub fn has_focus() -> bool {
     }
 }
 
+/// Puts `query` in the search box, as if typed (Tools > Hosts >
+/// Connections): the box's change event then searches.
+pub fn set_search(query: &str) {
+    let Some(h) = handles() else {
+        return;
+    };
+    if search_text(h.search) != query {
+        let text = wide(query);
+        // SAFETY: our own control; the text lives through the call.
+        unsafe {
+            let _ = SetWindowTextW(h.search, windows::core::PCWSTR(text.as_ptr()));
+        }
+    }
+}
+
 /// Gives the tree the keyboard (selecting its first item if none is).
 pub fn focus_tree() {
     let Some(h) = handles() else {

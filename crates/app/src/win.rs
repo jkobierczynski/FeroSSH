@@ -137,6 +137,7 @@ use crate::forwards::{
 use crate::fwd_panel;
 use crate::fwdview::{ForwardsView, FwdAction};
 use crate::highlight;
+use crate::hosts_panel;
 use crate::import_panel;
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
@@ -419,6 +420,7 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::FORWARDS, Always, &["Ctrl+Shift+P"]),
         d(cmd::KNOWN_HOSTS, Always, &["Ctrl+Shift+K"]),
         d(cmd::INVENTORY, Always, &["Ctrl+Shift+I"]),
+        d(cmd::HOSTS, Always, &[]),
         d(cmd::SNIPPETS, Always, &["Ctrl+Shift+Space"]),
         d(cmd::PALETTE, Always, &["Ctrl+Shift+A"]),
         d(
@@ -542,6 +544,8 @@ mod cmd {
     pub const KNOWN_HOSTS: u32 = 220;
     /// Tools > Inventory.
     pub const INVENTORY: u32 = 222;
+    /// Tools > Hosts.
+    pub const HOSTS: u32 = 682;
     /// Settings > Font ligatures.
     pub const FONT_LIGATURES: u32 = 221;
     /// Settings > Server status bar.
@@ -1259,6 +1263,8 @@ enum SideView {
     KnownHosts,
     /// The connection inventory (native controls only).
     Inventory,
+    /// The hosts, one row per machine (native controls only).
+    Hosts,
     /// The credential manager (native controls only).
     Credentials,
     /// The security rules (native controls only).
@@ -2863,6 +2869,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
+                RailItem::Hosts => cmd::HOSTS,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
                 RailItem::SecurityRules => cmd::SECURITY_RULES,
                 RailItem::Palette => cmd::PALETTE,
@@ -2889,6 +2896,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = known_hosts_panel::create(hwnd, known_hosts_event, dpi);
         // The inventory's, likewise.
         let _ = inventory_panel::create(hwnd, inventory_event, dpi);
+        // The hosts', likewise.
+        let _ = hosts_panel::create(hwnd, hosts_event, dpi);
         // The credential manager's, likewise.
         let _ = credential_panel::create(hwnd, credential_event, dpi);
         // The security rules', likewise.
@@ -2999,6 +3008,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || fwd_panel::pre_translate(&msg)
                 || known_hosts_panel::pre_translate(&msg)
                 || inventory_panel::pre_translate(&msg)
+                || hosts_panel::pre_translate(&msg)
                 || credential_panel::pre_translate(&msg)
                 || rules_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
@@ -3363,6 +3373,7 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
         item(tools, cmd::KNOWN_HOSTS, "Known &hosts\tCtrl+Shift+K")?;
         item(tools, cmd::INVENTORY, "&Inventory\tCtrl+Shift+I")?;
+        item(tools, cmd::HOSTS, "Ho&sts")?;
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         separator(tools)?;
         item(tools, cmd::CREDENTIAL_MANAGER, "Cre&dential manager")?;
@@ -12158,6 +12169,7 @@ impl Window {
             SideView::Snippets => RailItem::Snippets,
             SideView::KnownHosts => RailItem::KnownHosts,
             SideView::Inventory => RailItem::Inventory,
+            SideView::Hosts => RailItem::Hosts,
             SideView::Credentials => RailItem::Credentials,
             SideView::SecurityRules => RailItem::SecurityRules,
             SideView::Palette => RailItem::Palette,
@@ -12227,6 +12239,27 @@ impl Window {
     /// Whether the inventory shows (always native controls).
     fn inventory_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::Inventory
+    }
+
+    /// Reads the inventory and the connections again for Tools > Hosts,
+    /// and shows them taken together by machine.
+    fn reload_hosts(&mut self) {
+        // As for Inventory: a file that cannot be read leaves the list.
+        let inventory = match crate::inventory_view::read() {
+            Ok(inventory) => inventory,
+            Err(e) => {
+                hosts_panel::set_status(format!("Could not read the inventory: {e}"));
+                return;
+            }
+        };
+        let items = host_items(&ssh_env(), &self.settings);
+        let rows = crate::inventory_view::rows(&items, &inventory, &self.settings);
+        hosts_panel::set_rows(crate::hosts_view::hosts(&rows));
+    }
+
+    /// Whether the hosts show (always native controls).
+    fn hosts_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Hosts
     }
 
     /// Reads the credentials and saved passwords again for Tools >
@@ -12355,6 +12388,8 @@ impl Window {
             known_hosts_panel::has_focus()
         } else if self.inventory_native() {
             inventory_panel::has_focus()
+        } else if self.hosts_native() {
+            hosts_panel::has_focus()
         } else if self.credentials_native() {
             credential_panel::has_focus()
         } else if self.rules_native() {
@@ -12440,6 +12475,11 @@ impl Window {
             inventory_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             inventory_panel::place(None, 0, self.dpi);
+        }
+        if self.hosts_native() {
+            hosts_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            hosts_panel::place(None, 0, self.dpi);
         }
         if self.credentials_native() {
             credential_panel::place(self.areas.side, self.areas.side_width, self.dpi);
@@ -12658,10 +12698,12 @@ impl Window {
                     );
                 }
                 // Native controls (`files_panel`, `known_hosts_panel`,
-                // `inventory_panel`, `credential_panel`, `rules_panel`).
+                // `inventory_panel`, `hosts_panel`, `credential_panel`,
+                // `rules_panel`).
                 SideView::Files
                 | SideView::KnownHosts
                 | SideView::Inventory
+                | SideView::Hosts
                 | SideView::Credentials
                 | SideView::SecurityRules => {}
             }
@@ -13611,6 +13653,7 @@ impl Window {
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
+                RailItem::Hosts => cmd::HOSTS,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
                 RailItem::SecurityRules => cmd::SECURITY_RULES,
                 RailItem::Palette => cmd::PALETTE,
@@ -13946,6 +13989,11 @@ impl Window {
     /// Whether a paste is for the Inventory tool.
     fn inventory_paste(&self) -> bool {
         self.side.visible && self.side.focused && self.side.view == SideView::Inventory
+    }
+
+    /// Whether a paste is for the Hosts tool.
+    fn hosts_paste(&self) -> bool {
+        self.side.visible && self.side.focused && self.side.view == SideView::Hosts
     }
 
     /// Whether a paste is for the credential manager.
@@ -17353,6 +17401,7 @@ impl Window {
             SideView::Forwards | SideView::Palette => {}
             SideView::KnownHosts => self.reload_known_hosts(),
             SideView::Inventory => self.reload_inventory(),
+            SideView::Hosts => self.reload_hosts(),
             SideView::Credentials => self.reload_credentials(),
             SideView::SecurityRules => self.reload_rules(),
             SideView::Live => {
@@ -17395,6 +17444,7 @@ impl Window {
             cmd::LIVE => SideView::Live,
             cmd::KNOWN_HOSTS => SideView::KnownHosts,
             cmd::INVENTORY => SideView::Inventory,
+            cmd::HOSTS => SideView::Hosts,
             cmd::CREDENTIAL_MANAGER => SideView::Credentials,
             cmd::SECURITY_RULES => SideView::SecurityRules,
             _ => SideView::Sessions,
@@ -20006,6 +20056,10 @@ impl Window {
                 (
                     cmd::INVENTORY,
                     self.side.visible && self.side.view == SideView::Inventory,
+                ),
+                (
+                    cmd::HOSTS,
+                    self.side.visible && self.side.view == SideView::Hosts,
                 ),
                 (
                     cmd::CREDENTIAL_MANAGER,
@@ -22837,6 +22891,7 @@ fn tools_have_focus() -> bool {
         || script_report::has_focus()
         || known_hosts_panel::has_focus()
         || inventory_panel::has_focus()
+        || hosts_panel::has_focus()
         || credential_panel::has_focus()
         || rules_panel::has_focus()
 }
@@ -23434,6 +23489,38 @@ fn inventory_event(hwnd: HWND, event: inventory_panel::Event) {
         Event::Reload => {
             with_window(|w| {
                 w.reload_inventory();
+                w.refresh_chrome();
+            });
+        }
+        Event::Focused => tools_focused(),
+        Event::Leave => {
+            with_window(Window::focus_terminal);
+        }
+    }
+}
+
+/// Carries out what the user did in Tools > Hosts.
+fn hosts_event(hwnd: HWND, event: hosts_panel::Event) {
+    use hosts_panel::Event;
+    match event {
+        Event::Connect(host) => {
+            if let Some(Some(command)) =
+                with_window(|w| w.side_action(Some(SideAction::Open { host, split: false })))
+            {
+                run_command(hwnd, command);
+            }
+        }
+        // The connection manager, searched for the host's address.
+        Event::Connections(address) => {
+            with_window(|w| {
+                w.show_side(SideView::Sessions, true);
+                w.update_menu_checks();
+            });
+            conn_view::set_search(&format!("host:{address}"));
+        }
+        Event::Reload => {
+            with_window(|w| {
+                w.reload_hosts();
                 w.refresh_chrome();
             });
         }
@@ -24165,6 +24252,7 @@ fn is_side_pane(id: u32) -> bool {
             | cmd::SNIPPETS
             | cmd::KNOWN_HOSTS
             | cmd::INVENTORY
+            | cmd::HOSTS
             | cmd::CREDENTIAL_MANAGER
             | cmd::SECURITY_RULES
     )
@@ -24394,6 +24482,9 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
                 if with_window(|w| w.inventory_paste()) == Some(true) {
                     inventory_panel::paste(&text);
+                }
+                if with_window(|w| w.hosts_paste()) == Some(true) {
+                    hosts_panel::paste(&text);
                 }
                 if with_window(|w| w.credentials_paste()) == Some(true) {
                     credential_panel::paste(&text);
@@ -27063,6 +27154,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && with_window(|w| w.inventory_native()) == Some(true) => {
                         inventory_panel::focus_search();
                     }
+                    1 if want && with_window(|w| w.hosts_native()) == Some(true) => {
+                        hosts_panel::focus_search();
+                    }
                     1 if want && with_window(|w| w.credentials_native()) == Some(true) => {
                         credential_panel::focus_search();
                     }
@@ -27212,6 +27306,7 @@ mod tests {
             cmd::SNIPPETS,
             cmd::KNOWN_HOSTS,
             cmd::INVENTORY,
+            cmd::HOSTS,
             cmd::CREDENTIAL_MANAGER,
             cmd::SECURITY_RULES,
         ] {

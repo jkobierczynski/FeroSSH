@@ -88,6 +88,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Port forwards | Ctrl+Shift+P | Lists, adds, changes and stops port forwards on live connections (see [Port forwards](everyday-use.md#port-forwards)). |
 | Scripts | Ctrl+Shift+Space | Lists your scripts by category, to type one into the pane or edit them (see [Scripts](everyday-use.md#scripts)). |
 | Known hosts | Ctrl+Shift+K | Lists the host keys in `known_hosts` to search, copy and remove, `@cert-authority` and `@revoked` lines and hashed host names included (see [Known hosts](everyday-use.md#known-hosts)). |
+| Hosts | | One row per machine: the connections that reach the same address, with their users, ports, tags, latest login, host key and OS, to search, sort, connect and show in the connection manager (see [Hosts](everyday-use.md#hosts)). |
 | Inventory | Ctrl+Shift+I | Lists every connection with its last login, host key and, where read, OS and kernel, to search, sort, save as CSV and connect (see [Inventory](everyday-use.md#inventory)). |
 | Open scripts folder | | Opens `%APPDATA%\FeroSSH\scripts` in Explorer: one file per script, a folder per category, to copy to another PC or back up (see [The scripts folder](everyday-use.md#the-scripts-folder)). |
 | Command palette | Ctrl+Shift+A | One search box over every menu item, connection and script (see [Command palette](everyday-use.md#the-command-palette)). |
@@ -297,6 +298,17 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Ctrl+C or Copy fingerprint | Copies the entry's SHA-256 fingerprint. |
 | F5 or Reload | Reads the files again. |
 | Right click or Shift+F10 | Copy fingerprint, Copy line and Remove for the entry. |
+| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
+
+### Hosts
+
+| Key | Action |
+| --- | --- |
+| Typing | Searches with the connection manager's search words; a host shows when one of its connections matches. Plain words also look at the address, OS, kernel and fingerprints. In the list it goes to the search box; Down there moves to the list. |
+| A click on a column heading | Sorts by that column; again for the other way. |
+| Enter in the list, a double click or Connect | Opens the host's connection used last. |
+| Connections | Shows the host's connections in the connection manager. |
+| F5 or Reload | Reads the inventory again. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 
 ### Inventory (Ctrl+Shift+I)

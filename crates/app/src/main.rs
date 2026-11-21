@@ -71,6 +71,10 @@ mod form_view;
 #[cfg(windows)]
 mod fwd_panel;
 #[cfg(windows)]
+mod hosts_panel;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod hosts_view;
+#[cfg(windows)]
 mod inventory_panel;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod inventory_view;

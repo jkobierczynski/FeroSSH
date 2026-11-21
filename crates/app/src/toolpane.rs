@@ -22,6 +22,7 @@ pub const MIN_WIDTH: i32 = 80;
 pub enum RailItem {
     Connections,
     Sessions,
+    Hosts,
     Files,
     Forwards,
     Snippets,
@@ -37,9 +38,10 @@ pub enum RailItem {
 }
 
 impl RailItem {
-    pub const ALL: [RailItem; 11] = [
+    pub const ALL: [RailItem; 12] = [
         RailItem::Connections,
         RailItem::Sessions,
+        RailItem::Hosts,
         RailItem::Files,
         RailItem::Forwards,
         RailItem::Snippets,
@@ -56,6 +58,7 @@ impl RailItem {
         match self {
             RailItem::Connections => "Connection manager",
             RailItem::Sessions => "Session manager",
+            RailItem::Hosts => "Hosts",
             RailItem::Files => "File transfer",
             RailItem::Forwards => "Port forwards",
             RailItem::Snippets => "Scripts",
@@ -76,6 +79,7 @@ impl RailItem {
         match self {
             RailItem::Connections => '\u{E839}',   // Ethernet
             RailItem::Sessions => '\u{E756}',      // CommandPrompt
+            RailItem::Hosts => '\u{E7F4}',         // TVMonitor (a machine)
             RailItem::Files => '\u{E8B7}',         // Folder
             RailItem::Forwards => '\u{E8AB}',      // Switch
             RailItem::Snippets => '\u{E943}',      // Code
@@ -95,9 +99,10 @@ impl RailItem {
 }
 
 /// The tools' buttons, from the top.
-const TOP: [RailItem; 9] = [
+const TOP: [RailItem; 10] = [
     RailItem::Connections,
     RailItem::Sessions,
+    RailItem::Hosts,
     RailItem::Files,
     RailItem::Forwards,
     RailItem::Snippets,
@@ -414,24 +419,25 @@ mod tests {
         // 40 px rail: 5 px padding, 30 px buttons, 35 px steps.
         assert_eq!(item_at(20, 20, 40, 600), Some(RailItem::Connections));
         assert_eq!(item_at(20, 5 + 35 + 10, 40, 600), Some(RailItem::Sessions));
+        assert_eq!(item_at(20, 5 + 2 * 35 + 10, 40, 600), Some(RailItem::Hosts));
         assert_eq!(
-            item_at(20, 5 + 4 * 35 + 10, 40, 600),
+            item_at(20, 5 + 5 * 35 + 10, 40, 600),
             Some(RailItem::Snippets)
         );
         assert_eq!(
-            item_at(20, 5 + 5 * 35 + 10, 40, 600),
+            item_at(20, 5 + 6 * 35 + 10, 40, 600),
             Some(RailItem::KnownHosts)
         );
         assert_eq!(
-            item_at(20, 5 + 6 * 35 + 10, 40, 600),
+            item_at(20, 5 + 7 * 35 + 10, 40, 600),
             Some(RailItem::Inventory)
         );
         assert_eq!(
-            item_at(20, 5 + 7 * 35 + 10, 40, 600),
+            item_at(20, 5 + 8 * 35 + 10, 40, 600),
             Some(RailItem::Credentials)
         );
         assert_eq!(
-            item_at(20, 5 + 8 * 35 + 10, 40, 600),
+            item_at(20, 5 + 9 * 35 + 10, 40, 600),
             Some(RailItem::SecurityRules)
         );
         assert_eq!(item_at(20, 600 - 5 - 10, 40, 600), Some(RailItem::Pin));
