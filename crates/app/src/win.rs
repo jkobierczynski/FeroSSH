@@ -20274,18 +20274,18 @@ impl Window {
             }
             // New tabs too, when it is the default theme; and the saved
             // default follows a Save as that renamed it.
+            // The saved default is checked on its own: a --theme start
+            // may show another default while the settings name this one.
             if self.default_theme == before {
                 self.default_theme = saved.clone();
-                if before.name != name
-                    && self.settings.default_theme.as_deref() == Some(before.name)
-                {
-                    self.settings.default_theme = Some(name.to_owned());
-                    if let Err(e) = self.try_save_settings() {
-                        unsaved = format!(
-                            " New tabs use it now, but the settings could not be saved, so \
-                             the next start uses the old default ({e})."
-                        );
-                    }
+            }
+            if before.name != name && self.settings.default_theme.as_deref() == Some(before.name) {
+                self.settings.default_theme = Some(name.to_owned());
+                if let Err(e) = self.try_save_settings() {
+                    unsaved = format!(
+                        " The default theme was renamed, but the settings could not be \
+                         saved, so the next start uses the old default ({e})."
+                    );
                 }
             }
             shown = ids.len();
