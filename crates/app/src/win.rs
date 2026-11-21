@@ -15965,7 +15965,22 @@ impl Window {
                 format!("{host}:{port}")
             };
             let clipboard = self.desktop_clip(self.desktop_clip_limit(&[name])) == (true, true);
-            if let Err(e) = launch_rdp_client(&addr, self.fixed_desktop_size(name), clipboard) {
+            let size = self.fixed_desktop_size(name);
+            // No pane to ask in: a security rule that asks before
+            // connecting asks in a message box before mstsc starts.
+            if self
+                .policy_of(name, Some(&host), cfg.tag.as_deref())
+                .confirm_connect
+            {
+                self.queued.push(Command::ConfirmRdp {
+                    name: name.to_owned(),
+                    addr,
+                    size,
+                    clipboard,
+                });
+                return;
+            }
+            if let Err(e) = launch_rdp_client(&addr, size, clipboard) {
                 self.queued.push(Command::Notice(format!(
                     "Remote Desktop Connection (mstsc.exe) did not start: {e}"
                 )));
@@ -21916,6 +21931,14 @@ enum Command {
     ClearAllHistory,
     /// A message box with this text.
     Notice(String),
+    /// A direct Remote Desktop connection a security rule asks about
+    /// first: mstsc starts after Yes.
+    ConfirmRdp {
+        name: String,
+        addr: String,
+        size: Option<(u16, u16)>,
+        clipboard: bool,
+    },
     /// Ask, then delete `entries` in folder `dir` of `key`'s host (when
     /// it is still the listed one).
     ConfirmDelete {
@@ -24669,6 +24692,27 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::CopyKey { pane, host } => pick_key_to_copy(hwnd, pane, &host),
         Command::Notice(text) => {
             dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Command::ConfirmRdp {
+            name,
+            addr,
+            size,
+            clipboard,
+        } => {
+            let question = format!(
+                "A security rule asks before connecting to {}. Open Remote Desktop to {}?",
+                crate::ssh::sanitize_line(&name),
+                crate::ssh::sanitize_line(&addr)
+            );
+            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
+                && let Err(e) = launch_rdp_client(&addr, size, clipboard)
+            {
+                dialog(
+                    hwnd,
+                    &format!("Remote Desktop Connection (mstsc.exe) did not start: {e}"),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
         }
         Command::WriteLibrary => write_library(hwnd),
         Command::PickStandbyHotkey => {
