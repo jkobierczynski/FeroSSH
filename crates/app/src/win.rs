@@ -23512,13 +23512,13 @@ fn rules_event(hwnd: HWND, event: rules_panel::Event) {
     use rules_panel::Event;
     match event {
         Event::New => edit_rule(hwnd, None),
-        Event::Edit(i) => edit_rule(hwnd, Some(i)),
+        Event::Edit(row) => edit_rule(hwnd, Some((row.index, row.rule))),
         Event::Delete(row) => {
             save_rules(hwnd, |rules| {
                 // Only the rule asked about: the list may have changed
                 // under it (a vault sync).
-                if rules.get(row.index) == Some(&row.rule) {
-                    rules.remove(row.index);
+                if let Some(i) = find_rule(rules, row.index, &row.rule) {
+                    rules.remove(i);
                 }
             });
         }
@@ -23569,13 +23569,37 @@ fn save_rules(
     }
 }
 
-/// Opens rule number `index` (or a new one) to change; saves it once it
-/// names something and limits something.
-fn edit_rule(hwnd: HWND, index: Option<usize>) {
+/// Where `rule` is in `rules` now: at `index` as it was shown, or else
+/// the first one just like it (the list changed under it, a vault sync).
+fn find_rule(
+    rules: &[ferossh_config::host_policy::SecurityRule],
+    index: usize,
+    rule: &ferossh_config::host_policy::SecurityRule,
+) -> Option<usize> {
+    if rules.get(index) == Some(rule) {
+        return Some(index);
+    }
+    rules.iter().position(|r| r == rule)
+}
+
+/// The question when a rule changed elsewhere before it could be saved.
+const RULE_CHANGED: &str = "This rule was changed or deleted elsewhere (another FeroSSH \
+                            sharing the settings) while it was open. Nothing was saved; Reload \
+                            shows the rules as they are now.";
+
+/// Opens rule `shown` (its place as listed, and the rule then), or a
+/// new one, to change; saves it once it names something and limits
+/// something.
+fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::SecurityRule)>) {
     use ferossh_config::host_policy::{LIMITS, Policy, SecurityRule, words, words_text};
-    let original =
-        index.and_then(|i| with_window(|w| w.settings.security_rules.get(i).cloned()).flatten());
-    if index.is_some() && original.is_none() {
+    let index = shown.as_ref().map(|(i, _)| *i);
+    let original = shown.clone().map(|(_, rule)| rule);
+    if let Some((i, rule)) = &shown
+        && with_window(|w| find_rule(&w.settings.security_rules, *i, rule))
+            .flatten()
+            .is_none()
+    {
+        dialog(hwnd, RULE_CHANGED, MB_OK | MB_ICONWARNING);
         return;
     }
     let mut rule = original.clone().unwrap_or_default();
@@ -23649,11 +23673,18 @@ fn edit_rule(hwnd: HWND, index: Option<usize>) {
             if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
                 continue;
             }
-            if save_rules(hwnd, |rules| {
-                if rules.get(i) == Some(o) {
-                    rules.remove(i);
+            let lost = std::cell::Cell::new(false);
+            let saved = save_rules(hwnd, |rules| match find_rule(rules, i, o) {
+                Some(at) => {
+                    rules.remove(at);
                 }
-            }) {
+                None => lost.set(true),
+            });
+            if lost.get() {
+                dialog(hwnd, RULE_CHANGED, MB_OK | MB_ICONWARNING);
+                return;
+            }
+            if saved {
                 return;
             }
             continue;
@@ -23672,15 +23703,25 @@ fn edit_rule(hwnd: HWND, index: Option<usize>) {
         }
         let new = rule.clone();
         let old = original.clone();
-        if save_rules(hwnd, move |rules| match index {
-            // Edited where it was, if it is still there.
-            Some(i) if old.is_some() && rules.get(i) == old.as_ref() => {
-                if let Some(r) = rules.get_mut(i) {
-                    *r = new;
+        let lost = std::cell::Cell::new(false);
+        let saved = save_rules(hwnd, |rules| match (index, &old) {
+            // Edited where it is now; one changed or deleted elsewhere
+            // meanwhile is left alone (never added a second time).
+            (Some(i), Some(old)) => match find_rule(rules, i, old) {
+                Some(at) => {
+                    if let Some(r) = rules.get_mut(at) {
+                        *r = new;
+                    }
                 }
-            }
+                None => lost.set(true),
+            },
             _ => rules.push(new),
-        }) {
+        });
+        if lost.get() {
+            dialog(hwnd, RULE_CHANGED, MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if saved {
             return;
         }
         // Not saved: the form again, with what was typed.

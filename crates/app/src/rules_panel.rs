@@ -54,9 +54,10 @@ use crate::rules_view::{self as view, Column, Row};
 pub enum Event {
     /// Make a new rule.
     New,
-    /// Open rule number `0` (its place in the settings) to change (Edit,
-    /// Enter, a double click).
-    Edit(usize),
+    /// Open this rule to change (Edit, Enter, a double click): the row
+    /// as shown, so the rule opened is the one picked even if the list
+    /// changed under it.
+    Edit(Row),
     /// Delete this rule (the user said yes).
     Delete(Row),
     /// Read the list again (F5).
@@ -545,7 +546,7 @@ fn emit(e: Event) {
 
 fn edit() {
     if let Some(r) = selected() {
-        emit(Event::Edit(r.index));
+        emit(Event::Edit(r));
     }
 }
 
