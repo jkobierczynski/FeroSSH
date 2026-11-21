@@ -394,21 +394,6 @@ pub fn set_rows(rows: Vec<Row>, save_dir: PathBuf) {
     fill(keep.as_deref());
 }
 
-/// Puts `query` in the search box (the connection manager's search, when
-/// opened from there). The box's change event then fills the list.
-pub fn set_search(query: &str) {
-    let Some(h) = handles() else {
-        return;
-    };
-    if search_text(h.search) != query {
-        let text = wide(query);
-        // SAFETY: our own control; the text lives through the call.
-        unsafe {
-            let _ = SetWindowTextW(h.search, PCWSTR(text.as_ptr()));
-        }
-    }
-}
-
 /// Gives the search box the keyboard (as the tool opens).
 pub fn focus_search() {
     if let Some(h) = handles() {

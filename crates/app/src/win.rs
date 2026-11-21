@@ -23201,8 +23201,6 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     const NEW: u32 = 5;
     const SAVE_SEARCH: u32 = 6;
     const REMOVE_SEARCH: u32 = 7;
-    const CREDENTIALS: u32 = 8;
-    const INVENTORY: u32 = 9;
     // The search typed, when there is one to save.
     let typed = with_window(|w| {
         let q = w.side.list.query().trim().to_owned();
@@ -23239,8 +23237,6 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
-        let _ = AppendMenuW(menu, MF_STRING, CREDENTIALS as usize, w!("C&redentials"));
-        let _ = AppendMenuW(menu, MF_STRING, INVENTORY as usize, w!("&Inventory"));
         if typed.is_some() || search.is_some() {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
@@ -23280,18 +23276,6 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
         (EDIT, Some(host)) => SideAction::Edit(host),
         (DELETE, Some(host)) => SideAction::Delete(host),
         (NEW, _) => SideAction::New,
-        (CREDENTIALS, _) => {
-            with_window(|w| {
-                w.show_side(SideView::Credentials, true);
-                w.update_menu_checks();
-            });
-            credential_panel::focus_search();
-            return;
-        }
-        (INVENTORY, _) => {
-            inventory_window(hwnd);
-            return;
-        }
         (SAVE_SEARCH, _) => match typed {
             Some(q) => SideAction::SaveSearch(q),
             None => return,
@@ -23315,21 +23299,6 @@ fn login_refused(why: &str) -> String {
          connection manager.\x1b[0m\r\n",
         crate::ssh::sanitize(why)
     )
-}
-
-/// Connection manager > Inventory: Tools > Inventory, searched as the
-/// connection manager is.
-fn inventory_window(hwnd: HWND) {
-    let Some(query) = with_window(|w| w.side.list.query().trim().to_owned()) else {
-        return;
-    };
-    let _ = hwnd;
-    with_window(|w| {
-        w.show_side(SideView::Inventory, true);
-        w.update_menu_checks();
-    });
-    inventory_panel::set_search(&query);
-    inventory_panel::focus_search();
 }
 
 /// A change the inventory file must get even when writing it fails at
