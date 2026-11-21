@@ -15528,6 +15528,8 @@ impl Window {
         }
         if self.settings.workspace_auto_login {
             for n in ferossh_config::workspace::all_connections(&workspaces_dir()) {
+                // An `sftp://` pane logs in as the `user@host:port` it names.
+                let n = ferossh_config::ssh_config::sftp_url(&n).map_or(n, |(d, _)| d);
                 add(n, true);
             }
         }
