@@ -18689,7 +18689,18 @@ impl Window {
     /// [`Self::save_settings`], with the failure also returned, for callers
     /// that must not go on without the settings saved.
     fn try_save_settings(&mut self) -> std::result::Result<(), String> {
+        // Another FeroSSH window on this PC waits while this one reads,
+        // merges and writes the settings, so neither drops what the other
+        // added. (A file of its own, not the vault's lock, which the vault
+        // takes itself for each read and write.)
+        let _lock = crate::vault::lock_file(&settings_path());
+        let rules = self.settings.security_rules.clone();
         vault_ui::sync_settings(&mut self.settings);
+        // Rules the merge brought in show at once: the next focus finds
+        // nothing new to take in.
+        if self.settings.security_rules != rules && self.rules_native() {
+            rules_panel::set_rows(self.rule_rows());
+        }
         // Window colours shown by a menu preview are not saved.
         let shown = self.settings.window_colours;
         if let Some(p) = self
