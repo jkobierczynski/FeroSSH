@@ -7231,10 +7231,20 @@ impl Window {
             return Policy::default();
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
-        // The folder the Connection manager shows it in: a FeroSSH
-        // connection's own, else the one its ssh_config (an import's
-        // file) gives it.
-        let folder = load_saved()
+        let folder = self.rule_folder(alias);
+        self.settings.policy(&Subject {
+            name: alias,
+            hostname,
+            tags: &tags,
+            folder: folder.as_deref(),
+        })
+    }
+
+    /// The folder the Connection manager shows connection `alias` in: a
+    /// FeroSSH connection's own, else the one its ssh_config (an
+    /// import's file) gives it.
+    fn rule_folder(&self, alias: &str) -> Option<String> {
+        load_saved()
             .into_iter()
             .find(|h| h.alias.eq_ignore_ascii_case(alias))
             .and_then(|h| h.folder)
@@ -7247,13 +7257,7 @@ impl Window {
                     .into_iter()
                     .find(|h| h.name.eq_ignore_ascii_case(alias))
                     .and_then(|h| h.folder)
-            });
-        self.settings.policy(&Subject {
-            name: alias,
-            hostname,
-            tags: &tags,
-            folder: folder.as_deref(),
-        })
+            })
     }
 
     /// Whether pane `id` may connect to `destination` now. A security
@@ -7508,7 +7512,42 @@ impl Window {
             self.show(id, &text);
             self.update_menu_checks();
         }
+        self.warn_rule_lines(id, alias, hostname, tag);
         policy
+    }
+
+    /// Says so in pane `id` when a rule for the connection has lines this
+    /// FeroSSH does not understand: a limit it may be meant to have, and
+    /// does not get.
+    fn warn_rule_lines(&mut self, id: PaneId, alias: &str, hostname: &str, tag: Option<&str>) {
+        if self
+            .settings
+            .security_rules
+            .iter()
+            .all(|r| r.unknown.is_empty())
+        {
+            return;
+        }
+        let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
+        let folder = self.rule_folder(alias);
+        let lines = ferossh_config::host_policy::not_understood(
+            &self.settings.security_rules,
+            &Subject {
+                name: alias,
+                hostname: Some(hostname),
+                tags: &tags,
+                folder: folder.as_deref(),
+            },
+        );
+        if lines.is_empty() {
+            return;
+        }
+        let text = format!(
+            "\x1b[0;33mA security rule for this connection has lines this FeroSSH does not \
+             understand, so they are not applied: {}. See Tools > Security rules.\x1b[0m\r\n",
+            crate::ssh::sanitize_line(&lines.join("; "))
+        );
+        self.show(id, &text);
     }
 
     /// Whether `destination` logs in over SSH: not a serial port, a
@@ -23956,6 +23995,17 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
                  work; a folder covers the folders inside it). A connection that matches \
                  any of them gets the limits ticked below, whatever its own settings say. \
                  Changes apply to connections opened from now on.";
+    let odd = original
+        .as_ref()
+        .filter(|r| !r.unknown.is_empty())
+        .map(|r| {
+            format!(
+                "{intro}\n\nThis rule also has lines this FeroSSH does not understand, kept in \
+                 the file as they are but not applied: {}.",
+                crate::ssh::sanitize_line(&r.unknown.join("; "))
+            )
+        });
+    let intro = odd.as_deref().unwrap_or(intro);
     loop {
         if DIALOG_OPEN.get() {
             return;
@@ -23994,6 +24044,8 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
             tags: words(f.next().map_or("", String::as_str)),
             folders: words(f.next().map_or("", String::as_str)),
             limits: Policy::from_flags(&answer.checks),
+            // Lines the form cannot show stay as they were.
+            unknown: rule.unknown.clone(),
         };
         if rule.hosts.is_empty() && rule.tags.is_empty() && rule.folders.is_empty() {
             dialog(

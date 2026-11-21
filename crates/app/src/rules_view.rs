@@ -93,7 +93,7 @@ pub fn text(row: &Row, column: Column) -> String {
     let raw = match column {
         Column::Number => (row.index + 1).to_string(),
         Column::Matches => row.rule.describe_match(),
-        Column::Limits => row.rule.limits.describe().join(", "),
+        Column::Limits => limits_text(&row.rule),
         Column::Connections => match row.used_by.len() {
             0 => "none".to_owned(),
             n if n <= 3 => row.used_by.join(", "),
@@ -104,6 +104,21 @@ pub fn text(row: &Row, column: Column) -> String {
         },
     };
     clean(&raw)
+}
+
+/// A rule's limits in words, with a warning for the lines this FeroSSH
+/// does not understand (kept, but not applied).
+fn limits_text(rule: &SecurityRule) -> String {
+    let mut parts: Vec<String> = rule
+        .limits
+        .describe()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if !rule.unknown.is_empty() {
+        parts.push(format!("⚠ {}", rule.describe_unknown()));
+    }
+    parts.join(", ")
 }
 
 fn clean(text: &str) -> String {
@@ -125,7 +140,7 @@ pub fn filter<'a>(rows: &'a [Row], query: &str) -> Vec<&'a Row> {
         .filter(|r| {
             let hay = [
                 r.rule.describe_match(),
-                r.rule.limits.describe().join(", "),
+                limits_text(&r.rule),
                 r.used_by.join(" "),
             ]
             .join(" ")
@@ -165,6 +180,14 @@ pub fn summary(shown: &[&Row], total: usize) -> String {
         text.push_str(&format!(
             " {unused} cover{} no saved connection yet.",
             if unused == 1 { "s" } else { "" }
+        ));
+    }
+    let odd = shown.iter().filter(|r| !r.rule.unknown.is_empty()).count();
+    if odd > 0 {
+        text.push_str(&format!(
+            " {odd} {} lines this FeroSSH does not understand (marked ⚠): they are kept in the \
+             file but not applied; correct them in ferossh.conf or update FeroSSH.",
+            if odd == 1 { "rule has" } else { "rules have" }
         ));
     }
     text.push_str(" A rule only tightens: every rule that matches a connection adds its limits.");
@@ -264,5 +287,22 @@ mod tests {
         let mut evil = rows[2].clone();
         evil.rule.hosts = vec!["a\u{202e}b".into()];
         assert!(!delete_question(&evil).contains('\u{202e}'));
+    }
+
+    #[test]
+    fn lines_not_understood_show_as_a_warning() {
+        let mut rule = SecurityRule::default();
+        rule.tags.push("prod".into());
+        rule.limits.log_session = true;
+        rule.unknown.push("KeysOnly 1".into());
+        let all = [conn("db", &["prod"], None)];
+        let rows = rows(&[rule], &all);
+        assert_eq!(
+            text(&rows[0], Column::Limits),
+            "session logged, ⚠ not understood: KeysOnly 1"
+        );
+        let shown: Vec<&Row> = rows.iter().collect();
+        assert!(summary(&shown, 1).contains("1 rule has lines this FeroSSH does not understand"));
+        assert_eq!(filter(&rows, "understood").len(), 1);
     }
 }

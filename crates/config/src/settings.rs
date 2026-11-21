@@ -1301,6 +1301,9 @@ fn security_block(r: &SecurityRule) -> String {
             let _ = writeln!(out, "    {line}");
         }
     }
+    for line in &r.unknown {
+        let _ = writeln!(out, "    {line}");
+    }
     out
 }
 
@@ -1945,17 +1948,40 @@ impl Settings {
                         // Each limit is on only when written as such: a
                         // rule can only tighten.
                         let on = yes(&args);
+                        // A line not understood (a newer keyword, a typo,
+                        // a value that is not yes or no) is kept as it is
+                        // and shown as a warning: never dropped silently.
+                        let limit = matches!(
+                            keyword.as_str(),
+                            "keysonly"
+                                | "savepassword"
+                                | "forwardagent"
+                                | "clipboard"
+                                | "confirmconnect"
+                                | "logsession"
+                        );
+                        if limit && (on.is_none() || args.len() != 1) {
+                            r.unknown.push(clean(line.trim()));
+                            continue;
+                        }
                         match keyword.as_str() {
-                            "hosts" => r.hosts.extend(args),
-                            "tags" => r.tags.extend(args),
-                            "folders" => r.folders.extend(args),
-                            "keysonly" => r.limits.keys_only = on == Some(true),
-                            "savepassword" => r.limits.no_saved_password = on == Some(false),
-                            "forwardagent" => r.limits.no_agent_forwarding = on == Some(false),
-                            "clipboard" => r.limits.no_clipboard = on == Some(false),
-                            "confirmconnect" => r.limits.confirm_connect = on == Some(true),
-                            "logsession" => r.limits.log_session = on == Some(true),
-                            _ => {}
+                            // `Tag`, as ssh_config spells it, is read as
+                            // `Tags`.
+                            "hosts" | "host" if !args.is_empty() => r.hosts.extend(args),
+                            "tags" | "tag" if !args.is_empty() => r.tags.extend(args),
+                            "folders" | "folder" if !args.is_empty() => r.folders.extend(args),
+                            "keysonly" => r.limits.keys_only |= on == Some(true),
+                            "savepassword" => r.limits.no_saved_password |= on == Some(false),
+                            "forwardagent" => r.limits.no_agent_forwarding |= on == Some(false),
+                            "clipboard" => r.limits.no_clipboard |= on == Some(false),
+                            "confirmconnect" => r.limits.confirm_connect |= on == Some(true),
+                            "logsession" => r.limits.log_session |= on == Some(true),
+                            // Indented: a line of this rule. Unindented, it
+                            // is something after the rule, left alone.
+                            _ if line.starts_with(char::is_whitespace) => {
+                                r.unknown.push(clean(line.trim()));
+                            }
+                            _ => block = Block::Top,
                         }
                     }
                     Block::Credential(i) => {
@@ -3550,6 +3576,29 @@ DesktopShareSelection yes
         });
         assert!(p.log_session);
         assert!(s.policy(&Subject::default()).is_empty());
+    }
+
+    #[test]
+    fn rule_lines_not_understood_are_kept_and_written_back() {
+        let text = "SecurityRule\n    Tag production\n    KeysOnly 1\n    LogSession yes\n\
+                    SecurityRule\n    Tags lab\n    X11Forwarding no\n\
+                    NewerSetting on\n    Stray line\nSavedSearch tag:lab\n";
+        let s = Settings::parse(text);
+        assert_eq!(s.security_rules.len(), 2);
+        // `Tag` reads as `Tags`; `KeysOnly 1` is kept, not applied.
+        let r = &s.security_rules[0];
+        assert_eq!(r.tags, ["production"]);
+        assert!(r.limits.log_session && !r.limits.keys_only);
+        assert_eq!(r.unknown, ["KeysOnly 1"]);
+        // A rule whose only limit is a newer keyword is not dropped, and
+        // the unindented line after it is not taken into it.
+        let r = &s.security_rules[1];
+        assert!(r.limits.is_empty());
+        assert_eq!(r.unknown, ["X11Forwarding no"]);
+        assert_eq!(s.saved_searches, ["tag:lab"]);
+        let again = Settings::parse(&s.to_text());
+        assert_eq!(again.security_rules, s.security_rules);
+        assert!(s.to_text().contains("    X11Forwarding no\n"));
     }
 
     #[test]
