@@ -16,7 +16,7 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 | 6 | Credential and security rules by tag or folder | Done (#259, #260) |
 | 7 | Inventory columns with CSV export | Done (#261) |
 | 8 | Run a script or broadcast to a tag or saved search | To do |
-| 9 | A shared, read-only connection library for a team | To do |
+| 9 | A shared, read-only connection library for a team | Built (signed file on a share; HTTPS later) |
 | 10 | A machine-wide admin policy file | To do |
 
 ## 1. Several tags per connection (built)

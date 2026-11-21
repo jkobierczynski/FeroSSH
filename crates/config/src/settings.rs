@@ -988,6 +988,16 @@ pub struct Settings {
     /// holds about one connection (Settings > Allow deleting connection
     /// log entries). Off unless turned on.
     pub connection_log_delete: bool,
+    /// The team's shared connection library: a file on a share or in a
+    /// synced folder (see [`crate::team`]).
+    pub team_library: Option<String>,
+    /// The keys a team library must be signed with, as OpenSSH public
+    /// key lines.
+    pub team_library_keys: Vec<String>,
+    /// What the team library gave, once verified; never written to the
+    /// settings file. Its connections' profiles and its rules come before
+    /// the user's own.
+    pub team: crate::team::Team,
     /// Earlier commands on the host (and a few common ones) show greyed
     /// after the cursor while typing; Enter keeps echoed command lines in
     /// an encrypted per-host history. Off unless turned on.
@@ -1111,6 +1121,9 @@ impl Default for Settings {
             tmux_keys: false,
             font_ligatures: false,
             connection_log_delete: false,
+            team_library: None,
+            team_library_keys: Vec::new(),
+            team: crate::team::Team::default(),
             command_suggestions: false,
             default_theme: None,
             default_font: None,
@@ -1605,6 +1618,16 @@ impl Settings {
                 "connectionlogdelete" => {
                     block = Block::Top;
                     s.connection_log_delete = yes(&args).unwrap_or(false);
+                }
+                "teamlibrary" => {
+                    block = Block::Top;
+                    s.team_library = Some(joined).filter(|f| !f.is_empty());
+                }
+                "teamlibrarykey" => {
+                    block = Block::Top;
+                    if !joined.is_empty() && !s.team_library_keys.contains(&joined) {
+                        s.team_library_keys.push(joined);
+                    }
                 }
                 "commandsuggestions" => {
                     block = Block::Top;
@@ -2157,6 +2180,12 @@ impl Settings {
         if self.connection_log_delete {
             let _ = writeln!(out, "ConnectionLogDelete yes");
         }
+        if let Some(t) = &self.team_library {
+            let _ = writeln!(out, "TeamLibrary {}", arg(t));
+        }
+        for k in &self.team_library_keys {
+            let _ = writeln!(out, "TeamLibraryKey {}", k.replace(['\r', '\n'], " "));
+        }
         let _ = writeln!(out, "CommandSuggestions {}", flag(self.command_suggestions));
         if let Some(t) = &self.default_theme {
             let _ = writeln!(out, "DefaultTheme {}", arg(t));
@@ -2409,7 +2438,9 @@ impl Settings {
 
     /// The limits the security rules put on `subject`.
     pub fn policy(&self, subject: &Subject<'_>) -> Policy {
-        policy_for(&self.security_rules, subject)
+        // The team's rules and the user's: each can only add limits.
+        policy_for(&self.team.security_rules, subject)
+            .tightened(&policy_for(&self.security_rules, subject))
     }
 
     /// Where host `host`'s password comes from: its credential's source
@@ -2426,8 +2457,7 @@ impl Settings {
 
     /// The connections that name credential `name`.
     pub fn credential_users(&self, name: &str) -> Vec<String> {
-        self.profiles
-            .iter()
+        self.all_profiles()
             .filter(|p| {
                 p.credential
                     .as_deref()
@@ -2444,7 +2474,7 @@ impl Settings {
     /// uses a credential with a user or key file.
     pub fn credential_config(&self) -> String {
         let mut out = String::new();
-        for p in &self.profiles {
+        for p in self.all_profiles() {
             let Some(c) = p.credential.as_deref().and_then(|n| self.credential(n)) else {
                 continue;
             };
@@ -2479,9 +2509,33 @@ impl Settings {
     }
 
     pub fn profile(&self, host: &str) -> Option<&Profile> {
+        // A team connection has the team's profile, or none: never a
+        // local one.
+        if self.team.has(host) {
+            return self
+                .team
+                .profiles
+                .iter()
+                .find(|p| p.host.eq_ignore_ascii_case(host));
+        }
         self.profiles
             .iter()
             .find(|p| p.host.eq_ignore_ascii_case(host))
+    }
+
+    /// Whether connection `host` comes from the team library, so it may
+    /// not be changed here.
+    pub fn is_team(&self, host: &str) -> bool {
+        self.team.has(host)
+    }
+
+    /// Every profile in use: the team's, then the user's own for the
+    /// other connections.
+    pub fn all_profiles(&self) -> impl Iterator<Item = &Profile> {
+        self.team
+            .profiles
+            .iter()
+            .chain(self.profiles.iter().filter(|p| !self.team.has(&p.host)))
     }
 
     /// The host's profile, made if missing.
@@ -2533,10 +2587,11 @@ impl Settings {
         self.recent.truncate(MAX_RECENT);
     }
 
-    /// The theme rules: the user's, then the built-in tag rules.
+    /// The theme rules: the team's, the user's, then the built-in tag rules.
     pub fn host_themes(&self) -> crate::HostThemes {
         let mut themes = crate::HostThemes::new();
-        for r in &self.theme_rules {
+        // The team's first: theirs decide a look before the user's.
+        for r in self.team.theme_rules.iter().chain(&self.theme_rules) {
             themes.push(r.clone());
         }
         themes
@@ -3354,6 +3409,55 @@ DesktopShareSelection yes
         assert_eq!(back.standby_target, s.standby_target);
         assert_eq!(back.standby_hidden, s.standby_hidden);
         assert_eq!(d.standby_target, None);
+    }
+
+    #[test]
+    fn team_profiles_and_rules_come_first_and_are_not_written() {
+        let mut s = Settings::parse(
+            "TeamLibrary \"\\\\server\\team\\team.ferossh-library\"\n\
+             TeamLibraryKey ssh-ed25519 AAAAC3Nza admin\n\
+             Profile web\n    Tags mine\n    Credential mine\n\
+             Profile lab\n    Tags lab\n\
+             SecurityRule\n    Tags lab\n    LogSession yes\n",
+        );
+        assert_eq!(
+            s.team_library.as_deref(),
+            Some("\\\\server\\team\\team.ferossh-library")
+        );
+        assert_eq!(s.team_library_keys, ["ssh-ed25519 AAAAC3Nza admin"]);
+        let team = Settings::parse(
+            "Profile web\n    Tags prod\n    Credential ops\n\
+             SecurityRule\n    Tags prod\n    KeysOnly yes\n\
+             ThemeRule\n    Tags prod\n    Theme Production\n",
+        );
+        s.team = crate::team::Team {
+            names: vec!["web".into()],
+            profiles: team.profiles,
+            security_rules: team.security_rules,
+            theme_rules: team.theme_rules,
+            ..Default::default()
+        };
+        // The team's profile, never the local one of the same name.
+        assert_eq!(s.profile("WEB").unwrap().tags, ["prod"]);
+        assert!(s.is_team("web") && !s.is_team("lab"));
+        assert_eq!(s.profile("lab").unwrap().tags, ["lab"]);
+        assert_eq!(s.credential_users("ops"), ["web"]);
+        assert!(s.credential_users("mine").is_empty());
+        // Both sets of rules apply.
+        let tags = ["prod".to_owned(), "lab".to_owned()];
+        let p = s.policy(&Subject {
+            name: "x",
+            tags: &tags,
+            ..Subject::default()
+        });
+        assert!(p.keys_only && p.log_session);
+        // Nothing of the team's reaches the file; the library settings do.
+        let text = s.to_text();
+        assert!(!text.contains("Theme Production") && !text.contains("KeysOnly"));
+        assert!(text.contains("Tags mine"));
+        let back = Settings::parse(&text);
+        assert_eq!(back.team_library, s.team_library);
+        assert_eq!(back.team_library_keys, s.team_library_keys);
     }
 
     #[test]

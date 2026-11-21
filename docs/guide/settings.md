@@ -23,6 +23,8 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `Notifications yes` | no | Tab badges and Windows notifications when a pane asks for attention. Settings > Desktop notifications. |
 | `NotifyBell no` | yes | Whether the bell counts as asking for attention. Settings > Notify on the bell too. |
 | `AgentCommand claude --model opus` | claude, codex, aider | One coding agent command for Session > Coding agents, typed at the server's shell exactly as written (the rest of the line, quotes and `#` included). Repeat the line for more, up to 16, in menu order; any non-empty line replaces the built-in three; empty lines and lines with control characters are ignored. |
+| `TeamLibrary PATH` | | The team's signed connection library, on a share or in a synced folder (see [Team library](#team-library)). Settings > Team library. |
+| `TeamLibraryKey KEY` | | The public key the library must be signed with, as one line of a `.pub` file. Repeat the line for more than one key. |
 | `ConnectionLogDelete yes` | no | Tools > Connection log offers Delete..., which forgets what the log holds about one connection. Settings > Allow deleting connection log entries. |
 | `DefaultTheme NAME` | Nord | The theme new tabs open with (Theme manager > Set as default). `--theme` and theme rules come before it. |
 | `DefaultFont FAMILY` | Cascadia Mono | The font new tabs open with, when it is installed (Theme manager > Set as default on a font). |
@@ -315,3 +317,23 @@ SecurityRule
 | `LogSession yes` | The session is logged, and Session > Log this session cannot turn it off. If the log cannot be opened, nothing starts on the session (no login script, forwards or tmux) and it disconnects; if a write fails later, it disconnects too. Once the connection ends or you disconnect, Log this session goes back to how you had it. |
 
 A rule needs at least one of `Hosts`, `Tags` or `Folders`, and at least one limit. A connection shows the limits that apply when it starts. The limits cover SSH, Mosh, SFTP and tunnel connections, and the clipboard, confirmation and log limits cover Telnet and WinRM too.
+
+## Team library
+
+`TeamLibrary` names a file an administrator exports with File > Import and export > Export team library and signs with an SSH key:
+
+```
+ssh-keygen -Y sign -f admin_key -n ferossh-library team.ferossh-library
+```
+
+`ssh-keygen` writes `team.ferossh-library.sig` beside it, and both go on the share. FeroSSH reads the library at start (in the background) and on Refresh in the connection manager, and uses it only when the signature is by a `TeamLibraryKey` and made for `ferossh-library`. A library that holds saved passwords is refused. A good library is copied to `team-library.cache` in FeroSSH's folder; when the share cannot be read, or serves a file with a bad signature, FeroSSH says so and uses that copy, checked again against the keys set now.
+
+What the library gives comes before your own settings:
+
+- Its connections show in the **Team** folder (their own folders below it). Their address, user, port, jump hosts and the rest come from the library first, and a connection of your own with the same name is not used. Edit shows them read-only; saving one under a new name makes a copy of your own. They cannot be deleted, moved or retagged here.
+- Their profiles (tags, type, look, credential name) are the library's: a local `Profile` of the same name is not used.
+- Its `SecurityRule` blocks apply together with yours, and since rules only add limits, yours cannot loosen them. Tools > Security rules lists them first as "team 1", "team 2" and so on, and they cannot be changed or deleted there.
+- Its `ThemeRule` blocks are tried before yours.
+
+A library connection may name a credential. No credential travels in the library: each person keeps their own credential of that name, with their own user, key and password. Options in your own `~/.ssh/config` that the library does not set for a connection (a `Host *` block, say) still apply to it, and the security rules still limit it.
+

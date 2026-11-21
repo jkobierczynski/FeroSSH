@@ -218,6 +218,8 @@ mod suggest;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod tabstrip;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod team_lib;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod telnet;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod theme_view;

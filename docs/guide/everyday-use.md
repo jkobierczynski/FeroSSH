@@ -240,6 +240,12 @@ Tools > Security rules (the padlock on the tools rail) lists, in the tools pane,
 
 Changes apply to connections opened from then on. The rules are `SecurityRule` blocks in `ferossh.conf`, and you can still write them there; see [Settings](settings.md#security-rules).
 
+### Team library
+
+A team can share one set of connections and rules. An administrator sets them up in FeroSSH, exports them with **File > Import and export > Export team library**, signs the file with an SSH key (`ssh-keygen -Y sign -f admin_key -n ferossh-library team.ferossh-library`) and puts it with its `.sig` on a share or in a synced folder. Everyone else sets the file and the administrator's public key in **Settings > Team library**.
+
+FeroSSH then shows the team's connections in the **Team** folder of the connection manager and applies the team's security and theme rules first. Nobody can change, delete or retag a team connection, or loosen a team security rule, from their own FeroSSH; a team connection opened in the form is read-only, and a new name saves a copy of your own. A file whose signature does not match the key is not used. Refresh in the connection manager reads the library again, and when the share is out of reach FeroSSH uses the copy it checked last. See [Settings](settings.md#team-library) for the details.
+
 ### Connection log
 
 **Tools > Connection log** (Ctrl+Shift+I, or the list icon on the tools rail) shows every connection with its address, type, folder, tags, when you last connected, and the host key's type and SHA-256 fingerprint as the server showed it then. The search box takes the connection manager's search words (`tag:prod -tag:legacy`, `folder:db`) and plain words, which also look at the OS, kernel and fingerprint. Click a column heading to sort by it, again for the other way. **Save CSV** writes the rows shown, in that order, to the download folder (times in UTC). **Connect** (Enter, a double click) opens the picked connection, and **Reload** (F5) reads the list again.

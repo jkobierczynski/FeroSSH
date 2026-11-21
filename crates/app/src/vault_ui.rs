@@ -131,6 +131,63 @@ fn busy() {
     }
 }
 
+const TEAM_FILTER: PCWSTR =
+    w!("FeroSSH team libraries (*.ferossh-library)\0*.ferossh-library\0All files\0*.*\0");
+
+/// File > Import and export > Export team library: the saved connections,
+/// their profiles and the security and theme rules, with no password or
+/// credential, for an administrator to sign and share (see
+/// [`ferossh_config::team`]).
+pub(super) fn export_team(hwnd: HWND) {
+    let sessions = app_read(&sessions_path()).unwrap_or_default();
+    let hosts = bundle::count_hosts(&sessions);
+    if hosts == 0 {
+        dialog(
+            hwnd,
+            "There are no saved connections to put in a team library yet.",
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    }
+    let Some(bytes) = with_window(|w| ferossh_config::team::export(&sessions, &w.settings)) else {
+        return;
+    };
+    let start = home().join("Documents").join("team.ferossh-library");
+    let Some(path) = save_file(hwnd, w!("Export team library to"), &start, TEAM_FILTER) else {
+        return;
+    };
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path));
+    match written {
+        Ok(()) => {
+            let shown = path.display().to_string();
+            dialog(
+                hwnd,
+                &format!(
+                    "Exported {} with their settings and your security and theme rules to \
+                     {shown}. No password or credential is in it.\n\nSign it with your SSH key \
+                     before sharing it, so FeroSSH accepts it:\n\nssh-keygen -Y sign -f <your \
+                     key> -n {} \"{shown}\"\n\nThen put both the file and its .sig on the share, \
+                     and give your team the public key for Settings > Team library.",
+                    plural(hosts, "connection", "connections"),
+                    ferossh_config::team::NAMESPACE,
+                ),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            dialog(
+                hwnd,
+                &format!("Could not export to {}: {e}", path.display()),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
 /// The save dialog, starting at `start` (a folder and a file name).
 fn save_file(hwnd: HWND, title: PCWSTR, start: &Path, filter: PCWSTR) -> Option<PathBuf> {
     if DIALOG_OPEN.get() {
