@@ -1307,6 +1307,54 @@ fn security_block(r: &SecurityRule) -> String {
     out
 }
 
+/// Line `line` (`keyword`, `args`) of security rule `r`. Each limit is on
+/// only when written as such: a rule can only tighten. A line not
+/// understood (a newer keyword, a typo, a value that is not yes or no)
+/// is kept as written and shown as a warning, never dropped silently.
+/// `false` for an unindented line that is not the rule's: it ends it.
+fn security_line(r: &mut SecurityRule, keyword: &str, args: Vec<String>, line: &str) -> bool {
+    let on = yes(&args);
+    let limit = matches!(
+        keyword,
+        "keysonly"
+            | "savepassword"
+            | "forwardagent"
+            | "clipboard"
+            | "confirmconnect"
+            | "logsession"
+    );
+    if limit && (on.is_none() || args.len() != 1) {
+        r.unknown.push(kept_line(line));
+        return true;
+    }
+    match keyword {
+        // `Tag`, as ssh_config spells it, is read as `Tags`.
+        "hosts" | "host" if !args.is_empty() => r.hosts.extend(args),
+        "tags" | "tag" if !args.is_empty() => r.tags.extend(args),
+        "folders" | "folder" if !args.is_empty() => r.folders.extend(args),
+        "keysonly" => r.limits.keys_only |= on == Some(true),
+        "savepassword" => r.limits.no_saved_password |= on == Some(false),
+        "forwardagent" => r.limits.no_agent_forwarding |= on == Some(false),
+        "clipboard" => r.limits.no_clipboard |= on == Some(false),
+        "confirmconnect" => r.limits.confirm_connect |= on == Some(true),
+        "logsession" => r.limits.log_session |= on == Some(true),
+        // Indented: a line of this rule. Unindented, it is something
+        // after the rule, left alone.
+        _ if line.starts_with(char::is_whitespace) => r.unknown.push(kept_line(line)),
+        _ => return false,
+    }
+    true
+}
+
+/// A rule line kept as written: trimmed, tabs inside kept (they may
+/// separate a keyword from its value), other control characters dropped.
+fn kept_line(line: &str) -> String {
+    line.trim()
+        .chars()
+        .filter(|c| *c == '\t' || !c.is_control())
+        .collect()
+}
+
 impl Settings {
     pub fn parse(text: &str) -> Self {
         let mut s = Settings::default();
@@ -1315,6 +1363,17 @@ impl Settings {
             let Some((keyword, args)) = split_line(line) else {
                 continue;
             };
+            // An indented line under a SecurityRule is the rule's, even one
+            // named like a setting of its own (`DesktopClipboard`): kept on
+            // the rule, never applied to the whole program.
+            if let Block::Security(i) = block
+                && line.starts_with(char::is_whitespace)
+            {
+                if let Some(r) = s.security_rules.get_mut(i) {
+                    security_line(r, &keyword, args, line);
+                }
+                continue;
+            }
             let first = args.first().cloned();
             // Font and theme names may hold spaces, quoted or not.
             let joined = args.join(" ");
@@ -1942,46 +2001,10 @@ impl Settings {
                         }
                     }
                     Block::Security(i) => {
-                        let Some(r) = s.security_rules.get_mut(i) else {
-                            continue;
-                        };
-                        // Each limit is on only when written as such: a
-                        // rule can only tighten.
-                        let on = yes(&args);
-                        // A line not understood (a newer keyword, a typo,
-                        // a value that is not yes or no) is kept as it is
-                        // and shown as a warning: never dropped silently.
-                        let limit = matches!(
-                            keyword.as_str(),
-                            "keysonly"
-                                | "savepassword"
-                                | "forwardagent"
-                                | "clipboard"
-                                | "confirmconnect"
-                                | "logsession"
-                        );
-                        if limit && (on.is_none() || args.len() != 1) {
-                            r.unknown.push(clean(line.trim()));
-                            continue;
-                        }
-                        match keyword.as_str() {
-                            // `Tag`, as ssh_config spells it, is read as
-                            // `Tags`.
-                            "hosts" | "host" if !args.is_empty() => r.hosts.extend(args),
-                            "tags" | "tag" if !args.is_empty() => r.tags.extend(args),
-                            "folders" | "folder" if !args.is_empty() => r.folders.extend(args),
-                            "keysonly" => r.limits.keys_only |= on == Some(true),
-                            "savepassword" => r.limits.no_saved_password |= on == Some(false),
-                            "forwardagent" => r.limits.no_agent_forwarding |= on == Some(false),
-                            "clipboard" => r.limits.no_clipboard |= on == Some(false),
-                            "confirmconnect" => r.limits.confirm_connect |= on == Some(true),
-                            "logsession" => r.limits.log_session |= on == Some(true),
-                            // Indented: a line of this rule. Unindented, it
-                            // is something after the rule, left alone.
-                            _ if line.starts_with(char::is_whitespace) => {
-                                r.unknown.push(clean(line.trim()));
-                            }
-                            _ => block = Block::Top,
+                        if let Some(r) = s.security_rules.get_mut(i)
+                            && !security_line(r, &keyword, args, line)
+                        {
+                            block = Block::Top;
                         }
                     }
                     Block::Credential(i) => {
@@ -3580,7 +3603,8 @@ DesktopShareSelection yes
 
     #[test]
     fn rule_lines_not_understood_are_kept_and_written_back() {
-        let text = "SecurityRule\n    Tag production\n    KeysOnly 1\n    LogSession yes\n\
+        let text = "SecurityRule\n    Tag production\n    KeysOnly 1\n    DesktopClipboard both\n    \
+                    Future\tno\n    LogSession yes\n\
                     SecurityRule\n    Tags lab\n    X11Forwarding no\n\
                     NewerSetting on\n    Stray line\nSavedSearch tag:lab\n";
         let s = Settings::parse(text);
@@ -3589,7 +3613,12 @@ DesktopShareSelection yes
         let r = &s.security_rules[0];
         assert_eq!(r.tags, ["production"]);
         assert!(r.limits.log_session && !r.limits.keys_only);
-        assert_eq!(r.unknown, ["KeysOnly 1"]);
+        assert_eq!(
+            r.unknown,
+            ["KeysOnly 1", "DesktopClipboard both", "Future\tno"]
+        );
+        // A setting's name inside the rule is the rule's, not the program's.
+        assert_eq!(s.desktop_clipboard, None);
         // A rule whose only limit is a newer keyword is not dropped, and
         // the unindented line after it is not taken into it.
         let r = &s.security_rules[1];

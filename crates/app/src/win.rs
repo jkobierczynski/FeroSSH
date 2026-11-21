@@ -7520,6 +7520,19 @@ impl Window {
     /// FeroSSH does not understand: a limit it may be meant to have, and
     /// does not get.
     fn warn_rule_lines(&mut self, id: PaneId, alias: &str, hostname: &str, tag: Option<&str>) {
+        self.warn_rule_lines_for(id, alias, hostname, tag, false);
+    }
+
+    /// [`Self::warn_rule_lines`] for connection `alias`, a jump host on the
+    /// way when `hop` (named in the warning).
+    fn warn_rule_lines_for(
+        &mut self,
+        id: PaneId,
+        alias: &str,
+        hostname: &str,
+        tag: Option<&str>,
+        hop: bool,
+    ) {
         if self
             .settings
             .security_rules
@@ -7542,8 +7555,13 @@ impl Window {
         if lines.is_empty() {
             return;
         }
+        let whose = if hop {
+            format!("jump host {}", crate::ssh::sanitize_line(alias))
+        } else {
+            "this connection".to_owned()
+        };
         let text = format!(
-            "\x1b[0;33mA security rule for this connection has lines this FeroSSH does not \
+            "\x1b[0;33mA security rule for {whose} has lines this FeroSSH does not \
              understand, so they are not applied: {}. See Tools > Security rules.\x1b[0m\r\n",
             crate::ssh::sanitize_line(&lines.join("; "))
         );
@@ -7750,13 +7768,19 @@ impl Window {
             if !hops.is_empty() {
                 self.via.insert(channel, hops);
             }
-            let hop_policies: Vec<Policy> = session
+            let hop_targets: Vec<(String, String, Option<String>)> = session
                 .hops_mut()
                 .map(|hop| {
                     let t = &hop.target;
                     (t.alias.clone(), t.hostname.clone(), t.tag.clone())
                 })
-                .collect::<Vec<_>>()
+                .collect();
+            // A jump host's rule lines not understood are said too; its
+            // limits stay its own.
+            for (a, h, t) in &hop_targets {
+                self.warn_rule_lines_for(id, a, h, t.as_deref(), true);
+            }
+            let hop_policies: Vec<Policy> = hop_targets
                 .into_iter()
                 .map(|(a, h, t)| self.policy_of(&a, Some(&h), t.as_deref()))
                 .collect();
@@ -24055,7 +24079,9 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
             );
             continue;
         }
-        if rule.limits.is_empty() {
+        // A rule with lines not understood keeps them: it may still be
+        // saved with no limit ticked here.
+        if rule.limits.is_empty() && rule.unknown.is_empty() {
             dialog(hwnd, "Tick at least one limit.", MB_OK | MB_ICONWARNING);
             continue;
         }
