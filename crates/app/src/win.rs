@@ -1578,6 +1578,8 @@ struct Window {
     /// A note about the team library not shown yet, because another
     /// dialog was open.
     team_note_pending: Option<String>,
+    /// Whether a wait to show [`Self::team_note_pending`] is running.
+    team_note_retry: Arc<std::sync::atomic::AtomicBool>,
     /// Login scripts started so far, which numbers each run.
     script_runs: u64,
     snippets_view: SnippetsView,
@@ -2925,6 +2927,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 team_latest: Arc::default(),
                 team_note: None,
                 team_note_pending: None,
+                team_note_retry: Arc::default(),
                 script_runs: 0,
                 snippets_view: SnippetsView::default(),
                 snippets_peek: false,
@@ -15559,11 +15562,26 @@ impl Window {
                 let saved = load_saved();
                 // A team connection is the team's even when a local one
                 // shares its name (that one is not used).
+                let team = self
+                    .settings
+                    .is_team(&name)
+                    .then(|| self.saved_of(&name))
+                    .flatten();
                 let own = (!self.settings.is_team(&name))
                     .then(|| saved.iter().find(|h| h.alias.eq_ignore_ascii_case(&name)))
                     .flatten();
-                match own {
-                    Some(h) => SessionForm::new(
+                match (team, own) {
+                    // The team's record as the library has it, as the
+                    // connection uses it.
+                    (Some(h), _) => SessionForm::new(
+                        Some(h.alias.clone()),
+                        Source::ReadOnly("the team library".to_owned()),
+                        Values::from_saved(&h).with_profile(profile),
+                        hints,
+                        names,
+                        themes,
+                    ),
+                    (None, Some(h)) => SessionForm::new(
                         Some(h.alias.clone()),
                         Source::Saved,
                         Values::from_saved(h).with_profile(profile),
@@ -15571,7 +15589,7 @@ impl Window {
                         names,
                         themes,
                     ),
-                    None => {
+                    (None, None) => {
                         let folder = items
                             .iter()
                             .find(|h| h.name == name)
@@ -16312,12 +16330,17 @@ impl Window {
         }
         if self.team_note_pending.is_some() {
             if DIALOG_OPEN.get() {
-                // Said once the dialog open now closes: look again soon.
-                let notify = self.notifier();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    notify();
-                });
+                // Said once the dialog open now closes: look again soon,
+                // one wait at a time.
+                if !self.team_note_retry.swap(true, Ordering::AcqRel) {
+                    let notify = self.notifier();
+                    let retry = self.team_note_retry.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        retry.store(false, Ordering::Release);
+                        notify();
+                    });
+                }
             } else {
                 self.queued
                     .extend(self.team_note_pending.take().map(Command::Notice));
