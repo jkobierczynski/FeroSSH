@@ -183,7 +183,7 @@ pub fn text(row: &Row, column: Column) -> String {
                 match row.kind {
                     // A script names its secrets; FeroSSH cannot tell which.
                     Kind::Secret => "Scripts".to_owned(),
-                    // Which connections go through a proxy is not tracked.
+                    // None listed goes through it; a typed one still may.
                     Kind::Proxy => "Logins through this proxy".to_owned(),
                     _ => "Nothing".to_owned(),
                 }
@@ -281,9 +281,14 @@ pub fn delete_question(row: &Row) -> String {
             "Forget the script secret {}? A script that asks for it asks you again.",
             row.name
         ),
-        Kind::Proxy => format!(
+        Kind::Proxy if row.used_by.is_empty() => format!(
             "Forget the saved proxy password for {}? Connections through that proxy ask for \
              it again.",
+            row.name
+        ),
+        Kind::Proxy => format!(
+            "Forget the saved proxy password for {}? It is still used by {users}, which ask \
+             for it again through that proxy.",
             row.name
         ),
         _ if row.used_by.is_empty() => format!(
@@ -373,6 +378,15 @@ mod tests {
         let proxy = proxy.unwrap();
         assert_eq!(proxy.kind, Kind::Proxy);
         assert!(delete_question(&proxy).contains("through that proxy"));
+        let used = password_row(
+            "FeroSSH proxy:me@socks:1080",
+            "me",
+            Place::default(),
+            vec!["web".into(), "db".into()],
+        )
+        .unwrap();
+        assert_eq!(text(&used, Column::UsedBy), "web, db");
+        assert!(delete_question(&used).contains("still used by web, db"));
         assert!(password_row("Other:thing", "", Place::default(), vec![]).is_none());
         // What another program wrote there shows without its tricks.
         let odd = password_row("FeroSSH:a\u{202e}b\x1b@h:22", "", Place::default(), vec![]);

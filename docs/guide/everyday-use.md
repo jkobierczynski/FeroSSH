@@ -221,7 +221,7 @@ Tools > Credential manager (the key icon on the tools rail) lists, in the tools 
 - **Your named credentials**, with their user, key file and password source.
 - **The passwords FeroSSH keeps**: logins, proxy passwords and script secrets, in the Windows Credential Manager, in your vault, or both. The passwords themselves never show.
 
-Every row says what uses it: the connections that pick a credential, or the connections whose login keeps its password there. Search with any words (`-word` leaves rows out, and `nothing` finds the ones nothing uses). Click a column heading to sort by it.
+Every row says what uses it: the connections that pick a credential, the connections whose login keeps its password there, or the connections that go through a proxy. A script secret says **Scripts**, since a script names its own secrets. Search with any words (`-word` leaves rows out, and `nothing` finds the ones nothing uses). Click a column heading to sort by it.
 
 - **New credential...** makes a credential.
 - **Edit...** (Enter or a double click) changes or renames one. Its connections follow a new name.

@@ -15483,10 +15483,17 @@ impl Window {
         if self.settings.profile(name).is_some() {
             return self.settings.password_source(name);
         }
-        let alias = match WinrmTarget::typed(name) {
-            Some(t) => Some(t.alias),
-            None => Target::resolve(name, env).map(|t| t.alias),
-        };
+        // A typed WinRM address goes by its host's saved connection only
+        // when that is a WinRM one, as its login does.
+        if let Some(t) = WinrmTarget::typed(name) {
+            return self
+                .settings
+                .profile(&t.alias)
+                .filter(|p| p.kind == SessionKind::WinRm)
+                .map(|_| self.settings.password_source(&t.alias))
+                .unwrap_or_default();
+        }
+        let alias = Target::resolve(name, env).map(|t| t.alias);
         self.settings
             .password_source(alias.as_deref().unwrap_or(name))
     }
@@ -15521,6 +15528,19 @@ impl Window {
         // on what the saved workspaces open, asking ones too.
         let mut users: HashMap<String, Vec<String>> = HashMap::new();
         let mut add = |name: String, ask_too: bool| {
+            // The proxy it logs in to on the way keeps its password apart.
+            if WinrmTarget::typed(&name).is_none()
+                && let Some(t) = Target::resolve(&name, &env)
+                && let Some(p) = t.proxy_server.as_ref()
+                && let Some(user) = p.user.as_deref()
+            {
+                let list = users
+                    .entry(credman::proxy_target(user, &p.host, p.port))
+                    .or_default();
+                if !list.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                    list.push(name.clone());
+                }
+            }
             let keeps = match self.source_of_name(&name, &env) {
                 PasswordSource::Windows => true,
                 PasswordSource::Ask => ask_too,
