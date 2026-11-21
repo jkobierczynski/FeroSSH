@@ -2230,14 +2230,27 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 };
             }
             let target = Target::resolve(&h.name, env);
+            // The host itself when the way there does not resolve (jump
+            // hosts that loop, say): its host name and Tag still carry
+            // the security rules to the same machine reached another way.
+            let host_only = match target {
+                Some(_) => None,
+                None => Target::resolve_host(&h.name, env),
+            };
             let tags = ferossh_config::settings::host_tags(
-                target.as_ref().and_then(|t| t.tag.as_deref()),
+                target
+                    .as_ref()
+                    .or(host_only.as_ref())
+                    .and_then(|t| t.tag.as_deref()),
                 settings.profile(&h.name),
             );
-            let (user, hostname, mut port) = target
+            let (user, mut hostname, mut port) = target
                 .as_ref()
                 .map(|t| (Some(t.user.clone()), Some(t.hostname.clone()), Some(t.port)))
                 .unwrap_or_default();
+            if let Some(t) = &host_only {
+                hostname = Some(t.hostname.clone());
+            }
             // The port the session opens, for port: searches: SSH's 22 is
             // not Telnet's or a desktop's default.
             let own_port = || ssh_config::resolve_in(&env.config, &h.name, &includes).port;
@@ -7244,17 +7257,45 @@ impl Window {
     /// What the security rules forbid for connection `alias` (reaching
     /// `hostname`, with ssh_config's `Tag` `tag`).
     fn policy_of(&self, alias: &str, hostname: Option<&str>, tag: Option<&str>) -> Policy {
+        self.policy_and_peers(alias, hostname, tag).0
+    }
+
+    /// [`Self::policy_of`], and the other connections to the same machine
+    /// whose rules added to it: rules follow the machine, so an address
+    /// typed by hand or another alias gets a saved connection's tag and
+    /// folder rules too.
+    fn policy_and_peers(
+        &self,
+        alias: &str,
+        hostname: Option<&str>,
+        tag: Option<&str>,
+    ) -> (Policy, Vec<String>) {
         if self.settings.security_rules.is_empty() {
-            return Policy::default();
+            return (Policy::default(), Vec::new());
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
         let folder = self.rule_folder(alias);
-        self.settings.policy(&Subject {
-            name: alias,
-            hostname,
-            tags: &tags,
-            folder: folder.as_deref(),
-        })
+        let all = self.rule_connections();
+        let others: Vec<Subject<'_>> = all
+            .iter()
+            .map(|c| Subject {
+                name: &c.name,
+                hostname: c.hostname.as_deref(),
+                tags: &c.tags,
+                folder: c.folder.as_deref(),
+            })
+            .collect();
+        let (policy, from) = ferossh_config::host_policy::policy_with_peers(
+            &self.settings.security_rules,
+            &Subject {
+                name: alias,
+                hostname,
+                tags: &tags,
+                folder: folder.as_deref(),
+            },
+            &others,
+        );
+        (policy, from.into_iter().map(str::to_owned).collect())
     }
 
     /// The folder the Connection manager shows connection `alias` in: a
@@ -7510,7 +7551,7 @@ impl Window {
         hostname: &str,
         tag: Option<&str>,
     ) -> Policy {
-        let policy = self.policy_of(alias, Some(hostname), tag);
+        let (policy, peers) = self.policy_and_peers(alias, Some(hostname), tag);
         let Some(p) = self.panes.get_mut(&id) else {
             return policy;
         };
@@ -7522,8 +7563,16 @@ impl Window {
             p.log.enabled = before;
         }
         if !policy.is_empty() {
+            let peers = if peers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (also those of {}, which reaches the same machine)",
+                    crate::ssh::sanitize_line(&peers.join(", "))
+                )
+            };
             let text = format!(
-                "\x1b[0;90mSecurity rules: {}.\x1b[0m\r\n",
+                "\x1b[0;90mSecurity rules: {}{peers}.\x1b[0m\r\n",
                 policy.describe().join(", ")
             );
             self.show(id, &text);
@@ -7560,15 +7609,37 @@ impl Window {
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
         let folder = self.rule_folder(alias);
-        let lines = ferossh_config::host_policy::not_understood(
-            &self.settings.security_rules,
-            &Subject {
-                name: alias,
-                hostname: Some(hostname),
-                tags: &tags,
-                folder: folder.as_deref(),
-            },
-        );
+        let subject = Subject {
+            name: alias,
+            hostname: Some(hostname),
+            tags: &tags,
+            folder: folder.as_deref(),
+        };
+        let rules = &self.settings.security_rules;
+        let mut lines = ferossh_config::host_policy::not_understood(rules, &subject);
+        // Rules follow the machine: so do the lines they are missing.
+        let here = ferossh_config::host_policy::machine(&subject);
+        for c in self.rule_connections() {
+            let peer = Subject {
+                name: &c.name,
+                hostname: c.hostname.as_deref(),
+                tags: &c.tags,
+                folder: c.folder.as_deref(),
+            };
+            if c.name.eq_ignore_ascii_case(alias)
+                || !ferossh_config::host_policy::same_machine(
+                    ferossh_config::host_policy::machine(&peer),
+                    here,
+                )
+            {
+                continue;
+            }
+            for line in ferossh_config::host_policy::not_understood(rules, &peer) {
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+            }
+        }
         if lines.is_empty() {
             return;
         }
@@ -15841,9 +15912,15 @@ impl Window {
     /// covers, matched as a connection is (its folder as the connection
     /// manager shows it).
     fn rule_rows(&self) -> Vec<crate::rules_view::Row> {
-        use crate::rules_view::{Connection, rows};
+        crate::rules_view::rows(&self.settings.security_rules, &self.rule_connections())
+    }
+
+    /// Every connection the Connection manager lists, as the security
+    /// rules see it.
+    fn rule_connections(&self) -> Vec<crate::rules_view::Connection> {
+        use crate::rules_view::Connection;
         let saved = load_saved();
-        let all: Vec<Connection> = host_items(&ssh_env(), &self.settings)
+        host_items(&ssh_env(), &self.settings)
             .into_iter()
             .map(|h| {
                 let own = saved
@@ -15857,8 +15934,7 @@ impl Window {
                     tags: h.tags,
                 }
             })
-            .collect();
-        rows(&self.settings.security_rules, &all)
+            .collect()
     }
 
     /// The menu item that puts theme or font `row` on the pane: Settings

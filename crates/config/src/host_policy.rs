@@ -266,6 +266,60 @@ pub fn words_text(list: &[String]) -> String {
         .join(" ")
 }
 
+/// Whether host names `a` and `b` name the same machine, as written:
+/// any case, without a trailing dot or the brackets around an IPv6
+/// address. No DNS: an address and a name for it are not matched. This
+/// PC's own names (`localhost`, `127.x`, `::1`) are never one machine:
+/// tunnels and port forwards reach many through them.
+pub fn same_machine(a: &str, b: &str) -> bool {
+    let norm = |h: &str| {
+        let h = h.trim();
+        let h = h
+            .strip_prefix('[')
+            .and_then(|x| x.strip_suffix(']'))
+            .unwrap_or(h);
+        h.trim_end_matches('.').to_ascii_lowercase()
+    };
+    let (a, b) = (norm(a), norm(b));
+    let loopback = a == "localhost"
+        || a.ends_with(".localhost")
+        || a.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    !a.is_empty() && !loopback && a == b
+}
+
+/// The machine connection `subject` reaches: its host name, else its
+/// name.
+pub fn machine<'a>(subject: &Subject<'a>) -> &'a str {
+    subject.hostname.unwrap_or(subject.name)
+}
+
+/// The limits for `subject`, with those of every other connection in
+/// `others` that reaches the same machine ([`same_machine`]): the rules
+/// follow the machine, so typing its address, or another alias for it,
+/// does not leave a production host's tag or folder rules behind. Also
+/// the names of the connections whose rules added something.
+pub fn policy_with_peers<'a>(
+    rules: &[SecurityRule],
+    subject: &Subject<'_>,
+    others: &[Subject<'a>],
+) -> (Policy, Vec<&'a str>) {
+    let mut policy = policy_for(rules, subject);
+    let mut from = Vec::new();
+    let here = machine(subject);
+    for o in others {
+        if o.name.eq_ignore_ascii_case(subject.name) || !same_machine(machine(o), here) {
+            continue;
+        }
+        let theirs = policy_for(rules, o);
+        if policy.tightened(&theirs) != policy {
+            from.push(o.name);
+        }
+        policy.tighten(&theirs);
+    }
+    (policy, from)
+}
+
 /// The lines FeroSSH does not understand in the rules that match
 /// `subject` (each once): limits it may be missing.
 pub fn not_understood<'a>(rules: &'a [SecurityRule], subject: &Subject<'_>) -> Vec<&'a str> {
@@ -420,6 +474,65 @@ mod tests {
             crate::settings::clipboard_ways(rule.clipboard_limit(Some("to-host")).as_deref()),
             (true, false)
         );
+    }
+
+    #[test]
+    fn rules_follow_the_machine_not_the_name() {
+        let mut keys = rule();
+        keys.tags.push("prod".into());
+        keys.limits.keys_only = true;
+        let mut folder = rule();
+        folder.folders.push("Bank".into());
+        folder.limits.log_session = true;
+        let rules = [keys, folder];
+        let prod = vec!["prod".to_owned()];
+        let saved = [
+            Subject {
+                name: "db1",
+                hostname: Some("DB1.example.com."),
+                tags: &prod,
+                folder: None,
+            },
+            Subject {
+                name: "vault",
+                hostname: Some("[2001:db8::5]"),
+                folder: Some("Bank/eu"),
+                ..Subject::default()
+            },
+            Subject {
+                name: "lab",
+                hostname: Some("lab.example.com"),
+                ..Subject::default()
+            },
+        ];
+        // The address typed: db1's rules come along.
+        let typed = Subject {
+            name: "db1.example.com",
+            hostname: Some("db1.example.com"),
+            ..Subject::default()
+        };
+        let (p, from) = policy_with_peers(&rules, &typed, &saved);
+        assert!(p.keys_only && !p.log_session);
+        assert_eq!(from, ["db1"]);
+        // An IPv6 address, bracketed or not.
+        let v6 = Subject {
+            name: "2001:db8::5",
+            ..Subject::default()
+        };
+        let (p, from) = policy_with_peers(&rules, &v6, &saved);
+        assert!(p.log_session);
+        assert_eq!(from, ["vault"]);
+        // db1 itself: its own rules, nobody else named.
+        let (p, from) = policy_with_peers(&rules, &saved[0], &saved);
+        assert!(p.keys_only);
+        assert!(from.is_empty());
+        // Another machine: nothing.
+        let (p, _) = policy_with_peers(&rules, &saved[2], &saved);
+        assert!(p.is_empty());
+        assert!(!same_machine("", ""));
+        assert!(!same_machine("localhost", "LOCALHOST"));
+        assert!(!same_machine("127.0.0.1", "127.0.0.1"));
+        assert!(!same_machine("[::1]", "::1"));
     }
 
     #[test]

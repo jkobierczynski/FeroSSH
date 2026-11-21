@@ -317,4 +317,6 @@ SecurityRule
 
 A rule needs at least one of `Hosts`, `Tags` or `Folders`, and at least one limit. `Tag`, `Host` and `Folder` are read as `Tags`, `Hosts` and `Folders`. A connection shows the limits that apply when it starts.
 
+Rules follow the machine, not only the name. A connection also gets the limits of every other connection in the connection manager that reaches the same host name: an address typed in Connect to..., an `ssh://` link or a second ssh_config alias for `db1` gets `db1`'s tag and folder rules, and the line it shows names `db1`. Host names are compared as written, in any case, so an IP address and a DNS name for the same machine are not matched (put both in a rule's `Hosts` for that). `localhost` and loopback addresses never count as one machine.
+
 A line of a rule that FeroSSH does not understand (a keyword from a newer FeroSSH, a misspelling, or a value other than `yes` or `no`, such as `KeysOnly 1`) is never dropped: it stays in the file, and FeroSSH writes it back unchanged. It is not applied, though. Tools > Security rules marks the rule with ⚠ and names the line, and a connection that the rule covers says so in its pane when it starts. The limits cover SSH, Mosh, SFTP and tunnel connections, and the clipboard, confirmation and log limits cover Telnet and WinRM too.

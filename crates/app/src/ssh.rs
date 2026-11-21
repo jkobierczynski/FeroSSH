@@ -296,7 +296,7 @@ impl Target {
     }
 
     /// The host itself, without the way there.
-    fn resolve_host(typed: &str, env: &Env) -> Option<Self> {
+    pub(crate) fn resolve_host(typed: &str, env: &Env) -> Option<Self> {
         let (user, alias, port) = ssh_config::parse_destination(typed)?;
         let includes = ssh_config::DirIncludes {
             home: env.home.clone(),
