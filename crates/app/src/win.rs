@@ -23518,7 +23518,7 @@ fn rules_event(hwnd: HWND, event: rules_panel::Event) {
 fn save_rules(
     hwnd: HWND,
     change: impl FnOnce(&mut Vec<ferossh_config::host_policy::SecurityRule>),
-) {
+) -> bool {
     let Some(result) = with_window(|w| {
         w.pull_vault_settings();
         let before = w.settings.security_rules.clone();
@@ -23529,12 +23529,16 @@ fn save_rules(
         }
         saved
     }) else {
-        return;
+        return false;
     };
     let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
     run_commands(hwnd, next);
-    if let Err(e) = result {
-        dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+            false
+        }
     }
 }
 
@@ -23599,19 +23603,33 @@ fn edit_rule(hwnd: HWND, index: Option<usize>) {
         if answer.option
             && let (Some(i), Some(o)) = (index, &original)
         {
-            let question = format!(
-                "Delete security rule {} ({})?",
-                i + 1,
-                crate::ssh::sanitize_line(&o.describe_match())
-            );
-            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
-                save_rules(hwnd, |rules| {
-                    if rules.get(i) == Some(o) {
-                        rules.remove(i);
-                    }
-                });
+            // The same question as the page's Delete..., naming the
+            // connections that lose the limits.
+            let question = with_window(|w| {
+                w.rule_rows()
+                    .into_iter()
+                    .find(|r| r.index == i && &r.rule == o)
+                    .map(|r| crate::rules_view::delete_question(&r))
+            })
+            .flatten()
+            .unwrap_or_else(|| {
+                format!(
+                    "Delete security rule {} ({})?",
+                    i + 1,
+                    crate::ssh::sanitize_line(&o.describe_match())
+                )
+            });
+            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+                continue;
             }
-            return;
+            if save_rules(hwnd, |rules| {
+                if rules.get(i) == Some(o) {
+                    rules.remove(i);
+                }
+            }) {
+                return;
+            }
+            continue;
         }
         if rule.hosts.is_empty() && rule.tags.is_empty() && rule.folders.is_empty() {
             dialog(
@@ -23627,7 +23645,7 @@ fn edit_rule(hwnd: HWND, index: Option<usize>) {
         }
         let new = rule.clone();
         let old = original.clone();
-        save_rules(hwnd, move |rules| match index {
+        if save_rules(hwnd, move |rules| match index {
             // Edited where it was, if it is still there.
             Some(i) if old.is_some() && rules.get(i) == old.as_ref() => {
                 if let Some(r) = rules.get_mut(i) {
@@ -23635,8 +23653,10 @@ fn edit_rule(hwnd: HWND, index: Option<usize>) {
                 }
             }
             _ => rules.push(new),
-        });
-        return;
+        }) {
+            return;
+        }
+        // Not saved: the form again, with what was typed.
     }
 }
 

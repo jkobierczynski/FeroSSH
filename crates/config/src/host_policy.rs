@@ -212,7 +212,7 @@ impl SecurityRule {
 /// characters are left out.
 pub fn words(text: &str) -> Vec<String> {
     let clean: String = text.chars().filter(|c| !c.is_control()).collect();
-    crate::ssh_config::split_line(&format!("x {clean}"))
+    crate::ssh_config::split_line(&format!("x = {clean}"))
         .map(|(_, args)| args)
         .unwrap_or_default()
         .into_iter()
@@ -248,6 +248,12 @@ pub fn policy_for(rules: &[SecurityRule], subject: &Subject<'_>) -> Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn words_keep_a_leading_equals_sign() {
+        assert_eq!(words(&words_text(&["=Prod".to_owned()])), ["=Prod"]);
+        assert_eq!(words("=a b"), ["=a", "b"]);
+    }
 
     fn rule() -> SecurityRule {
         SecurityRule::default()
