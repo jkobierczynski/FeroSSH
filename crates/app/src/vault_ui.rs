@@ -532,9 +532,9 @@ pub(super) fn import(hwnd: HWND) {
     if !plan.reviews.is_empty() {
         question.push_str(
             "\n\nLook these over: a connection that now goes somewhere else gets the password \
-             you type for it. Your tags, folders and Production or Staging themes stay, and new \
-             host keys are asked about, unless your own connection already had \
-             StrictHostKeyChecking no.",
+             you type for it. Your tags, folders and Production or Staging themes stay. A \
+             StrictHostKeyChecking line that trusts new host keys without asking is left \
+             out, unless your own copy of that connection already has that very line.",
         );
         question.push_str(&reviews_text(&plan.reviews));
     }

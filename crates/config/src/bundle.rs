@@ -687,7 +687,10 @@ fn drop_trust_lines<'a>(
             review(
                 reviews,
                 name,
-                format!("left out \"StrictHostKeyChecking {v}\": new host keys are asked about"),
+                format!(
+                    "left out \"StrictHostKeyChecking {v}\", which trusts a new host key \
+                     without asking"
+                ),
             );
             continue;
         }
