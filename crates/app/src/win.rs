@@ -1511,6 +1511,9 @@ struct Window {
     /// Renames and deletes the inventory file could not take yet: done
     /// first at its next change, so it follows the connections in the end.
     inventory_pending: Vec<InventoryFix>,
+    /// The connection form's next save was asked about the security
+    /// limits it takes away, and the answer was Yes.
+    form_losses_ok: bool,
     /// Show what changed: each running git's channel, and its tab.
     diffs: HashMap<ChannelId, PaneId>,
     /// The server status bar's samples, by their channel: one per
@@ -2959,6 +2962,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 system_reads: HashMap::new(),
                 inventory_renames: HashMap::new(),
                 inventory_pending: Vec::new(),
+                form_losses_ok: false,
                 diffs: HashMap::new(),
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
@@ -15996,6 +16000,13 @@ impl Window {
                         crate::ssh::sanitize_line(&name)
                     )));
                 }
+                // A tag, folder, host or name changed can take security
+                // limits away: asked first, unless answered already.
+                if !std::mem::take(&mut self.form_losses_ok)
+                    && let Some(question) = self.form_loss_question(form, &hosts, &settings, &name)
+                {
+                    return Some(Command::ConfirmFormLosses { question, connect });
+                }
                 // The inventory follows a renamed connection (a read-only one
                 // saved under a new name is a copy: it has none yet).
                 let renamed = form
@@ -16061,6 +16072,57 @@ impl Window {
         }
         self.refresh_chrome();
         out
+    }
+
+    /// [`Self::loss_question`] for the connection form saving connection
+    /// `name` into `hosts` and `settings`.
+    fn form_loss_question(
+        &self,
+        form: &SessionForm,
+        hosts: &[saved::SavedHost],
+        settings: &Settings,
+        name: &str,
+    ) -> Option<String> {
+        let original = form.original.as_deref()?;
+        // A read-only connection saved under a new name is a copy: the
+        // original stays as it was.
+        if matches!(form.source, Source::ReadOnly(_)) && !original.eq_ignore_ascii_case(name) {
+            return None;
+        }
+        let before = self.rule_connections();
+        let was = before
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(original))?;
+        let saved = hosts.iter().find(|h| h.alias.eq_ignore_ascii_case(name));
+        let ssh_tag = Target::resolve(original, &ssh_env()).and_then(|t| t.tag);
+        let to = crate::rules_view::Connection {
+            name: name.to_owned(),
+            hostname: saved
+                .map(|h| h.hostname.clone().unwrap_or_else(|| name.to_owned()))
+                .or_else(|| was.hostname.clone()),
+            tags: ferossh_config::settings::host_tags(ssh_tag.as_deref(), settings.profile(name)),
+            folder: match saved {
+                Some(h) => h.folder.clone(),
+                None => was.folder.clone(),
+            },
+        };
+        let what = if original.eq_ignore_ascii_case(name) {
+            format!("Save {}", crate::ssh::sanitize_line(name))
+        } else {
+            format!(
+                "Rename {} to {}",
+                crate::ssh::sanitize_line(original),
+                crate::ssh::sanitize_line(name)
+            )
+        };
+        self.loss_question(
+            settings,
+            &[crate::rules_view::Changed {
+                from: original.to_owned(),
+                to,
+            }],
+            &what,
+        )
     }
 
     /// Saved WinRM connection `name` as the settings describe it now: its
@@ -16702,6 +16764,117 @@ impl Window {
             )));
         }
         own
+    }
+
+    /// The question before `changes` (made with settings `after`) when
+    /// they take security limits away from any connection; `what` names
+    /// the change. `None` when nothing is lost.
+    fn loss_question(
+        &self,
+        after: &Settings,
+        changes: &[crate::rules_view::Changed],
+        what: &str,
+    ) -> Option<String> {
+        let rules = |s: &Settings| -> Vec<SecurityRule> {
+            s.team
+                .security_rules
+                .iter()
+                .chain(&s.security_rules)
+                .cloned()
+                .collect()
+        };
+        if changes.is_empty() || !self.settings.has_security_rules() {
+            return None;
+        }
+        let lost = crate::rules_view::lost_limits(
+            &rules(&self.settings),
+            &rules(after),
+            &self.rule_connections(),
+            changes,
+        );
+        (!lost.is_empty()).then(|| crate::rules_view::loss_question(what, &lost))
+    }
+
+    /// [`Self::loss_question`] for a right-click action on several
+    /// connections: removing a tag or moving them to another folder.
+    fn bulk_loss_question(&self, action: &crate::bulk::BulkAction) -> Option<String> {
+        use crate::bulk::BulkAction;
+        use crate::rules_view::Changed;
+        let own = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .filter(|n| !self.settings.is_team(n))
+                .cloned()
+                .collect()
+        };
+        let before = self.rule_connections();
+        let picked = |names: &[String]| -> Vec<crate::rules_view::Connection> {
+            before
+                .iter()
+                .filter(|c| names.iter().any(|n| n.eq_ignore_ascii_case(&c.name)))
+                .cloned()
+                .collect()
+        };
+        let mut after = self.settings.clone();
+        let (changes, what): (Vec<Changed>, String) = match action {
+            BulkAction::RemoveTag(names, tag) => {
+                let names = own(names);
+                crate::bulk::remove_tag(&mut after, &names, tag);
+                let env = ssh_env();
+                let changes = picked(&names)
+                    .into_iter()
+                    .map(|c| {
+                        // ssh_config's own Tag stays.
+                        let ssh_tag = Target::resolve(&c.name, &env).and_then(|t| t.tag);
+                        Changed {
+                            from: c.name.clone(),
+                            to: crate::rules_view::Connection {
+                                tags: ferossh_config::settings::host_tags(
+                                    ssh_tag.as_deref(),
+                                    after.profile(&c.name),
+                                ),
+                                ..c
+                            },
+                        }
+                    })
+                    .collect();
+                (
+                    changes,
+                    format!(
+                        "Remove tag {} from {} connection{}",
+                        crate::ssh::sanitize_line(tag),
+                        names.len(),
+                        plural(names.len())
+                    ),
+                )
+            }
+            BulkAction::MoveTo(names, folder) => {
+                let (mine, _) = crate::bulk::saved_only(&load_saved(), &own(names));
+                let changes = picked(&mine)
+                    .into_iter()
+                    .map(|c| Changed {
+                        from: c.name.clone(),
+                        to: crate::rules_view::Connection {
+                            folder: folder.clone(),
+                            ..c
+                        },
+                    })
+                    .collect();
+                (
+                    changes,
+                    format!(
+                        "Move {} connection{} to {}",
+                        mine.len(),
+                        plural(mine.len()),
+                        folder
+                            .as_deref()
+                            .map_or_else(|| "no folder".to_owned(), crate::ssh::sanitize_line)
+                    ),
+                )
+            }
+            _ => return None,
+        };
+        self.loss_question(&after, &changes, &what)
     }
 
     /// Reads the hosts again after a session was saved or deleted.
@@ -22908,6 +23081,12 @@ enum Command {
     },
     /// A security rule requires pane `0`'s session log, which failed.
     LogRequired(PaneId),
+    /// The connection form's save takes security limits away: asks, and
+    /// saves (and connects, when `connect`) on Yes.
+    ConfirmFormLosses {
+        question: String,
+        connect: bool,
+    },
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
     /// Settings > Key bindings: the window that changes them.
@@ -25523,6 +25702,12 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
         },
         _ => return,
     };
+    // A tag removed or a folder left can take security limits away.
+    if let Some(question) = with_window(|w| w.bulk_loss_question(&action)).flatten()
+        && dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES)
+    {
+        return;
+    }
     let (command, queued) = with_window(|w| {
         let command = w.side_action(Some(SideAction::Bulk(action)));
         (command, std::mem::take(&mut w.queued))
@@ -26252,6 +26437,21 @@ fn run_command(hwnd: HWND, command: Command) {
                     // SAFETY: our window; replaces any earlier timer with this id.
                     unsafe { SetTimer(Some(hwnd), TIMER_WORKSPACE_ASK, 500, None) };
                 }
+            }
+        }
+        Command::ConfirmFormLosses { question, connect } => {
+            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                let (command, queued) = with_window(|w| {
+                    w.form_losses_ok = true;
+                    let command = w.form_action(Some(FormAction::Save { connect }));
+                    w.form_losses_ok = false;
+                    (command, std::mem::take(&mut w.queued))
+                })
+                .unwrap_or_default();
+                if let Some(command) = command {
+                    run_command(hwnd, command);
+                }
+                run_commands(hwnd, queued);
             }
         }
         Command::EditWorkspace(name) => {
