@@ -119,17 +119,22 @@ pub fn keep_in(
     now: u64,
 ) -> std::io::Result<()> {
     let _held = crate::inventory_view::lock(dir)?;
-    // Nothing is written unless the records, as they are under the lock,
-    // lost no more than the Yes was given for, for every connection on
-    // the way: another window may have kept more limits since it was
-    // asked. The connection is then asked again, and a No to that leaves
-    // no line or record for the jump hosts either.
+    // The whole route's update is worked out first, each check against
+    // the records as the ones before it left them (one alias's line never
+    // takes away what another on the same machine just kept). Nothing is
+    // written unless every step lost no more than the Yes was given for:
+    // another window may have kept more limits since it was asked. The
+    // connection is then asked again, and a No to that leaves no line or
+    // record for the jump hosts either.
     let on_disk = read_locked(dir)?;
-    if checks
-        .iter()
-        .any(|c| worth_keeping(&on_disk, c) && !approved(&on_disk, c, accepted))
-    {
-        return Ok(());
+    let mut next = on_disk.clone();
+    for c in checks {
+        if worth_keeping(&next, c) {
+            if !approved(&next, c, accepted) {
+                return Ok(());
+            }
+            next.keep(&c.name, &c.machine, c.now, now);
+        }
     }
     if !accepted.is_empty() {
         let text: String = accepted
@@ -146,16 +151,10 @@ pub fn keep_in(
             .collect();
         append_log(&dir.join("limit-changes.log"), &text)?;
     }
-    update_locked(dir, |kept| {
-        // Each against the records as the ones before it left them: one
-        // alias's line never takes away what another on the same machine
-        // just kept.
-        for c in checks {
-            if worth_keeping(kept, c) && approved(kept, c, accepted) {
-                kept.keep(&c.name, &c.machine, c.now, now);
-            }
-        }
-    })
+    if next == on_disk {
+        return Ok(());
+    }
+    crate::inventory_view::write_whole(&dir.join("limits.conf"), &next.to_text())
 }
 
 /// Whether `lowered` holds no loss that `approved` (the losses a Yes
@@ -344,6 +343,46 @@ mod tests {
         );
         let log = std::fs::read_to_string(dir.join("limit-changes.log")).unwrap();
         assert!(!log.contains("jump1"));
+        // Two aliases of one machine on the same route: the jump host's
+        // line also moves the destination's, and the destination would
+        // then lose more than was shown, so neither is written.
+        let alias = |name: &str, now: Policy| Check {
+            name: name.into(),
+            machine: "twin.example.com".into(),
+            now,
+        };
+        let keys = check(true).now;
+        keep_in(
+            &dir,
+            &[alias("twin-a", keys), alias("twin-b", keys)],
+            &[],
+            290,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(dir.join("limits.conf")).unwrap();
+        let log_before = std::fs::read_to_string(dir.join("limit-changes.log")).unwrap();
+        let logs = Policy {
+            log_session: true,
+            ..Policy::default()
+        };
+        let route = [alias("twin-a", logs), alias("twin-b", Policy::default())];
+        let shown: Vec<Lowered> = route
+            .iter()
+            .map(|c| Lowered {
+                check: c.clone(),
+                lost: keys,
+                since: None,
+            })
+            .collect();
+        keep_in(&dir, &route, &shown, 295).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("limits.conf")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("limit-changes.log")).unwrap(),
+            log_before
+        );
         // A connection that never had a limit gets no line.
         let typed = Check {
             name: "10.0.0.9".into(),
