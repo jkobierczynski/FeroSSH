@@ -1510,7 +1510,7 @@ struct Window {
     inventory_pending: Vec<InventoryFix>,
     /// The connection form's next save was asked about the security
     /// limits it takes away, and the answer was Yes.
-    form_losses_ok: Option<String>,
+    form_losses_ok: Option<LossAsk>,
     /// Show what changed: each running git's channel, and its tab.
     diffs: HashMap<ChannelId, PaneId>,
     /// The server status bar's samples, by their channel: one per
@@ -16033,13 +16033,14 @@ impl Window {
                 }
                 // A tag, folder, host or name changed can take security
                 // limits away: asked first, unless answered already.
-                // A Yes holds for the question it answered: one that reads
-                // otherwise now (a rule changed meanwhile) is asked again.
+                // A Yes holds for the losses it answered: when any differs
+                // now (a rule changed meanwhile), even one past those the
+                // question lists, it is asked again.
                 let answered = self.form_losses_ok.take();
-                if let Some(question) = self.form_loss_question(form, &hosts, &settings, &name)
-                    && answered.as_deref() != Some(question.as_str())
+                if let Some(ask) = self.form_loss_question(form, &hosts, &settings, &name)
+                    && answered.as_ref() != Some(&ask)
                 {
-                    return Some(Command::ConfirmFormLosses { question, connect });
+                    return Some(Command::ConfirmFormLosses { ask, connect });
                 }
                 // The inventory follows a renamed connection (a read-only one
                 // saved under a new name is a copy: it has none yet).
@@ -16116,7 +16117,7 @@ impl Window {
         hosts: &[saved::SavedHost],
         settings: &Settings,
         name: &str,
-    ) -> Option<String> {
+    ) -> Option<LossAsk> {
         let original = form.original.as_deref()?;
         // A read-only connection saved under a new name is a copy: the
         // original stays as it was.
@@ -16808,7 +16809,7 @@ impl Window {
         after: &Settings,
         changes: &[crate::rules_view::Changed],
         what: &str,
-    ) -> Option<String> {
+    ) -> Option<LossAsk> {
         let rules = |s: &Settings| -> Vec<SecurityRule> {
             s.team
                 .security_rules
@@ -16826,12 +16827,15 @@ impl Window {
             &self.rule_connections(),
             changes,
         );
-        (!lost.is_empty()).then(|| crate::rules_view::loss_question(what, &lost))
+        (!lost.is_empty()).then(|| LossAsk {
+            question: crate::rules_view::loss_question(what, &lost),
+            lost,
+        })
     }
 
     /// [`Self::loss_question`] for a right-click action on several
     /// connections: removing a tag or moving them to another folder.
-    fn bulk_loss_question(&self, action: &crate::bulk::BulkAction) -> Option<String> {
+    fn bulk_loss_question(&self, action: &crate::bulk::BulkAction) -> Option<LossAsk> {
         use crate::bulk::BulkAction;
         use crate::rules_view::Changed;
         let own = |names: &[String]| -> Vec<String> {
@@ -23062,6 +23066,15 @@ struct CrowdedOffer {
     others: u32,
 }
 
+/// A question about security limits an edit takes away, with every
+/// connection's loss it stands for: the text lists only the first few, so
+/// a Yes is matched against all of them.
+#[derive(Clone, Debug, PartialEq)]
+struct LossAsk {
+    question: String,
+    lost: Vec<(String, Policy)>,
+}
+
 enum Command {
     Id(u32),
     /// A Windows notification about a pane ([`crate::toast`]).
@@ -23118,7 +23131,7 @@ enum Command {
     /// The connection form's save takes security limits away: asks, and
     /// saves (and connects, when `connect`) on Yes.
     ConfirmFormLosses {
-        question: String,
+        ask: LossAsk,
         connect: bool,
     },
     /// Tools > New SSH key: the window that asks what to make.
@@ -25737,12 +25750,13 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
         _ => return,
     };
     // A tag removed or a folder left can take security limits away. A
-    // Yes holds for the question it answered: if the rules changed while
-    // it was open and the question reads otherwise now, it is asked again.
-    let mut answered: Option<String> = None;
+    // Yes holds for the losses it answered: if the rules changed while it
+    // was open and any loss differs now, even one past those the question
+    // lists, it is asked again.
+    let mut answered: Option<LossAsk> = None;
     let (command, queued) = loop {
         let outcome = with_window(|w| match w.bulk_loss_question(&action) {
-            Some(q) if answered.as_deref() != Some(q.as_str()) => Err(q),
+            Some(ask) if answered.as_ref() != Some(&ask) => Err(ask),
             _ => {
                 let command = w.side_action(Some(SideAction::Bulk(action.clone())));
                 Ok((command, std::mem::take(&mut w.queued)))
@@ -25750,12 +25764,16 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
         });
         match outcome {
             Some(Ok(done)) => break done,
-            Some(Err(question)) => {
-                if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES)
+            Some(Err(ask)) => {
+                if dialog(
+                    hwnd,
+                    &ask.question,
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                ) != Some(IDYES)
                 {
                     return;
                 }
-                answered = Some(question);
+                answered = Some(ask);
             }
             None => return,
         }
@@ -26486,10 +26504,15 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
             }
         }
-        Command::ConfirmFormLosses { question, connect } => {
-            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+        Command::ConfirmFormLosses { ask, connect } => {
+            if dialog(
+                hwnd,
+                &ask.question,
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            ) == Some(IDYES)
+            {
                 let (command, queued) = with_window(|w| {
-                    w.form_losses_ok = Some(question);
+                    w.form_losses_ok = Some(ask);
                     let command = w.form_action(Some(FormAction::Save { connect }));
                     w.form_losses_ok = None;
                     (command, std::mem::take(&mut w.queued))
