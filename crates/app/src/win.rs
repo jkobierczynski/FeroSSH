@@ -913,6 +913,12 @@ struct PendingConnect {
     endpoint: String,
     /// What the request that connected does once the answer is Yes.
     after: AfterConfirm,
+    /// The connections on the way, with their limits now: kept once the
+    /// answer is Yes.
+    checks: Vec<crate::limits_store::Check>,
+    /// Those of them with fewer limits than when they last connected:
+    /// noted in `limit-changes.log` once the answer is Yes.
+    lowered: Vec<crate::limits_store::Lowered>,
 }
 
 /// What a connection that waited for a security rule's answer still has
@@ -1964,6 +1970,32 @@ fn app_dir() -> PathBuf {
 
 /// FeroSSH's folder for what stays on this PC: `%LOCALAPPDATA%\FeroSSH`,
 /// or `local` in a portable FeroSSH's data folder.
+/// The question before connecting to `destination` (`endpoint`): a rule
+/// asks first (`confirm`), or connections on the way have fewer limits
+/// than when they last connected (`lowered`, one per line).
+fn confirm_connect_text(destination: &str, endpoint: &str, confirm: bool, lowered: &str) -> String {
+    let where_to = format!(
+        "{} ({})",
+        crate::ssh::sanitize_line(destination),
+        crate::ssh::sanitize_line(endpoint)
+    );
+    if lowered.is_empty() {
+        return format!("A security rule asks before connecting to {where_to}. Connect now?");
+    }
+    let ask = if confirm {
+        "A security rule also asks before connecting. "
+    } else {
+        ""
+    };
+    format!(
+        "Fewer security limits apply to {where_to} than when it last connected. \
+         These no longer apply:\n\n{lowered}\n\n\
+         A tag, folder or name may have changed (in FeroSSH, by hand or by an import), \
+         a rule may have been removed, or the team library was not loaded. \
+         Connecting anyway is noted in limit-changes.log.\n\n{ask}Connect anyway?"
+    )
+}
+
 fn local_dir() -> PathBuf {
     crate::portable::local_dir().unwrap_or_else(|| PathBuf::from(".").join("FeroSSH"))
 }
@@ -5968,6 +6000,9 @@ impl Window {
             Some(InventoryFix::Rename(old.to_owned(), new.to_owned())),
             |_| {},
         );
+        // The limits it had follow it too, so a rename alone is not
+        // taken for a connection without a past.
+        crate::limits_store::renamed(old, new);
     }
 
     /// What the inventory's system command printed, or that it ended.
@@ -7416,8 +7451,15 @@ impl Window {
         extras: &Extras,
         env: &Env,
     ) -> bool {
-        if !self.settings.has_security_rules() {
+        // The limits each connection on the way had when it last
+        // connected: one gone (a tag, folder or name changed, a rule
+        // removed, the team library not loaded) is asked about, even when
+        // no rule is left at all.
+        let checks = self.limit_checks(destination, env);
+        let lowered = crate::limits_store::lowered(&checks);
+        if !self.settings.has_security_rules() && lowered.is_empty() {
             self.connect_confirmed.remove(&id);
+            Self::keep_limits(&checks, &[]);
             return true;
         }
         let (alias, endpoint, confirm) = self.connect_subject(destination, env);
@@ -7427,16 +7469,31 @@ impl Window {
         match self.connect_confirmed.remove(&id) {
             Some(approved) if approved == endpoint => return true,
             Some(_) => {}
-            None if !confirm => return true,
+            None if !confirm && lowered.is_empty() => {
+                Self::keep_limits(&checks, &[]);
+                return true;
+            }
             None => {}
         }
-        self.show(
-            id,
-            &format!(
-                "\x1b[0;90mA security rule asks before connecting to {}.\x1b[0m\r\n",
-                crate::ssh::sanitize_line(&alias)
-            ),
-        );
+        if confirm {
+            self.show(
+                id,
+                &format!(
+                    "\x1b[0;90mA security rule asks before connecting to {}.\x1b[0m\r\n",
+                    crate::ssh::sanitize_line(&alias)
+                ),
+            );
+        }
+        let lowered_text = crate::limits_store::describe(&lowered);
+        if !lowered.is_empty() {
+            self.show(
+                id,
+                &format!(
+                    "\x1b[0;33mFewer security limits than when last connected: {}.\x1b[0m\r\n",
+                    lowered_text.replace('\n', "; ")
+                ),
+            );
+        }
         self.connect_asked += 1;
         let token = self.connect_asked;
         self.connect_pending.insert(
@@ -7445,6 +7502,8 @@ impl Window {
                 token,
                 endpoint: endpoint.clone(),
                 after: AfterConfirm::Plain,
+                checks,
+                lowered,
             },
         );
         self.workspace_asks.push(Command::ConfirmConnect {
@@ -7453,6 +7512,8 @@ impl Window {
             destination: destination.to_owned(),
             endpoint,
             extras: extras.clone(),
+            confirm,
+            lowered: lowered_text,
         });
         // SAFETY: our window; replaces any earlier timer with this id.
         unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
@@ -7503,6 +7564,54 @@ impl Window {
             }
             _ => WinrmTarget::typed(destination),
         }
+    }
+
+    /// Every connection on the way to `destination` (the jump hosts and
+    /// the host) with the limits the security rules give it now.
+    fn limit_checks(&self, destination: &str, env: &Env) -> Vec<crate::limits_store::Check> {
+        use crate::limits_store::Check;
+        let check = |alias: &str, hostname: Option<&str>, tag: Option<&str>| Check {
+            name: alias.to_owned(),
+            machine: hostname.unwrap_or(alias).to_owned(),
+            now: self.policy_of(alias, hostname, tag),
+        };
+        if ferossh_config::ssh_config::sftp_url(destination).is_none() {
+            if let Some(t) = self.telnet_target(destination, env) {
+                return vec![check(&t.alias, Some(&t.hostname), t.tag.as_deref())];
+            }
+            if let Some(t) = self.winrm_target(destination, env) {
+                return vec![check(&t.alias, Some(&t.hostname), t.tag.as_deref())];
+            }
+        }
+        let lookup = ferossh_config::ssh_config::sftp_url(destination)
+            .map_or_else(|| destination.to_owned(), |(d, _)| d);
+        let Some(target) = Target::resolve(&lookup, env) else {
+            return vec![check(&lookup, None, None)];
+        };
+        let mut out: Vec<Check> = target
+            .jumps
+            .iter()
+            .map(|hop| check(&hop.alias, Some(&hop.hostname), hop.tag.as_deref()))
+            .collect();
+        out.push(check(
+            &target.alias,
+            Some(&target.hostname),
+            target.tag.as_deref(),
+        ));
+        out
+    }
+
+    /// Keeps `checks`' limits as those they had when last connected, and
+    /// notes `accepted` (fewer limits, connected anyway). A file that
+    /// cannot be written costs only the next comparison.
+    fn keep_limits(
+        checks: &[crate::limits_store::Check],
+        accepted: &[crate::limits_store::Lowered],
+    ) {
+        if accepted.is_empty() && !crate::limits_store::changes(checks) {
+            return;
+        }
+        let _ = crate::limits_store::keep(checks, accepted, crate::inventory_view::now());
     }
 
     /// The connection `destination` names, as the security rules see
@@ -7581,6 +7690,7 @@ impl Window {
             return;
         };
         if yes {
+            Self::keep_limits(&pending.checks, &pending.lowered);
             self.connect_confirmed.insert(id, pending.endpoint);
             match pending.after {
                 AfterConfirm::Plain => self.connect_with(id, destination, extras),
@@ -22790,6 +22900,11 @@ enum Command {
         /// Where it goes, as resolved when asked.
         endpoint: String,
         extras: Extras,
+        /// Whether a rule asks first.
+        confirm: bool,
+        /// The connections with fewer limits than when last connected,
+        /// one per line; empty when none.
+        lowered: String,
     },
     /// A security rule requires pane `0`'s session log, which failed.
     LogRequired(PaneId),
@@ -26108,12 +26223,10 @@ fn run_command(hwnd: HWND, command: Command) {
             destination,
             endpoint,
             extras,
+            confirm,
+            lowered,
         } => {
-            let text = format!(
-                "A security rule asks before connecting to {} ({}). Connect now?",
-                crate::ssh::sanitize_line(&destination),
-                crate::ssh::sanitize_line(&endpoint)
-            );
+            let text = confirm_connect_text(&destination, &endpoint, confirm, &lowered);
             match dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
                 Some(answer) => {
                     let next = with_window(|w| {
@@ -26132,6 +26245,8 @@ fn run_command(hwnd: HWND, command: Command) {
                             destination,
                             endpoint,
                             extras,
+                            confirm,
+                            lowered,
                         });
                     });
                     // SAFETY: our window; replaces any earlier timer with this id.

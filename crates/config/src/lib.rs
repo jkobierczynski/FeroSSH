@@ -18,6 +18,7 @@ pub mod inventory;
 mod json;
 pub mod known_hosts;
 pub mod library;
+pub mod limit_record;
 pub mod login;
 pub mod mobaxterm;
 pub mod mremoteng;

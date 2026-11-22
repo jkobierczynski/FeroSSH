@@ -34,9 +34,9 @@ pub fn read() -> std::io::Result<Inventory> {
 /// Held while the inventory is read, changed and written: an exclusive
 /// open of `inventory.lock`, which every FeroSSH process takes the same
 /// way, so two windows' changes do not interleave. Released when dropped.
-struct Lock(#[allow(dead_code)] std::fs::File);
+pub(crate) struct Lock(#[allow(dead_code)] std::fs::File);
 
-fn lock(dir: &std::path::Path) -> std::io::Result<Lock> {
+pub(crate) fn lock(dir: &std::path::Path) -> std::io::Result<Lock> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join("inventory.lock");
     let mut last = None;
@@ -60,7 +60,7 @@ fn lock(dir: &std::path::Path) -> std::io::Result<Lock> {
 
 /// Writes `text` through a temporary file of this write's own beside
 /// `path`, then moves it over: a whole file or none.
-fn write_whole(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_whole(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let (tmp, mut file) = loop {

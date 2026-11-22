@@ -240,6 +240,14 @@ Tools > Security rules (the padlock on the tools rail) lists, in the tools pane,
 
 Changes apply to connections opened from then on. The rules are `SecurityRule` blocks in `ferossh.conf`, and you can still write them there; see [Settings](settings.md#security-rules).
 
+#### When a connection loses limits
+
+Rules don't belong to a connection: they match it by tag, folder or name each time it connects. Removing a tag, moving a connection to another folder, renaming it, an import, a hand edit of the files, a deleted rule or a team library that could not be read can all take limits away without anyone meaning to.
+
+So FeroSSH remembers the limits each connection had when it last connected, and asks before connecting when one of them is gone. The question names each connection on the way (jump hosts too) and the limits it no longer has. **No** leaves the pane unconnected, and the question comes again next time. **Yes** connects, takes the new set of limits as the one to compare with from then on, and adds a line to `limit-changes.log`. Limits follow the machine, so another alias or the typed address of a host is compared with what it had too, and a rename in FeroSSH keeps the record.
+
+Both files are in FeroSSH's folder for this PC (`%LOCALAPPDATA%\FeroSSH`, or `FeroSSH-data\local` beside a portable exe): `limits.conf` holds the last limits per connection and `limit-changes.log` lists every connection made with fewer. They are not protected. Deleting them only means the next connection starts a new record without asking. They are there to catch changes nobody meant, and a team library is what stops a user from loosening a team's rules.
+
 ### Team library
 
 A team can share one set of connections and rules. An administrator sets them up in FeroSSH, exports them with **File > Import and export > Export team library**, signs the file with an SSH key (`ssh-keygen -Y sign -f admin_key -n ferossh-library team.ferossh-library`) and puts it with its `.sig` on a share or in a synced folder. Everyone else sets the file and the administrator's public key in **Settings > Team library**.

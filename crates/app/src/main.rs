@@ -86,6 +86,8 @@ mod keygen_view;
 mod keys_view;
 #[cfg(windows)]
 mod known_hosts_panel;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod limits_store;
 #[cfg(windows)]
 mod live_panel;
 #[cfg(windows)]
