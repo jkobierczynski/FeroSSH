@@ -6,7 +6,7 @@
 //! CRLF for Notepad. Raw logs keep every byte, for replaying with `cat`.
 //! The UI process writes the file; the worker never sees it. A log opened
 //! with a chain file is also sealed against later edits (see `chain`).
-//! Plain logs can put the time each line started in front of it; raw logs
+//! Plain logs can put the time each line ended in front of it; raw logs
 //! never do, so they still replay.
 
 use std::io::{self, Write};
@@ -132,8 +132,9 @@ pub struct LogWriter<W: Write> {
     line: Line,
     /// Stamps each plain line with the time when set.
     clock: Option<Clock>,
-    /// When the unfinished line started, while stamping.
-    started: Option<String>,
+    /// When bytes last reached the unfinished line, while stamping: its
+    /// time if the log closes before the line ends.
+    last: Option<String>,
 }
 
 impl<W: Write> std::fmt::Debug for LogWriter<W> {
@@ -167,7 +168,7 @@ impl<W: Write> LogWriter<W> {
             parser: Parser::new(),
             line: Line::default(),
             clock: None,
-            started: None,
+            last: None,
         })
     }
 
@@ -180,28 +181,33 @@ impl<W: Write> LogWriter<W> {
     pub fn set_timestamps(&mut self, clock: Option<Clock>) {
         self.clock = clock;
         if clock.is_none() {
-            self.started = None;
+            self.last = None;
         }
     }
 
     /// Writes the lines the parser finished. A line is stamped with the
-    /// time its first bytes came, which for all but the first finished
-    /// line is now.
-    fn write_lines(&mut self) -> io::Result<()> {
+    /// time it was finished, so a command line shows when Enter was
+    /// pressed, not when its prompt appeared. `closing` writes the
+    /// unfinished last line with the time bytes last reached it.
+    fn write_lines(&mut self, closing: bool) -> io::Result<()> {
         let Some(clock) = self.clock else {
             for line in self.line.done.drain(..) {
                 write!(self.out, "{line}\r\n")?;
             }
             return Ok(());
         };
-        let now = clock();
-        let mut first = self.started.take();
+        if self.line.done.is_empty() && self.line.chars.is_empty() {
+            return Ok(());
+        }
+        let now = match self.last.take() {
+            Some(at) if closing => at,
+            _ => clock(),
+        };
         for line in self.line.done.drain(..) {
-            let at = first.take().unwrap_or_else(|| now.clone());
-            write!(self.out, "[{at}] {line}\r\n")?;
+            write!(self.out, "[{now}] {line}\r\n")?;
         }
         if !self.line.chars.is_empty() {
-            self.started = Some(first.unwrap_or(now));
+            self.last = Some(now);
         }
         Ok(())
     }
@@ -213,7 +219,7 @@ impl<W: Write> LogWriter<W> {
             self.out.write_all(bytes)?;
         } else {
             self.parser.advance(&mut self.line, bytes);
-            self.write_lines()?;
+            self.write_lines(false)?;
         }
         self.out.flush()?;
         if let Sink::Chained(c) = &mut self.out {
@@ -244,7 +250,7 @@ impl<W: Write> LogWriter<W> {
     fn close(mut self, footer: &str) -> io::Result<Sink<W>> {
         if !self.raw && !self.line.chars.is_empty() {
             self.line.end();
-            self.write_lines()?;
+            self.write_lines(true)?;
         }
         if self.raw {
             write!(self.out, "\r\n")?;
@@ -373,21 +379,52 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_mark_when_each_line_started() {
+    fn timestamps_mark_when_each_line_ended() {
         let mut w = LogWriter::new(Vec::new(), false, "start").unwrap();
         w.write(b"before\r\n").unwrap();
         w.set_timestamps(Some(tick));
-        // The second write finishes a line the first one started.
+        // A line is stamped by the write that ends it.
         w.write(b"one\r\ntw").unwrap();
         w.write(b"o\r\nthree\r\n").unwrap();
-        // A write that ends no line keeps the line's first time.
+        // An unfinished line closes with the time bytes last reached it.
         w.write(b"fo").unwrap();
         w.write(b"ur").unwrap();
-        w.write(b"\x1b[31m").unwrap();
         let got = String::from_utf8(w.finish("end").unwrap()).unwrap();
         assert_eq!(
             got,
-            "start\r\nbefore\r\n[t0] one\r\n[t0] two\r\n[t1] three\r\n[t2] four\r\nend\r\n"
+            "start\r\nbefore\r\n[t0] one\r\n[t1] two\r\n[t1] three\r\n[t3] four\r\nend\r\n"
+        );
+    }
+
+    /// A prompt that waits for the user: the command line gets the time
+    /// Enter was pressed, not the time the prompt appeared.
+    #[test]
+    fn a_typed_command_gets_the_time_it_was_entered() {
+        use std::cell::Cell;
+        thread_local!(static NOW: Cell<u32> = const { Cell::new(0) });
+        fn clock() -> String {
+            format!("{}", NOW.with(Cell::get))
+        }
+        let at = |t| NOW.with(|n| n.set(t));
+        let mut w = LogWriter::new(Vec::new(), false, "s").unwrap();
+        w.set_timestamps(Some(clock));
+        at(100);
+        w.write(b"$ ").unwrap();
+        at(500);
+        w.write(b"l").unwrap();
+        at(501);
+        w.write(b"s").unwrap();
+        at(502);
+        w.write(b"\r\na  b\r\n$ ").unwrap();
+        at(900);
+        w.write(b"pwd\r\n/root\r\n$ ").unwrap();
+        at(950);
+        w.write(b"exit").unwrap();
+        at(999);
+        let got = String::from_utf8(w.finish("e").unwrap()).unwrap();
+        assert_eq!(
+            got,
+            "s\r\n[502] $ ls\r\n[502] a  b\r\n[900] $ pwd\r\n[900] /root\r\n[950] $ exit\r\ne\r\n"
         );
     }
 

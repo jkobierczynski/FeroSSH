@@ -142,7 +142,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | --- | --- |
 | Log to file | Writes what the focused tab receives to a log file. ✓ while logging. See [Logs](logs.md). |
 | Logs and recordings > Log raw output (keep escape codes) | Logs every byte as received, so the log replays with `cat`. ✓ |
-| Logs and recordings > Timestamp each log line | Puts the time each line started in front of it, in plain logs. ✓ `LogTimestamps`. |
+| Logs and recordings > Timestamp each log line | Puts the time each line ended in front of it, in plain logs. ✓ `LogTimestamps`. |
 | Logs and recordings > Save this pane's output to a log | Writes everything the pane still holds, scrollback and screen, to a new log file. |
 | Logs and recordings > Save output of all panes to logs | The same for every pane in every tab, one file each. |
 | Logs and recordings > Record this pane (asciicast) | Records what the focused pane shows, with its timing, to a `.cast` file in the log folder, until you choose it again. Only the host's output goes in, never your keystrokes: what you type is in it only as the host echoes it, so a password typed at a prompt that does not echo stays out, but a secret the host echoes or prints (such as `mysql -pSecret` on a command line) is recorded. Off by default; ✓ while recording. See [Recording a pane](logs.md#recording-a-pane-and-playing-it-back). |
