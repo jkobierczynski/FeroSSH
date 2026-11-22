@@ -913,9 +913,6 @@ struct PendingConnect {
     endpoint: String,
     /// What the request that connected does once the answer is Yes.
     after: AfterConfirm,
-    /// The connections on the way, with their limits now: kept once the
-    /// answer is Yes.
-    checks: Vec<crate::limits_store::Check>,
     /// Those of them with fewer limits than when they last connected:
     /// noted in `limit-changes.log` once the answer is Yes.
     lowered: Vec<crate::limits_store::Lowered>,
@@ -7518,7 +7515,6 @@ impl Window {
                 token,
                 endpoint: endpoint.clone(),
                 after: AfterConfirm::Plain,
-                checks,
                 lowered,
             },
         );
@@ -7706,7 +7702,14 @@ impl Window {
             return;
         };
         if yes {
-            Self::keep_limits(&pending.checks, &pending.lowered);
+            // Kept (and logged) only while what is lost now is what the
+            // question showed: a limit lost meanwhile is asked about
+            // first, and a No to that leaves the record and log alone.
+            let checks = self.limit_checks(destination, &ssh_env());
+            let lowered = crate::limits_store::lowered(&checks);
+            if crate::limits_store::covered(&lowered, &pending.lowered) {
+                Self::keep_limits(&checks, &lowered);
+            }
             self.connect_confirmed.insert(id, pending.endpoint);
             self.limits_approved.insert(id, pending.lowered);
             match pending.after {
