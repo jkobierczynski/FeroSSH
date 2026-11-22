@@ -1510,7 +1510,7 @@ struct Window {
     inventory_pending: Vec<InventoryFix>,
     /// The connection form's next save was asked about the security
     /// limits it takes away, and the answer was Yes.
-    form_losses_ok: bool,
+    form_losses_ok: Option<String>,
     /// Show what changed: each running git's channel, and its tab.
     diffs: HashMap<ChannelId, PaneId>,
     /// The server status bar's samples, by their channel: one per
@@ -2962,7 +2962,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 system_reads: HashMap::new(),
                 inventory_renames: HashMap::new(),
                 inventory_pending: Vec::new(),
-                form_losses_ok: false,
+                form_losses_ok: None,
                 diffs: HashMap::new(),
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
@@ -7465,7 +7465,7 @@ impl Window {
         if !self.settings.has_security_rules() && lowered.is_empty() {
             self.connect_confirmed.remove(&id);
             self.limits_approved.remove(&id);
-            Self::keep_limits(&checks, &[]);
+            self.keep_limits(&checks, &[]);
             return true;
         }
         let (alias, endpoint, confirm) = self.connect_subject(destination, env);
@@ -7483,7 +7483,7 @@ impl Window {
             }
             Some(_) => {}
             None if !confirm && lowered.is_empty() => {
-                Self::keep_limits(&checks, &[]);
+                self.keep_limits(&checks, &[]);
                 return true;
             }
             None => {}
@@ -7615,15 +7615,22 @@ impl Window {
 
     /// Keeps `checks`' limits as those they had when last connected, and
     /// notes `accepted` (fewer limits, connected anyway). A file that
-    /// cannot be written costs only the next comparison.
+    /// cannot be written does not stop the connection: a notice says so,
+    /// and the next connection asks again.
     fn keep_limits(
+        &mut self,
         checks: &[crate::limits_store::Check],
         accepted: &[crate::limits_store::Lowered],
     ) {
         if accepted.is_empty() && !crate::limits_store::changes(checks) {
             return;
         }
-        let _ = crate::limits_store::keep(checks, accepted, crate::inventory_view::now());
+        if let Err(e) = crate::limits_store::keep(checks, accepted, crate::inventory_view::now()) {
+            self.queued.push(Command::Notice(format!(
+                "FeroSSH could not note the security limits in limits.conf or limit-changes.log \
+                 ({e}). It asks about them again next time."
+            )));
+        }
     }
 
     /// The connection `destination` names, as the security rules see
@@ -7705,10 +7712,16 @@ impl Window {
             // Kept (and logged) only while what is lost now is what the
             // question showed: a limit lost meanwhile is asked about
             // first, and a No to that leaves the record and log alone.
-            let checks = self.limit_checks(destination, &ssh_env());
+            // ... and only for the endpoint it was asked about: another
+            // (an edited HostName meanwhile) is asked about again.
+            let env = ssh_env();
+            let checks = self.limit_checks(destination, &env);
             let lowered = crate::limits_store::lowered(&checks);
-            if crate::limits_store::covered(&lowered, &pending.lowered) {
-                Self::keep_limits(&checks, &lowered);
+            let (_, endpoint, _) = self.connect_subject(destination, &env);
+            if endpoint == pending.endpoint
+                && crate::limits_store::covered(&lowered, &pending.lowered)
+            {
+                self.keep_limits(&checks, &lowered);
             }
             self.connect_confirmed.insert(id, pending.endpoint);
             self.limits_approved.insert(id, pending.lowered);
@@ -16020,8 +16033,11 @@ impl Window {
                 }
                 // A tag, folder, host or name changed can take security
                 // limits away: asked first, unless answered already.
-                if !std::mem::take(&mut self.form_losses_ok)
-                    && let Some(question) = self.form_loss_question(form, &hosts, &settings, &name)
+                // A Yes holds for the question it answered: one that reads
+                // otherwise now (a rule changed meanwhile) is asked again.
+                let answered = self.form_losses_ok.take();
+                if let Some(question) = self.form_loss_question(form, &hosts, &settings, &name)
+                    && answered.as_deref() != Some(question.as_str())
                 {
                     return Some(Command::ConfirmFormLosses { question, connect });
                 }
@@ -16112,7 +16128,7 @@ impl Window {
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(original))?;
         let saved = hosts.iter().find(|h| h.alias.eq_ignore_ascii_case(name));
-        let ssh_tag = Target::resolve(original, &ssh_env()).and_then(|t| t.tag);
+        let ssh_tag = Target::resolve(name, &ssh_env()).and_then(|t| t.tag);
         let to = crate::rules_view::Connection {
             name: name.to_owned(),
             hostname: saved
@@ -25720,17 +25736,30 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
         },
         _ => return,
     };
-    // A tag removed or a folder left can take security limits away.
-    if let Some(question) = with_window(|w| w.bulk_loss_question(&action)).flatten()
-        && dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES)
-    {
-        return;
-    }
-    let (command, queued) = with_window(|w| {
-        let command = w.side_action(Some(SideAction::Bulk(action)));
-        (command, std::mem::take(&mut w.queued))
-    })
-    .unwrap_or_default();
+    // A tag removed or a folder left can take security limits away. A
+    // Yes holds for the question it answered: if the rules changed while
+    // it was open and the question reads otherwise now, it is asked again.
+    let mut answered: Option<String> = None;
+    let (command, queued) = loop {
+        let outcome = with_window(|w| match w.bulk_loss_question(&action) {
+            Some(q) if answered.as_deref() != Some(q.as_str()) => Err(q),
+            _ => {
+                let command = w.side_action(Some(SideAction::Bulk(action.clone())));
+                Ok((command, std::mem::take(&mut w.queued)))
+            }
+        });
+        match outcome {
+            Some(Ok(done)) => break done,
+            Some(Err(question)) => {
+                if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES)
+                {
+                    return;
+                }
+                answered = Some(question);
+            }
+            None => return,
+        }
+    };
     if let Some(command) = command {
         run_command(hwnd, command);
     }
@@ -26460,9 +26489,9 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::ConfirmFormLosses { question, connect } => {
             if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
                 let (command, queued) = with_window(|w| {
-                    w.form_losses_ok = true;
+                    w.form_losses_ok = Some(question);
                     let command = w.form_action(Some(FormAction::Save { connect }));
-                    w.form_losses_ok = false;
+                    w.form_losses_ok = None;
                     (command, std::mem::take(&mut w.queued))
                 })
                 .unwrap_or_default();

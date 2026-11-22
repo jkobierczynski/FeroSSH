@@ -130,12 +130,13 @@ pub fn keep_in(
         append_log(&dir.join("limit-changes.log"), &text)?;
     }
     update_locked(dir, |kept| {
-        let worth: Vec<&Check> = checks
-            .iter()
-            .filter(|c| worth_keeping(kept, c) && approved(kept, c, accepted))
-            .collect();
-        for c in worth {
-            kept.keep(&c.name, &c.machine, c.now, now);
+        // Each against the records as the ones before it left them: one
+        // alias's line never takes away what another on the same machine
+        // just kept.
+        for c in checks {
+            if worth_keeping(kept, c) && approved(kept, c, accepted) {
+                kept.keep(&c.name, &c.machine, c.now, now);
+            }
         }
     })
 }
