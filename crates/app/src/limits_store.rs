@@ -72,13 +72,18 @@ fn update_in(dir: &Path, change: impl FnOnce(&mut Limits)) -> std::io::Result<()
 }
 
 /// [`update_in`] with the lock already held.
+/// The records as they are on disk; the caller holds the lock.
+fn read_locked(dir: &Path) -> std::io::Result<Limits> {
+    match std::fs::read_to_string(dir.join("limits.conf")) {
+        Ok(t) => Ok(Limits::parse(&t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Limits::default()),
+        Err(e) => Err(e),
+    }
+}
+
 fn update_locked(dir: &Path, change: impl FnOnce(&mut Limits)) -> std::io::Result<()> {
     let path = dir.join("limits.conf");
-    let mut kept = match std::fs::read_to_string(&path) {
-        Ok(t) => Limits::parse(&t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Limits::default(),
-        Err(e) => return Err(e),
-    };
+    let mut kept = read_locked(dir)?;
     let before = kept.clone();
     change(&mut kept);
     if kept == before {
@@ -114,8 +119,16 @@ pub fn keep_in(
     now: u64,
 ) -> std::io::Result<()> {
     let _held = crate::inventory_view::lock(dir)?;
-    if !accepted.is_empty() {
-        let text: String = accepted
+    // Logged only where the records, as they are under the lock, lost no
+    // more than the Yes was given for: another window may have kept more
+    // limits since it was asked, and that connection is asked again.
+    let on_disk = read_locked(dir)?;
+    let logged: Vec<&Lowered> = accepted
+        .iter()
+        .filter(|l| approved(&on_disk, &l.check, accepted))
+        .collect();
+    if !logged.is_empty() {
+        let text: String = logged
             .iter()
             .map(|l| {
                 limit_record::log_line(
@@ -288,6 +301,9 @@ mod tests {
             since: None,
         };
         keep_in(&dir, &[check(false)], std::slice::from_ref(&shown), 260).unwrap();
+        // ... nor writes a line for it: that connection is asked again.
+        let log = std::fs::read_to_string(dir.join("limit-changes.log")).unwrap();
+        assert_eq!(log.matches("connected anyway").count(), 1);
         let left = lowered_in(&dir, &[check(false)]);
         assert!(left[0].lost.log_session && left[0].lost.keys_only);
         assert!(!covered(&left, std::slice::from_ref(&shown)));
