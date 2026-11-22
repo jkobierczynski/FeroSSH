@@ -68,6 +68,11 @@ pub fn lowered(checks: &[Check]) -> Vec<Lowered> {
 /// log's lock, so two windows keep each other's lines.
 fn update_in(dir: &Path, change: impl FnOnce(&mut Limits)) -> std::io::Result<()> {
     let _held = crate::inventory_view::lock(dir)?;
+    update_locked(dir, change)
+}
+
+/// [`update_in`] with the lock already held.
+fn update_locked(dir: &Path, change: impl FnOnce(&mut Limits)) -> std::io::Result<()> {
     let path = dir.join("limits.conf");
     let mut kept = match std::fs::read_to_string(&path) {
         Ok(t) => Limits::parse(&t),
@@ -82,15 +87,33 @@ fn update_in(dir: &Path, change: impl FnOnce(&mut Limits)) -> std::io::Result<()
     crate::inventory_view::write_whole(&path, &kept.to_text())
 }
 
+/// Whether keeping `c` now (in `kept`, as it is under the lock) takes
+/// away only what `accepted` showed: a limit another window kept since
+/// the question was asked, or one nobody was asked about, stays.
+fn approved(kept: &Limits, c: &Check, accepted: &[Lowered]) -> bool {
+    let lost = limit_record::lost(&kept.before(&c.name, &c.machine).limits, &c.now);
+    if lost.is_empty() {
+        return true;
+    }
+    accepted
+        .iter()
+        .filter(|l| l.check.name.eq_ignore_ascii_case(&c.name))
+        .any(|l| limit_record::lost(&lost, &l.lost).is_empty())
+}
+
 /// Keeps `checks`' limits as they are now, at `now`; for the ones in
 /// `accepted` (fewer than before, connected anyway) a line in
-/// `limit-changes.log` too.
+/// `limit-changes.log` too. All under one lock: two windows never
+/// interleave their lines, or rotate the log over each other. A
+/// connection whose record lost more than `accepted` says is left as it
+/// is, so the next connection asks about the rest.
 pub fn keep_in(
     dir: &Path,
     checks: &[Check],
     accepted: &[Lowered],
     now: u64,
 ) -> std::io::Result<()> {
+    let _held = crate::inventory_view::lock(dir)?;
     if !accepted.is_empty() {
         let text: String = accepted
             .iter()
@@ -106,11 +129,25 @@ pub fn keep_in(
             .collect();
         append_log(&dir.join("limit-changes.log"), &text)?;
     }
-    update_in(dir, |kept| {
-        let worth: Vec<&Check> = checks.iter().filter(|c| worth_keeping(kept, c)).collect();
+    update_locked(dir, |kept| {
+        let worth: Vec<&Check> = checks
+            .iter()
+            .filter(|c| worth_keeping(kept, c) && approved(kept, c, accepted))
+            .collect();
         for c in worth {
             kept.keep(&c.name, &c.machine, c.now, now);
         }
+    })
+}
+
+/// Whether `lowered` holds no loss that `approved` (the losses a Yes
+/// was given for) did not show.
+pub fn covered(lowered: &[Lowered], approved: &[Lowered]) -> bool {
+    lowered.iter().all(|l| {
+        approved
+            .iter()
+            .filter(|a| a.check.name.eq_ignore_ascii_case(&l.check.name))
+            .any(|a| limit_record::lost(&l.lost, &a.lost).is_empty())
     })
 }
 
@@ -233,6 +270,30 @@ mod tests {
         assert!(lowered_in(&dir, &[check(false)]).is_empty());
         let log = std::fs::read_to_string(dir.join("limit-changes.log")).unwrap();
         assert!(log.contains("db1\tdb1.example.com\tlost KeysOnly\tconnected anyway"));
+        // A Yes for KeysOnly does not take away a limit another window
+        // kept meanwhile.
+        let both = Check {
+            now: Policy {
+                keys_only: true,
+                log_session: true,
+                ..Policy::default()
+            },
+            ..check(true)
+        };
+        keep_in(&dir, &[both], &[], 250).unwrap();
+        let shown = Lowered {
+            check: check(false),
+            lost: check(true).now,
+            since: None,
+        };
+        keep_in(&dir, &[check(false)], std::slice::from_ref(&shown), 260).unwrap();
+        let left = lowered_in(&dir, &[check(false)]);
+        assert!(left[0].lost.log_session && left[0].lost.keys_only);
+        assert!(!covered(&left, std::slice::from_ref(&shown)));
+        assert!(covered(
+            std::slice::from_ref(&shown),
+            std::slice::from_ref(&shown)
+        ));
         // A connection that never had a limit gets no line.
         let typed = Check {
             name: "10.0.0.9".into(),

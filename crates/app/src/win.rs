@@ -1641,6 +1641,9 @@ struct Window {
     /// Panes whose next connection a security rule's question already
     /// allowed, with the endpoint the answer was for.
     connect_confirmed: HashMap<PaneId, String>,
+    /// The lost limits a pane's Yes was given for, beside its endpoint in
+    /// `connect_confirmed`.
+    limits_approved: HashMap<PaneId, Vec<crate::limits_store::Lowered>>,
     /// Panes waiting for an answer to a security rule's question; no
     /// other request takes them meanwhile.
     connect_pending: HashMap<PaneId, PendingConnect>,
@@ -3009,6 +3012,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 workspace_after: HashMap::new(),
                 workspace_asks: Vec::new(),
                 connect_confirmed: HashMap::new(),
+                limits_approved: HashMap::new(),
                 connect_pending: HashMap::new(),
                 connect_asked: 0,
                 workspace_names: Vec::new(),
@@ -7463,6 +7467,7 @@ impl Window {
         let lowered = crate::limits_store::lowered(&checks);
         if !self.settings.has_security_rules() && lowered.is_empty() {
             self.connect_confirmed.remove(&id);
+            self.limits_approved.remove(&id);
             Self::keep_limits(&checks, &[]);
             return true;
         }
@@ -7470,8 +7475,15 @@ impl Window {
         // A Yes holds for the endpoint and route it was given for: one
         // that changed meanwhile (an edited HostName, jump host or proxy)
         // is asked about again, even if no rule matches it now.
+        // ... and for the lost limits it was shown: one more lost since
+        // is asked about again.
+        let shown = self.limits_approved.remove(&id).unwrap_or_default();
         match self.connect_confirmed.remove(&id) {
-            Some(approved) if approved == endpoint => return true,
+            Some(approved)
+                if approved == endpoint && crate::limits_store::covered(&lowered, &shown) =>
+            {
+                return true;
+            }
             Some(_) => {}
             None if !confirm && lowered.is_empty() => {
                 Self::keep_limits(&checks, &[]);
@@ -7696,6 +7708,7 @@ impl Window {
         if yes {
             Self::keep_limits(&pending.checks, &pending.lowered);
             self.connect_confirmed.insert(id, pending.endpoint);
+            self.limits_approved.insert(id, pending.lowered);
             match pending.after {
                 AfterConfirm::Plain => self.connect_with(id, destination, extras),
                 AfterConfirm::Run => {
@@ -7720,9 +7733,11 @@ impl Window {
             // Asked again (the endpoint changed): no Yes left over.
             if self.connect_pending.contains_key(&id) {
                 self.connect_confirmed.remove(&id);
+                self.limits_approved.remove(&id);
             }
         } else {
             self.connect_confirmed.remove(&id);
+            self.limits_approved.remove(&id);
             if matches!(pending.after, AfterConfirm::Run) {
                 self.fail_run_row(id, "not confirmed".into());
             }
