@@ -207,7 +207,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 
 ## Right-click menu in the connection manager
 
-Right-clicking a host in the connection manager offers Connect (Enter), Open in a split (Shift+Enter), Edit connection... (F2), Delete connection... (Del) and New connection... (Ins).; with several connections selected, the menu acts on them instead, so clear the selection first.
+Right-clicking a host in the connection manager offers Connect (Enter), Open in a split (Shift+Enter), Edit connection... (F2), Delete connection... (Del), Add tag, Remove tag, Move to folder, Change a field and New connection... (Ins). With several connections selected, the menu acts on them all instead, so clear the selection first to act on one.
 
 ## Keys in the side panes
 

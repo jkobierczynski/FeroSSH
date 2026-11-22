@@ -24599,6 +24599,12 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     const NEW: u32 = 5;
     const SAVE_SEARCH: u32 = 6;
     const REMOVE_SEARCH: u32 = 7;
+    // A connection of one's own can be tagged, moved and changed as with
+    // several selected (a team one cannot).
+    let group = host
+        .as_ref()
+        .filter(|h| with_window(|w| !w.settings.is_team(h)).unwrap_or(false))
+        .and_then(|h| group_choices(std::slice::from_ref(h)));
     // The search typed, when there is one to save.
     let typed = with_window(|w| {
         let q = w.side.list.query().trim().to_owned();
@@ -24633,6 +24639,10 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
                 w!("&Delete connection...\tDel"),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            if let Some((tags, folders)) = &group {
+                append_group_items(menu, tags, folders);
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            }
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
         if typed.is_some() || search.is_some() {
@@ -24668,6 +24678,11 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
         let _ = DestroyMenu(menu);
         u32::try_from(chosen.0).unwrap_or(0)
     };
+    if let (Some(h), Some((tags, folders))) = (&host, &group)
+        && group_pick(hwnd, picked, vec![h.clone()], tags, folders)
+    {
+        return;
+    }
     let action = match (picked, host) {
         (CONNECT, Some(host)) => SideAction::Open { host, split: false },
         (SPLIT, Some(host)) => SideAction::Open { host, split: true },
@@ -25596,22 +25611,12 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
 /// The connection manager's right-click menu with several hosts
 /// selected: connect to them all, tag them, move them, delete them.
 fn bulk_menu(hwnd: HWND, names: Vec<String>) {
-    use crate::bulk::{BulkAction, MAX_CHOICES};
+    use crate::bulk::BulkAction;
     use crate::native::wide;
     const CONNECT_ALL: u32 = 1;
     const DELETE: u32 = 2;
     const CLEAR: u32 = 3;
-    const NO_FOLDER: u32 = 4;
-    const ADD_TAG: u32 = 100;
-    const REMOVE_TAG: u32 = 200;
-    const MOVE_TO: u32 = 300;
-    const EDIT: u32 = 400;
-    let fields = crate::bulk_edit::EditField::ALL;
-    let Some((tags, folders)) = with_window(|w| {
-        let items = host_items(&ssh_env(), &w.settings);
-        let tags = crate::bulk::tag_choices(&items, &w.settings, &names);
-        (tags, crate::bulk::folder_choices(&load_saved()))
-    }) else {
+    let Some((tags, folders)) = group_choices(&names) else {
         return;
     };
     let n = names.len();
@@ -25632,6 +25637,77 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             PCWSTR(connect.as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        append_group_items(menu, &tags, &folders);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let delete = wide(&format!("&Delete {n} connections...\tDel"));
+        let _ = AppendMenuW(menu, MF_STRING, DELETE as usize, PCWSTR(delete.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            CLEAR as usize,
+            w!("Clear the selection\tEsc"),
+        );
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    let action = match picked {
+        0 => return,
+        CLEAR => {
+            conn_view::clear_marks();
+            return;
+        }
+        DELETE => {
+            delete_many(hwnd, names);
+            return;
+        }
+        CONNECT_ALL => {
+            if n > 8
+                && dialog(
+                    hwnd,
+                    &format!("Connect to all {n} connections, a tab each?"),
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                ) != Some(IDYES)
+            {
+                return;
+            }
+            BulkAction::OpenAll(names)
+        }
+        p => {
+            group_pick(hwnd, p, names, &tags, &folders);
+            return;
+        }
+    };
+    run_bulk(hwnd, action);
+}
+
+/// The right-click items that tag, move or change connections `names`
+/// (one or several): Add tag, Remove tag, Move to folder, Change a field.
+/// Ids from [`GROUP_NO_FOLDER`] up; [`group_pick`] carries out the pick.
+///
+/// # Safety
+/// `menu` is a popup menu of ours, alive until the caller destroys it.
+unsafe fn append_group_items(menu: HMENU, tags: &crate::bulk::TagChoices, folders: &[String]) {
+    use crate::bulk::MAX_CHOICES;
+    use crate::native::wide;
+    const ADD_TAG: u32 = GROUP_ADD_TAG;
+    const REMOVE_TAG: u32 = GROUP_REMOVE_TAG;
+    const MOVE_TO: u32 = GROUP_MOVE_TO;
+    const EDIT: u32 = GROUP_EDIT;
+    const NO_FOLDER: u32 = GROUP_NO_FOLDER;
+    let fields = crate::bulk_edit::EditField::ALL;
+    // SAFETY: menus of ours; each submenu belongs to `menu` once appended.
+    unsafe {
         let sub = |label: &str, base: u32, list: &[String], empty: &str| {
             let Ok(popup) = CreatePopupMenu() else {
                 return;
@@ -25671,7 +25747,7 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             &tags.remove,
             "None of their own (ssh_config's Tag stays)",
         );
-        sub("&Move to folder", MOVE_TO, &folders, "");
+        sub("&Move to folder", MOVE_TO, folders, "");
         if let Ok(popup) = CreatePopupMenu() {
             for (i, f) in fields.iter().enumerate() {
                 let text = wide(&format!("{}...", f.label()));
@@ -25684,29 +25760,36 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             }
             let _ = AppendMenuW(menu, MF_POPUP, popup.0 as usize, w!("C&hange a field"));
         }
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let delete = wide(&format!("&Delete {n} connections...\tDel"));
-        let _ = AppendMenuW(menu, MF_STRING, DELETE as usize, PCWSTR(delete.as_ptr()));
-        let _ = AppendMenuW(
-            menu,
-            MF_STRING,
-            CLEAR as usize,
-            w!("Clear the selection\tEsc"),
-        );
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let chosen = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY,
-            pt.x,
-            pt.y,
-            None,
-            hwnd,
-            None,
-        );
-        let _ = DestroyMenu(menu);
-        u32::try_from(chosen.0).unwrap_or(0)
-    };
+    }
+}
+
+/// What [`append_group_items`] offers for `names`: the tags to add and
+/// remove, and the folders.
+fn group_choices(names: &[String]) -> Option<(crate::bulk::TagChoices, Vec<String>)> {
+    with_window(|w| {
+        let items = host_items(&ssh_env(), &w.settings);
+        let tags = crate::bulk::tag_choices(&items, &w.settings, names);
+        (tags, crate::bulk::folder_choices(&load_saved()))
+    })
+}
+
+const GROUP_NO_FOLDER: u32 = 99;
+const GROUP_ADD_TAG: u32 = 100;
+const GROUP_REMOVE_TAG: u32 = 200;
+const GROUP_MOVE_TO: u32 = 300;
+const GROUP_EDIT: u32 = 400;
+
+/// Carries out `picked` from [`append_group_items`] for `names`; false
+/// when it is not one of those items.
+fn group_pick(
+    hwnd: HWND,
+    picked: u32,
+    names: Vec<String>,
+    tags: &crate::bulk::TagChoices,
+    folders: &[String],
+) -> bool {
+    use crate::bulk::BulkAction;
+    let fields = crate::bulk_edit::EditField::ALL;
     let pick = |base: u32, list: &[String]| {
         picked
             .checked_sub(base)
@@ -25714,48 +25797,40 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             .cloned()
     };
     let action = match picked {
-        0 => return,
-        CLEAR => {
-            conn_view::clear_marks();
-            return;
-        }
-        DELETE => {
-            delete_many(hwnd, names);
-            return;
-        }
-        CONNECT_ALL => {
-            if n > 8
-                && dialog(
-                    hwnd,
-                    &format!("Connect to all {n} connections, a tab each?"),
-                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-                ) != Some(IDYES)
-            {
-                return;
-            }
-            BulkAction::OpenAll(names)
-        }
-        NO_FOLDER => BulkAction::MoveTo(names, None),
-        p if (EDIT..EDIT + 100).contains(&p) => {
-            if let Some(&field) = fields.get((p - EDIT) as usize) {
+        GROUP_NO_FOLDER => BulkAction::MoveTo(names, None),
+        p if (GROUP_EDIT..GROUP_EDIT + 100).contains(&p) => {
+            if let Some(&field) = fields.get((p - GROUP_EDIT) as usize) {
                 edit_many(hwnd, names, field);
             }
-            return;
+            return true;
         }
-        p if (MOVE_TO..MOVE_TO + 100).contains(&p) => match pick(MOVE_TO, &folders) {
-            Some(f) => BulkAction::MoveTo(names, Some(f)),
-            None => return,
-        },
-        p if (REMOVE_TAG..REMOVE_TAG + 100).contains(&p) => match pick(REMOVE_TAG, &tags.remove) {
-            Some(t) => BulkAction::RemoveTag(names, t),
-            None => return,
-        },
-        p if (ADD_TAG..ADD_TAG + 100).contains(&p) => match pick(ADD_TAG, &tags.add) {
-            Some(t) => BulkAction::AddTag(names, t),
-            None => return,
-        },
-        _ => return,
+        p if (GROUP_MOVE_TO..GROUP_MOVE_TO + 100).contains(&p) => {
+            match pick(GROUP_MOVE_TO, folders) {
+                Some(f) => BulkAction::MoveTo(names, Some(f)),
+                None => return true,
+            }
+        }
+        p if (GROUP_REMOVE_TAG..GROUP_REMOVE_TAG + 100).contains(&p) => {
+            match pick(GROUP_REMOVE_TAG, &tags.remove) {
+                Some(t) => BulkAction::RemoveTag(names, t),
+                None => return true,
+            }
+        }
+        p if (GROUP_ADD_TAG..GROUP_ADD_TAG + 100).contains(&p) => {
+            match pick(GROUP_ADD_TAG, &tags.add) {
+                Some(t) => BulkAction::AddTag(names, t),
+                None => return true,
+            }
+        }
+        _ => return false,
     };
+    run_bulk(hwnd, action);
+    true
+}
+
+/// Runs `action` on its connections, asking first when it takes
+/// security limits away.
+fn run_bulk(hwnd: HWND, action: crate::bulk::BulkAction) {
     // A tag removed or a folder left can take security limits away. A
     // Yes holds for the losses it answered: if the rules changed while it
     // was open and any loss differs now, even one past those the question
@@ -25818,7 +25893,7 @@ fn edit_many(hwnd: HWND, names: Vec<String>, field: crate::bulk_edit::EditField)
         return;
     };
     let n = targets.len();
-    let title = format!("Change {} on {n} connections", field.label());
+    let title = format!("Change {} on {n} connection{}", field.label(), plural(n));
     let now = match &start {
         Some(v) if v.is_empty() => "They all have it empty now.".to_owned(),
         Some(v) => format!("They all have {v} now."),
