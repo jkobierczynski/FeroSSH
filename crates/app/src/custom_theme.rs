@@ -415,7 +415,8 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
 /// what [`load`] read. A team theme is used instead of this PC's theme
 /// of the same name, as the team's rules come before the user's; the
 /// PC's file is then listed as not used. A team theme that cannot be
-/// read is listed too. Still at most [`MAX`]: the PC's own go first.
+/// read is listed too. Still at most [`MAX`]: the PC's own go first, and
+/// team themes past it are left out.
 pub fn add_team(loaded: &mut Loaded, team: &[String]) {
     let (themes, broken) = loaded;
     let mut added: Vec<CustomTheme> = Vec::new();
@@ -454,18 +455,14 @@ pub fn add_team(loaded: &mut Loaded, team: &[String]) {
         }
         !shadowed
     });
-    let room = MAX.saturating_sub(added.len());
-    for own in themes.drain(room.min(themes.len())..).collect::<Vec<_>>() {
+    // The PC's own stay; team themes past the limit are left out.
+    let room = MAX.saturating_sub(themes.len());
+    for extra in added.drain(room.min(added.len())..) {
         broken.push(Broken {
-            file: own
-                .path
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            reason: format!("more than {MAX} themes with the team library's"),
+            file: format!("team library theme {}", extra.theme.name),
+            reason: format!("more than {MAX} themes with this PC's"),
         });
     }
-    added.truncate(MAX);
     themes.extend(added);
     themes.sort_by_key(|t| t.theme.name.to_lowercase());
 }
@@ -474,6 +471,24 @@ pub fn add_team(loaded: &mut Loaded, team: &[String]) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_list_keeps_the_pcs_own_themes() {
+        let own: Vec<CustomTheme> = (0..MAX)
+            .map(|i| parse(&format!("Name Own {i:02}\n"), "x").unwrap())
+            .collect();
+        let mut loaded: Loaded = (own, Vec::new());
+        add_team(
+            &mut loaded,
+            &["Name Own 07\n".into(), "Name Extra\n".into()],
+        );
+        let (themes, broken) = loaded;
+        assert_eq!(themes.len(), MAX);
+        // The same name still replaces; the new one does not fit.
+        assert!(themes.iter().any(|t| t.theme.name == "Own 07" && t.team));
+        assert!(!themes.iter().any(|t| t.theme.name == "Extra"));
+        assert!(broken.iter().any(|b| b.file.ends_with("Extra")));
+    }
 
     #[test]
     fn team_themes_replace_local_ones_of_the_same_name() {

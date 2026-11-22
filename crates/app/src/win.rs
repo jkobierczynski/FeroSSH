@@ -16585,9 +16585,24 @@ impl Window {
         crate::team_lib::set_current(loaded.team.clone());
         let themes_changed = loaded.team.themes != self.settings.team.themes;
         self.settings.team = loaded.team;
-        if themes_changed && let Ok((themes, _)) = load_custom_themes() {
-            // The team's themes for connections opened from now on.
-            self.custom_themes = themes;
+        if themes_changed {
+            // The team's themes for connections opened from now on, and in
+            // Settings > Custom themes (whose ids index the list, and which
+            // the command palette reads).
+            match custom_themes_menu(self.menu) {
+                Some(menu) => self.fill_custom_themes(menu),
+                None => {
+                    if let Ok((themes, _)) = load_custom_themes() {
+                        self.custom_themes = themes;
+                    }
+                }
+            }
+            // New tabs: the default theme as registered now (a team theme
+            // may have replaced a local one of its name); open panes keep
+            // their colours.
+            if let Some(t) = Theme::by_name(self.default_theme.name) {
+                self.default_theme = t;
+            }
         }
         self.reload_sessions(None);
         if self.rules_native() {

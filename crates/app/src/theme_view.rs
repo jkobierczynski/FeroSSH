@@ -10,6 +10,8 @@
 
 use ferossh_config::ThemeRule;
 
+use crate::rules_view::clean_all;
+
 /// A saved connection, as theme rules see it: what matches a rule.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Connection {
@@ -324,13 +326,7 @@ pub fn text(row: &Row, column: Column) -> String {
 }
 
 fn clean(text: &str) -> String {
-    text.chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        })
-        .take(400)
-        .collect()
+    clean_all(text).chars().take(400).collect()
 }
 
 /// The rows a search keeps: every word in a row's name, details,
@@ -419,18 +415,15 @@ pub fn details(row: &Row) -> String {
         ),
         _ => "A built-in rule: it always applies and cannot be changed.".to_owned(),
     };
-    let names: Vec<String> = row.used_by.iter().map(|n| clean(n)).collect();
+    let names: Vec<String> = row.used_by.iter().map(|n| clean_all(n)).collect();
     let covers = match names.len() {
         0 => "It covers no saved connection yet.".to_owned(),
-        n => format!(
-            "Connections it covers ({n}): {}",
-            crate::bulk::name_list(&names)
-        ),
+        n => format!("Connections it covers ({n}): {}", names.join(", ")),
     };
     format!(
         "{what}\n\nMatches: {}\nSets: {}\n\n{covers}",
-        clean(&row.name),
-        clean(&row.details)
+        clean_all(&row.name),
+        clean_all(&row.details)
     )
 }
 
@@ -601,7 +594,7 @@ mod tests {
     fn team_rules_and_themes_show_apart_and_cannot_be_changed() {
         let team = [ThemeRule::new("Sandstorm").tags(&["db"])];
         let mine = [ThemeRule::new("Dracula").tags(&["lab"])];
-        let all = [conn("db1", &["db"])];
+        let all: Vec<Connection> = (1..=13).map(|i| conn(&format!("db{i}"), &["db"])).collect();
         let rows = rows(
             &team,
             &mine,
@@ -613,7 +606,7 @@ mod tests {
         let mut on: Vec<&Row> = on_page(&rows, Page::Rules);
         sort(&mut on, None, false);
         assert_eq!(on[0].group, Group::TeamRules, "tried first, listed first");
-        assert_eq!(on[0].used_by, ["db1"]);
+        assert_eq!(on[0].used_by.len(), 13);
         assert!(!on[0].is_own_rule());
         assert_eq!(on[1].group, Group::Rules);
         let sand = rows.iter().find(|r| r.name == "Sandstorm").unwrap();
@@ -625,7 +618,10 @@ mod tests {
         let d = details(on[0]);
         assert!(d.starts_with("Team rule 1: from the team library"), "{d}");
         assert!(d.contains("Matches: tags db") && d.contains("Sets: Sandstorm"));
-        assert!(d.contains("db1"));
+        for i in 1..=13 {
+            assert!(d.contains(&format!("db{i}")), "every connection: {d}");
+        }
+        assert!(!d.contains("more"));
     }
 
     #[test]

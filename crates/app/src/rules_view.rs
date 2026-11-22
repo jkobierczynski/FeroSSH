@@ -134,12 +134,17 @@ fn limits_text(rule: &SecurityRule) -> String {
 }
 
 fn clean(text: &str) -> String {
+    clean_all(text).chars().take(400).collect()
+}
+
+/// `text` without control and direction characters, whole: for the
+/// details of a rule, which must show all of it.
+pub fn clean_all(text: &str) -> String {
     text.chars()
         .filter(|c| {
             !c.is_control()
                 && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         })
-        .take(400)
         .collect()
 }
 
@@ -222,7 +227,7 @@ pub fn details(row: &Row) -> String {
         if w.is_empty() {
             "(any)".to_owned()
         } else {
-            clean(&w.join(" "))
+            clean_all(&w.join(" "))
         }
     };
     let r = &row.rule;
@@ -239,21 +244,18 @@ pub fn details(row: &Row) -> String {
         text.push_str(" none");
     }
     for l in limits {
-        text.push_str(&format!("\n  - {}", clean(l)));
+        text.push_str(&format!("\n  - {}", clean_all(l)));
     }
     if !r.unknown.is_empty() {
         text.push_str(&format!(
             "\n  - not understood by this FeroSSH, so not applied: {}",
-            clean(&r.describe_unknown())
+            clean_all(&r.describe_unknown())
         ));
     }
-    let names: Vec<String> = row.used_by.iter().map(|n| clean(n)).collect();
+    let names: Vec<String> = row.used_by.iter().map(|n| clean_all(n)).collect();
     text.push_str(&match names.len() {
         0 => "\n\nIt covers no connection in the connection manager yet.".to_owned(),
-        n => format!(
-            "\n\nConnections it covers ({n}): {}",
-            crate::bulk::name_list(&names)
-        ),
+        n => format!("\n\nConnections it covers ({n}): {}", names.join(", ")),
     });
     text
 }
@@ -364,7 +366,7 @@ mod tests {
             },
             ..SecurityRule::default()
         }];
-        let all: Vec<Connection> = (1..=5)
+        let all: Vec<Connection> = (1..=13)
             .map(|i| Connection {
                 name: format!("web{i}"),
                 tags: vec!["prod".into()],
@@ -376,11 +378,10 @@ mod tests {
         assert!(d.starts_with("Team rule 1: from the team library"), "{d}");
         assert!(d.contains("Tags: prod"));
         assert!(d.contains("Hosts: (any)"));
-        assert!(
-            d.contains("web5"),
-            "every connection, not the first three: {d}"
-        );
-        assert!(d.contains("Connections it covers (5)"));
+        for i in 1..=13 {
+            assert!(d.contains(&format!("web{i}")), "every connection: {d}");
+        }
+        assert!(d.contains("Connections it covers (13)") && !d.contains("more"));
         for l in team[0].limits.describe() {
             assert!(d.contains(l));
         }

@@ -175,6 +175,20 @@ pub(super) fn export_team(hwnd: HWND) {
     }) else {
         return;
     };
+    // FeroSSH refuses a library past this size, so none is written.
+    if bytes.len() > ferossh_config::team::MAX_LEN {
+        dialog(
+            hwnd,
+            &format!(
+                "The team library would be {} KB, more than the {} KB FeroSSH reads, so it \
+                 was not exported. Leave out connections or custom themes and try again.",
+                bytes.len() / 1024,
+                ferossh_config::team::MAX_LEN / 1024
+            ),
+            MB_OK | MB_ICONWARNING,
+        );
+        return;
+    }
     let start = home().join("Documents").join("team.ferossh-library");
     let Some(path) = save_file(hwnd, w!("Export team library to"), &start, TEAM_FILTER) else {
         return;
