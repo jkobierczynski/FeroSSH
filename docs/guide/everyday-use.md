@@ -176,7 +176,7 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 **Saved searches.** Right-click the connection manager while a search is typed and choose *Save this search as a folder*. The search then shows as a folder named *Search: tag:prod* above the others, listing the connections it finds at that moment; it starts closed. Right-click that folder and choose *Remove this saved search* to drop it. Saved searches are kept in `ferossh.conf` (`SavedSearch`).
 
-**Several connections at once.** Ctrl+click connections to select several (the one already selected comes along), Shift+click to select a run of them, Ctrl+A to select every connection listed (a search narrows it first), and Ctrl+Space to add or take out the selected one. Selected connections are highlighted; a plain click or Escape clears the selection. Right-click one of them for a menu that acts on them all:
+**Several connections at once.** Ctrl+click connections to select several (the one already selected comes along), Shift+click to select a run of them, Ctrl+A to select every connection listed (a search narrows it first), and Ctrl+Space to add or take out the selected one. Selected connections are highlighted; a plain click or Escape clears the selection. Right-click one of them for a menu that acts on them all (Add tag, Remove tag, Move to folder and Change a field are also on the menu of a single connection):
 
 - **Connect to all**: a tab each (FeroSSH asks first when there are more than eight).
 - **Add tag** and **Remove tag**: any tag already used by a connection can be added; a connection's own tags can be removed, while a tag from ssh_config's `Tag` stays. To use a brand-new tag, give it to one connection in its form first.
@@ -239,6 +239,16 @@ Tools > Security rules (the padlock on the tools rail) lists, in the tools pane,
 - **Delete...** asks first, and names the connections that lose its limits.
 
 Changes apply to connections opened from then on. The rules are `SecurityRule` blocks in `ferossh.conf`, and you can still write them there; see [Settings](settings.md#security-rules).
+
+#### When a connection loses limits
+
+Rules don't belong to a connection: they match it by tag, folder or name each time it connects. Removing a tag, moving a connection to another folder, renaming it, an import, a hand edit of the files, a deleted rule or a team library that could not be read can all take limits away without anyone meaning to.
+
+When you make such a change in FeroSSH (Remove tag or Move to folder on a selection, or saving or renaming a connection in its form), it first names each connection that would lose limits, with the limits, and asks. The rules themselves stay as they are: they just no longer cover those connections. Each connection in the connection manager keeps to its own tags and folder, so only the connections you change are listed. Imports already keep your tags and folders.
+
+So FeroSSH also remembers the limits each connection had when it last connected, and asks before connecting when one of them is gone. The question names each connection on the way (jump hosts too) and the limits it no longer has. **No** leaves the pane unconnected, and the question comes again next time. **Yes** connects, takes the new set of limits as the one to compare with from then on, and adds a line to `limit-changes.log`. A Yes holds only for what the question showed: if more limits went, or the connection now goes elsewhere, while it was open, FeroSSH keeps the old record and asks again. If `limits.conf` or `limit-changes.log` cannot be written, the connection still goes ahead and a notice says so; the record then stays as it was, so the next connection asks again. A typed address is compared with what every connection to that host had, as it gets their limits, and a rename in FeroSSH keeps the record. This covers SSH, SFTP, Telnet and WinRM connections and their jump hosts. Desktops opened directly or through Via SSH, and remote apps, are not compared yet; for a desktop through Via SSH, the SSH login to the Via host is. A pane that reconnects (Enter on an ended pane, an automatic retry) keeps the session it had and is not asked again, as with ConfirmConnect.
+
+Both files are in FeroSSH's folder for this PC (`%LOCALAPPDATA%\FeroSSH`, or `FeroSSH-data\local` beside a portable exe): `limits.conf` holds the last limits per connection and `limit-changes.log` lists every connection made with fewer. They are not protected. Deleting them only means the next connection starts a new record without asking. They are there to catch changes nobody meant, and a team library is what stops a user from loosening a team's rules.
 
 ### Team library
 

@@ -913,6 +913,9 @@ struct PendingConnect {
     endpoint: String,
     /// What the request that connected does once the answer is Yes.
     after: AfterConfirm,
+    /// Those of them with fewer limits than when they last connected:
+    /// noted in `limit-changes.log` once the answer is Yes.
+    lowered: Vec<crate::limits_store::Lowered>,
 }
 
 /// What a connection that waited for a security rule's answer still has
@@ -1505,6 +1508,9 @@ struct Window {
     /// Renames and deletes the inventory file could not take yet: done
     /// first at its next change, so it follows the connections in the end.
     inventory_pending: Vec<InventoryFix>,
+    /// The connection form's next save was asked about the security
+    /// limits it takes away, and the answer was Yes.
+    form_losses_ok: Option<LossAsk>,
     /// Show what changed: each running git's channel, and its tab.
     diffs: HashMap<ChannelId, PaneId>,
     /// The server status bar's samples, by their channel: one per
@@ -1632,6 +1638,9 @@ struct Window {
     /// Panes whose next connection a security rule's question already
     /// allowed, with the endpoint the answer was for.
     connect_confirmed: HashMap<PaneId, String>,
+    /// The lost limits a pane's Yes was given for, beside its endpoint in
+    /// `connect_confirmed`.
+    limits_approved: HashMap<PaneId, Vec<crate::limits_store::Lowered>>,
     /// Panes waiting for an answer to a security rule's question; no
     /// other request takes them meanwhile.
     connect_pending: HashMap<PaneId, PendingConnect>,
@@ -1964,6 +1973,32 @@ fn app_dir() -> PathBuf {
 
 /// FeroSSH's folder for what stays on this PC: `%LOCALAPPDATA%\FeroSSH`,
 /// or `local` in a portable FeroSSH's data folder.
+/// The question before connecting to `destination` (`endpoint`): a rule
+/// asks first (`confirm`), or connections on the way have fewer limits
+/// than when they last connected (`lowered`, one per line).
+fn confirm_connect_text(destination: &str, endpoint: &str, confirm: bool, lowered: &str) -> String {
+    let where_to = format!(
+        "{} ({})",
+        crate::ssh::sanitize_line(destination),
+        crate::ssh::sanitize_line(endpoint)
+    );
+    if lowered.is_empty() {
+        return format!("A security rule asks before connecting to {where_to}. Connect now?");
+    }
+    let ask = if confirm {
+        "A security rule also asks before connecting. "
+    } else {
+        ""
+    };
+    format!(
+        "Fewer security limits apply to {where_to} than when it last connected. \
+         These no longer apply:\n\n{lowered}\n\n\
+         A tag, folder or name may have changed (in FeroSSH, by hand or by an import), \
+         a rule may have been removed, or the team library was not loaded. \
+         Connecting anyway is noted in limit-changes.log.\n\n{ask}Connect anyway?"
+    )
+}
+
 fn local_dir() -> PathBuf {
     crate::portable::local_dir().unwrap_or_else(|| PathBuf::from(".").join("FeroSSH"))
 }
@@ -2949,6 +2984,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 system_reads: HashMap::new(),
                 inventory_renames: HashMap::new(),
                 inventory_pending: Vec::new(),
+                form_losses_ok: None,
                 diffs: HashMap::new(),
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
@@ -2995,6 +3031,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 workspace_after: HashMap::new(),
                 workspace_asks: Vec::new(),
                 connect_confirmed: HashMap::new(),
+                limits_approved: HashMap::new(),
                 connect_pending: HashMap::new(),
                 connect_asked: 0,
                 workspace_names: Vec::new(),
@@ -5990,6 +6027,9 @@ impl Window {
             Some(InventoryFix::Rename(old.to_owned(), new.to_owned())),
             |_| {},
         );
+        // The limits it had follow it too, so a rename alone is not
+        // taken for a connection without a past.
+        crate::limits_store::renamed(old, new);
     }
 
     /// What the inventory's system command printed, or that it ended.
@@ -7438,27 +7478,57 @@ impl Window {
         extras: &Extras,
         env: &Env,
     ) -> bool {
-        if !self.settings.has_security_rules() {
+        // The limits each connection on the way had when it last
+        // connected: one gone (a tag, folder or name changed, a rule
+        // removed, the team library not loaded) is asked about, even when
+        // no rule is left at all.
+        let checks = self.limit_checks(destination, env);
+        let lowered = crate::limits_store::lowered(&checks);
+        if !self.settings.has_security_rules() && lowered.is_empty() {
             self.connect_confirmed.remove(&id);
+            self.limits_approved.remove(&id);
+            self.keep_limits(&checks, &[]);
             return true;
         }
         let (alias, endpoint, confirm) = self.connect_subject(destination, env);
         // A Yes holds for the endpoint and route it was given for: one
         // that changed meanwhile (an edited HostName, jump host or proxy)
         // is asked about again, even if no rule matches it now.
+        // ... and for the lost limits it was shown: one more lost since
+        // is asked about again.
+        let shown = self.limits_approved.remove(&id).unwrap_or_default();
         match self.connect_confirmed.remove(&id) {
-            Some(approved) if approved == endpoint => return true,
+            Some(approved)
+                if approved == endpoint && crate::limits_store::covered(&lowered, &shown) =>
+            {
+                return true;
+            }
             Some(_) => {}
-            None if !confirm => return true,
+            None if !confirm && lowered.is_empty() => {
+                self.keep_limits(&checks, &[]);
+                return true;
+            }
             None => {}
         }
-        self.show(
-            id,
-            &format!(
-                "\x1b[0;90mA security rule asks before connecting to {}.\x1b[0m\r\n",
-                crate::ssh::sanitize_line(&alias)
-            ),
-        );
+        if confirm {
+            self.show(
+                id,
+                &format!(
+                    "\x1b[0;90mA security rule asks before connecting to {}.\x1b[0m\r\n",
+                    crate::ssh::sanitize_line(&alias)
+                ),
+            );
+        }
+        let lowered_text = crate::limits_store::describe(&lowered);
+        if !lowered.is_empty() {
+            self.show(
+                id,
+                &format!(
+                    "\x1b[0;33mFewer security limits than when last connected: {}.\x1b[0m\r\n",
+                    lowered_text.replace('\n', "; ")
+                ),
+            );
+        }
         self.connect_asked += 1;
         let token = self.connect_asked;
         self.connect_pending.insert(
@@ -7467,6 +7537,7 @@ impl Window {
                 token,
                 endpoint: endpoint.clone(),
                 after: AfterConfirm::Plain,
+                lowered,
             },
         );
         self.workspace_asks.push(Command::ConfirmConnect {
@@ -7475,6 +7546,8 @@ impl Window {
             destination: destination.to_owned(),
             endpoint,
             extras: extras.clone(),
+            confirm,
+            lowered: lowered_text,
         });
         // SAFETY: our window; replaces any earlier timer with this id.
         unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
@@ -7524,6 +7597,69 @@ impl Window {
                 })
             }
             _ => WinrmTarget::typed(destination),
+        }
+    }
+
+    /// Every connection on the way to `destination` (the jump hosts and
+    /// the host) with the limits the security rules give it now.
+    fn limit_checks(&self, destination: &str, env: &Env) -> Vec<crate::limits_store::Check> {
+        use crate::limits_store::Check;
+        // A saved connection is compared with its own record only, as it
+        // keeps to its own rules; an address typed or an alias not saved
+        // with every record for its machine, whose limits it gets.
+        let saved = self.rule_connections();
+        let check = |alias: &str, hostname: Option<&str>, tag: Option<&str>| Check {
+            name: alias.to_owned(),
+            machine: if saved.iter().any(|c| c.name.eq_ignore_ascii_case(alias)) {
+                alias.to_owned()
+            } else {
+                hostname.unwrap_or(alias).to_owned()
+            },
+            now: self.policy_of(alias, hostname, tag),
+        };
+        if ferossh_config::ssh_config::sftp_url(destination).is_none() {
+            if let Some(t) = self.telnet_target(destination, env) {
+                return vec![check(&t.alias, Some(&t.hostname), t.tag.as_deref())];
+            }
+            if let Some(t) = self.winrm_target(destination, env) {
+                return vec![check(&t.alias, Some(&t.hostname), t.tag.as_deref())];
+            }
+        }
+        let lookup = ferossh_config::ssh_config::sftp_url(destination)
+            .map_or_else(|| destination.to_owned(), |(d, _)| d);
+        let Some(target) = Target::resolve(&lookup, env) else {
+            return vec![check(&lookup, None, None)];
+        };
+        let mut out: Vec<Check> = target
+            .jumps
+            .iter()
+            .map(|hop| check(&hop.alias, Some(&hop.hostname), hop.tag.as_deref()))
+            .collect();
+        out.push(check(
+            &target.alias,
+            Some(&target.hostname),
+            target.tag.as_deref(),
+        ));
+        out
+    }
+
+    /// Keeps `checks`' limits as those they had when last connected, and
+    /// notes `accepted` (fewer limits, connected anyway). A file that
+    /// cannot be written does not stop the connection: a notice says so,
+    /// and the next connection asks again.
+    fn keep_limits(
+        &mut self,
+        checks: &[crate::limits_store::Check],
+        accepted: &[crate::limits_store::Lowered],
+    ) {
+        if accepted.is_empty() && !crate::limits_store::changes(checks) {
+            return;
+        }
+        if let Err(e) = crate::limits_store::keep(checks, accepted, crate::inventory_view::now()) {
+            self.queued.push(Command::Notice(format!(
+                "FeroSSH could not note the security limits in limits.conf or limit-changes.log \
+                 ({e}). It asks about them again next time."
+            )));
         }
     }
 
@@ -7603,7 +7739,22 @@ impl Window {
             return;
         };
         if yes {
+            // Kept (and logged) only while what is lost now is what the
+            // question showed: a limit lost meanwhile is asked about
+            // first, and a No to that leaves the record and log alone.
+            // ... and only for the endpoint it was asked about: another
+            // (an edited HostName meanwhile) is asked about again.
+            let env = ssh_env();
+            let checks = self.limit_checks(destination, &env);
+            let lowered = crate::limits_store::lowered(&checks);
+            let (_, endpoint, _) = self.connect_subject(destination, &env);
+            if endpoint == pending.endpoint
+                && crate::limits_store::covered(&lowered, &pending.lowered)
+            {
+                self.keep_limits(&checks, &lowered);
+            }
             self.connect_confirmed.insert(id, pending.endpoint);
+            self.limits_approved.insert(id, pending.lowered);
             match pending.after {
                 AfterConfirm::Plain => self.connect_with(id, destination, extras),
                 AfterConfirm::Run => {
@@ -7628,9 +7779,11 @@ impl Window {
             // Asked again (the endpoint changed): no Yes left over.
             if self.connect_pending.contains_key(&id) {
                 self.connect_confirmed.remove(&id);
+                self.limits_approved.remove(&id);
             }
         } else {
             self.connect_confirmed.remove(&id);
+            self.limits_approved.remove(&id);
             if matches!(pending.after, AfterConfirm::Run) {
                 self.fail_run_row(id, "not confirmed".into());
             }
@@ -7735,9 +7888,13 @@ impl Window {
             folder: folder.as_deref(),
         };
         let mut lines = ferossh_config::host_policy::not_understood(&rules, &subject);
-        // Rules follow the machine: so do the lines they are missing.
+        // Rules follow the machine to an address typed or an alias not
+        // saved: so do the lines they are missing. A saved connection
+        // keeps to its own.
         let here = ferossh_config::host_policy::machine(&subject);
-        for c in self.rule_connections() {
+        let all = self.rule_connections();
+        let saved = all.iter().any(|c| c.name.eq_ignore_ascii_case(alias));
+        for c in all.into_iter().filter(|_| !saved) {
             let peer = Subject {
                 name: &c.name,
                 hostname: c.hostname.as_deref(),
@@ -15908,6 +16065,17 @@ impl Window {
                         crate::ssh::sanitize_line(&name)
                     )));
                 }
+                // A tag, folder, host or name changed can take security
+                // limits away: asked first, unless answered already.
+                // A Yes holds for the losses it answered: when any differs
+                // now (a rule changed meanwhile), even one past those the
+                // question lists, it is asked again.
+                let answered = self.form_losses_ok.take();
+                if let Some(ask) = self.form_loss_question(form, &hosts, &settings, &name)
+                    && answered.as_ref() != Some(&ask)
+                {
+                    return Some(Command::ConfirmFormLosses { ask, connect });
+                }
                 // The inventory follows a renamed connection (a read-only one
                 // saved under a new name is a copy: it has none yet).
                 let renamed = form
@@ -15973,6 +16141,57 @@ impl Window {
         }
         self.refresh_chrome();
         out
+    }
+
+    /// [`Self::loss_question`] for the connection form saving connection
+    /// `name` into `hosts` and `settings`.
+    fn form_loss_question(
+        &self,
+        form: &SessionForm,
+        hosts: &[saved::SavedHost],
+        settings: &Settings,
+        name: &str,
+    ) -> Option<LossAsk> {
+        let original = form.original.as_deref()?;
+        // A read-only connection saved under a new name is a copy: the
+        // original stays as it was.
+        if matches!(form.source, Source::ReadOnly(_)) && !original.eq_ignore_ascii_case(name) {
+            return None;
+        }
+        let before = self.rule_connections();
+        let was = before
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(original))?;
+        let saved = hosts.iter().find(|h| h.alias.eq_ignore_ascii_case(name));
+        let ssh_tag = Target::resolve(name, &ssh_env()).and_then(|t| t.tag);
+        let to = crate::rules_view::Connection {
+            name: name.to_owned(),
+            hostname: saved
+                .map(|h| h.hostname.clone().unwrap_or_else(|| name.to_owned()))
+                .or_else(|| was.hostname.clone()),
+            tags: ferossh_config::settings::host_tags(ssh_tag.as_deref(), settings.profile(name)),
+            folder: match saved {
+                Some(h) => h.folder.clone(),
+                None => was.folder.clone(),
+            },
+        };
+        let what = if original.eq_ignore_ascii_case(name) {
+            format!("Save {}", crate::ssh::sanitize_line(name))
+        } else {
+            format!(
+                "Rename {} to {}",
+                crate::ssh::sanitize_line(original),
+                crate::ssh::sanitize_line(name)
+            )
+        };
+        self.loss_question(
+            settings,
+            &[crate::rules_view::Changed {
+                from: original.to_owned(),
+                to,
+            }],
+            &what,
+        )
     }
 
     /// Saved WinRM connection `name` as the settings describe it now: its
@@ -16648,6 +16867,127 @@ impl Window {
             )));
         }
         own
+    }
+
+    /// The question before `changes` (made with settings `after`) when
+    /// they take security limits away from any connection; `what` names
+    /// the change. `None` when nothing is lost.
+    fn loss_question(
+        &self,
+        after: &Settings,
+        changes: &[crate::rules_view::Changed],
+        what: &str,
+    ) -> Option<LossAsk> {
+        let rules = |s: &Settings| -> Vec<SecurityRule> {
+            s.team
+                .security_rules
+                .iter()
+                .chain(&s.security_rules)
+                .cloned()
+                .collect()
+        };
+        if changes.is_empty() || !self.settings.has_security_rules() {
+            return None;
+        }
+        let lost = crate::rules_view::lost_limits(
+            &rules(&self.settings),
+            &rules(after),
+            &self.rule_connections(),
+            changes,
+        );
+        (!lost.is_empty()).then(|| LossAsk {
+            question: crate::rules_view::loss_question(
+                what,
+                &lost,
+                &changes
+                    .iter()
+                    .map(|c| c.to.name.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            lost,
+        })
+    }
+
+    /// [`Self::loss_question`] for a right-click action on several
+    /// connections: removing a tag or moving them to another folder.
+    fn bulk_loss_question(&self, action: &crate::bulk::BulkAction) -> Option<LossAsk> {
+        use crate::bulk::BulkAction;
+        use crate::rules_view::Changed;
+        let own = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .filter(|n| !self.settings.is_team(n))
+                .cloned()
+                .collect()
+        };
+        let before = self.rule_connections();
+        let picked = |names: &[String]| -> Vec<crate::rules_view::Connection> {
+            before
+                .iter()
+                .filter(|c| names.iter().any(|n| n.eq_ignore_ascii_case(&c.name)))
+                .cloned()
+                .collect()
+        };
+        let mut after = self.settings.clone();
+        let (changes, what): (Vec<Changed>, String) = match action {
+            BulkAction::RemoveTag(names, tag) => {
+                let names = own(names);
+                crate::bulk::remove_tag(&mut after, &names, tag);
+                let env = ssh_env();
+                let changes = picked(&names)
+                    .into_iter()
+                    .map(|c| {
+                        // ssh_config's own Tag stays.
+                        let ssh_tag = Target::resolve(&c.name, &env).and_then(|t| t.tag);
+                        Changed {
+                            from: c.name.clone(),
+                            to: crate::rules_view::Connection {
+                                tags: ferossh_config::settings::host_tags(
+                                    ssh_tag.as_deref(),
+                                    after.profile(&c.name),
+                                ),
+                                ..c
+                            },
+                        }
+                    })
+                    .collect();
+                (
+                    changes,
+                    format!(
+                        "Remove tag {} from {} connection{}",
+                        crate::ssh::sanitize_line(tag),
+                        names.len(),
+                        plural(names.len())
+                    ),
+                )
+            }
+            BulkAction::MoveTo(names, folder) => {
+                let (mine, _) = crate::bulk::saved_only(&load_saved(), &own(names));
+                let changes = picked(&mine)
+                    .into_iter()
+                    .map(|c| Changed {
+                        from: c.name.clone(),
+                        to: crate::rules_view::Connection {
+                            folder: folder.clone(),
+                            ..c
+                        },
+                    })
+                    .collect();
+                (
+                    changes,
+                    format!(
+                        "Move {} connection{} to {}",
+                        mine.len(),
+                        plural(mine.len()),
+                        folder
+                            .as_deref()
+                            .map_or_else(|| "no folder".to_owned(), crate::ssh::sanitize_line)
+                    ),
+                )
+            }
+            _ => return None,
+        };
+        self.loss_question(&after, &changes, &what)
     }
 
     /// Reads the hosts again after a session was saved or deleted.
@@ -22801,6 +23141,15 @@ struct CrowdedOffer {
     others: u32,
 }
 
+/// A question about security limits an edit takes away, with every
+/// connection's loss it stands for: the text lists only the first few, so
+/// a Yes is matched against all of them.
+#[derive(Clone, Debug, PartialEq)]
+struct LossAsk {
+    question: String,
+    lost: Vec<(String, Policy)>,
+}
+
 enum Command {
     Id(u32),
     /// A Windows notification about a pane ([`crate::toast`]).
@@ -22846,9 +23195,20 @@ enum Command {
         /// Where it goes, as resolved when asked.
         endpoint: String,
         extras: Extras,
+        /// Whether a rule asks first.
+        confirm: bool,
+        /// The connections with fewer limits than when last connected,
+        /// one per line; empty when none.
+        lowered: String,
     },
     /// A security rule requires pane `0`'s session log, which failed.
     LogRequired(PaneId),
+    /// The connection form's save takes security limits away: asks, and
+    /// saves (and connects, when `connect`) on Yes.
+    ConfirmFormLosses {
+        ask: LossAsk,
+        connect: bool,
+    },
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
     /// Settings > Key bindings: the window that changes them.
@@ -24307,6 +24667,12 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     const NEW: u32 = 5;
     const SAVE_SEARCH: u32 = 6;
     const REMOVE_SEARCH: u32 = 7;
+    // A connection of one's own can be tagged, moved and changed as with
+    // several selected (a team one cannot).
+    let group = host
+        .as_ref()
+        .filter(|h| with_window(|w| !w.settings.is_team(h)).unwrap_or(false))
+        .and_then(|h| group_choices(std::slice::from_ref(h)));
     // The search typed, when there is one to save.
     let typed = with_window(|w| {
         let q = w.side.list.query().trim().to_owned();
@@ -24341,6 +24707,10 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
                 w!("&Delete connection...\tDel"),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            if let Some((tags, folders)) = &group {
+                append_group_items(menu, tags, folders);
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            }
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
         if typed.is_some() || search.is_some() {
@@ -24376,6 +24746,11 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
         let _ = DestroyMenu(menu);
         u32::try_from(chosen.0).unwrap_or(0)
     };
+    if let (Some(h), Some((tags, folders))) = (&host, &group)
+        && group_pick(hwnd, picked, vec![h.clone()], tags, folders)
+    {
+        return;
+    }
     let action = match (picked, host) {
         (CONNECT, Some(host)) => SideAction::Open { host, split: false },
         (SPLIT, Some(host)) => SideAction::Open { host, split: true },
@@ -25319,22 +25694,12 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
 /// The connection manager's right-click menu with several hosts
 /// selected: connect to them all, tag them, move them, delete them.
 fn bulk_menu(hwnd: HWND, names: Vec<String>) {
-    use crate::bulk::{BulkAction, MAX_CHOICES};
+    use crate::bulk::BulkAction;
     use crate::native::wide;
     const CONNECT_ALL: u32 = 1;
     const DELETE: u32 = 2;
     const CLEAR: u32 = 3;
-    const NO_FOLDER: u32 = 4;
-    const ADD_TAG: u32 = 100;
-    const REMOVE_TAG: u32 = 200;
-    const MOVE_TO: u32 = 300;
-    const EDIT: u32 = 400;
-    let fields = crate::bulk_edit::EditField::ALL;
-    let Some((tags, folders)) = with_window(|w| {
-        let items = host_items(&ssh_env(), &w.settings);
-        let tags = crate::bulk::tag_choices(&items, &w.settings, &names);
-        (tags, crate::bulk::folder_choices(&load_saved()))
-    }) else {
+    let Some((tags, folders)) = group_choices(&names) else {
         return;
     };
     let n = names.len();
@@ -25355,6 +25720,77 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             PCWSTR(connect.as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        append_group_items(menu, &tags, &folders);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let delete = wide(&format!("&Delete {n} connections...\tDel"));
+        let _ = AppendMenuW(menu, MF_STRING, DELETE as usize, PCWSTR(delete.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            CLEAR as usize,
+            w!("Clear the selection\tEsc"),
+        );
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    let action = match picked {
+        0 => return,
+        CLEAR => {
+            conn_view::clear_marks();
+            return;
+        }
+        DELETE => {
+            delete_many(hwnd, names);
+            return;
+        }
+        CONNECT_ALL => {
+            if n > 8
+                && dialog(
+                    hwnd,
+                    &format!("Connect to all {n} connections, a tab each?"),
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                ) != Some(IDYES)
+            {
+                return;
+            }
+            BulkAction::OpenAll(names)
+        }
+        p => {
+            group_pick(hwnd, p, names, &tags, &folders);
+            return;
+        }
+    };
+    run_bulk(hwnd, action);
+}
+
+/// The right-click items that tag, move or change connections `names`
+/// (one or several): Add tag, Remove tag, Move to folder, Change a field.
+/// Ids from [`GROUP_NO_FOLDER`] up; [`group_pick`] carries out the pick.
+///
+/// # Safety
+/// `menu` is a popup menu of ours, alive until the caller destroys it.
+unsafe fn append_group_items(menu: HMENU, tags: &crate::bulk::TagChoices, folders: &[String]) {
+    use crate::bulk::MAX_CHOICES;
+    use crate::native::wide;
+    const ADD_TAG: u32 = GROUP_ADD_TAG;
+    const REMOVE_TAG: u32 = GROUP_REMOVE_TAG;
+    const MOVE_TO: u32 = GROUP_MOVE_TO;
+    const EDIT: u32 = GROUP_EDIT;
+    const NO_FOLDER: u32 = GROUP_NO_FOLDER;
+    let fields = crate::bulk_edit::EditField::ALL;
+    // SAFETY: menus of ours; each submenu belongs to `menu` once appended.
+    unsafe {
         let sub = |label: &str, base: u32, list: &[String], empty: &str| {
             let Ok(popup) = CreatePopupMenu() else {
                 return;
@@ -25394,7 +25830,7 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             &tags.remove,
             "None of their own (ssh_config's Tag stays)",
         );
-        sub("&Move to folder", MOVE_TO, &folders, "");
+        sub("&Move to folder", MOVE_TO, folders, "");
         if let Ok(popup) = CreatePopupMenu() {
             for (i, f) in fields.iter().enumerate() {
                 let text = wide(&format!("{}...", f.label()));
@@ -25407,29 +25843,36 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             }
             let _ = AppendMenuW(menu, MF_POPUP, popup.0 as usize, w!("C&hange a field"));
         }
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let delete = wide(&format!("&Delete {n} connections...\tDel"));
-        let _ = AppendMenuW(menu, MF_STRING, DELETE as usize, PCWSTR(delete.as_ptr()));
-        let _ = AppendMenuW(
-            menu,
-            MF_STRING,
-            CLEAR as usize,
-            w!("Clear the selection\tEsc"),
-        );
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let chosen = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY,
-            pt.x,
-            pt.y,
-            None,
-            hwnd,
-            None,
-        );
-        let _ = DestroyMenu(menu);
-        u32::try_from(chosen.0).unwrap_or(0)
-    };
+    }
+}
+
+/// What [`append_group_items`] offers for `names`: the tags to add and
+/// remove, and the folders.
+fn group_choices(names: &[String]) -> Option<(crate::bulk::TagChoices, Vec<String>)> {
+    with_window(|w| {
+        let items = host_items(&ssh_env(), &w.settings);
+        let tags = crate::bulk::tag_choices(&items, &w.settings, names);
+        (tags, crate::bulk::folder_choices(&load_saved()))
+    })
+}
+
+const GROUP_NO_FOLDER: u32 = 99;
+const GROUP_ADD_TAG: u32 = 100;
+const GROUP_REMOVE_TAG: u32 = 200;
+const GROUP_MOVE_TO: u32 = 300;
+const GROUP_EDIT: u32 = 400;
+
+/// Carries out `picked` from [`append_group_items`] for `names`; false
+/// when it is not one of those items.
+fn group_pick(
+    hwnd: HWND,
+    picked: u32,
+    names: Vec<String>,
+    tags: &crate::bulk::TagChoices,
+    folders: &[String],
+) -> bool {
+    use crate::bulk::BulkAction;
+    let fields = crate::bulk_edit::EditField::ALL;
     let pick = |base: u32, list: &[String]| {
         picked
             .checked_sub(base)
@@ -25437,53 +25880,69 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             .cloned()
     };
     let action = match picked {
-        0 => return,
-        CLEAR => {
-            conn_view::clear_marks();
-            return;
-        }
-        DELETE => {
-            delete_many(hwnd, names);
-            return;
-        }
-        CONNECT_ALL => {
-            if n > 8
-                && dialog(
-                    hwnd,
-                    &format!("Connect to all {n} connections, a tab each?"),
-                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-                ) != Some(IDYES)
-            {
-                return;
-            }
-            BulkAction::OpenAll(names)
-        }
-        NO_FOLDER => BulkAction::MoveTo(names, None),
-        p if (EDIT..EDIT + 100).contains(&p) => {
-            if let Some(&field) = fields.get((p - EDIT) as usize) {
+        GROUP_NO_FOLDER => BulkAction::MoveTo(names, None),
+        p if (GROUP_EDIT..GROUP_EDIT + 100).contains(&p) => {
+            if let Some(&field) = fields.get((p - GROUP_EDIT) as usize) {
                 edit_many(hwnd, names, field);
             }
-            return;
+            return true;
         }
-        p if (MOVE_TO..MOVE_TO + 100).contains(&p) => match pick(MOVE_TO, &folders) {
-            Some(f) => BulkAction::MoveTo(names, Some(f)),
-            None => return,
-        },
-        p if (REMOVE_TAG..REMOVE_TAG + 100).contains(&p) => match pick(REMOVE_TAG, &tags.remove) {
-            Some(t) => BulkAction::RemoveTag(names, t),
-            None => return,
-        },
-        p if (ADD_TAG..ADD_TAG + 100).contains(&p) => match pick(ADD_TAG, &tags.add) {
-            Some(t) => BulkAction::AddTag(names, t),
-            None => return,
-        },
-        _ => return,
+        p if (GROUP_MOVE_TO..GROUP_MOVE_TO + 100).contains(&p) => {
+            match pick(GROUP_MOVE_TO, folders) {
+                Some(f) => BulkAction::MoveTo(names, Some(f)),
+                None => return true,
+            }
+        }
+        p if (GROUP_REMOVE_TAG..GROUP_REMOVE_TAG + 100).contains(&p) => {
+            match pick(GROUP_REMOVE_TAG, &tags.remove) {
+                Some(t) => BulkAction::RemoveTag(names, t),
+                None => return true,
+            }
+        }
+        p if (GROUP_ADD_TAG..GROUP_ADD_TAG + 100).contains(&p) => {
+            match pick(GROUP_ADD_TAG, &tags.add) {
+                Some(t) => BulkAction::AddTag(names, t),
+                None => return true,
+            }
+        }
+        _ => return false,
     };
-    let (command, queued) = with_window(|w| {
-        let command = w.side_action(Some(SideAction::Bulk(action)));
-        (command, std::mem::take(&mut w.queued))
-    })
-    .unwrap_or_default();
+    run_bulk(hwnd, action);
+    true
+}
+
+/// Runs `action` on its connections, asking first when it takes
+/// security limits away.
+fn run_bulk(hwnd: HWND, action: crate::bulk::BulkAction) {
+    // A tag removed or a folder left can take security limits away. A
+    // Yes holds for the losses it answered: if the rules changed while it
+    // was open and any loss differs now, even one past those the question
+    // lists, it is asked again.
+    let mut answered: Option<LossAsk> = None;
+    let (command, queued) = loop {
+        let outcome = with_window(|w| match w.bulk_loss_question(&action) {
+            Some(ask) if answered.as_ref() != Some(&ask) => Err(ask),
+            _ => {
+                let command = w.side_action(Some(SideAction::Bulk(action.clone())));
+                Ok((command, std::mem::take(&mut w.queued)))
+            }
+        });
+        match outcome {
+            Some(Ok(done)) => break done,
+            Some(Err(ask)) => {
+                if dialog(
+                    hwnd,
+                    &ask.question,
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                ) != Some(IDYES)
+                {
+                    return;
+                }
+                answered = Some(ask);
+            }
+            None => return,
+        }
+    };
     if let Some(command) = command {
         run_command(hwnd, command);
     }
@@ -25517,7 +25976,7 @@ fn edit_many(hwnd: HWND, names: Vec<String>, field: crate::bulk_edit::EditField)
         return;
     };
     let n = targets.len();
-    let title = format!("Change {} on {n} connections", field.label());
+    let title = format!("Change {} on {n} connection{}", field.label(), plural(n));
     let now = match &start {
         Some(v) if v.is_empty() => "They all have it empty now.".to_owned(),
         Some(v) => format!("They all have {v} now."),
@@ -26179,12 +26638,10 @@ fn run_command(hwnd: HWND, command: Command) {
             destination,
             endpoint,
             extras,
+            confirm,
+            lowered,
         } => {
-            let text = format!(
-                "A security rule asks before connecting to {} ({}). Connect now?",
-                crate::ssh::sanitize_line(&destination),
-                crate::ssh::sanitize_line(&endpoint)
-            );
+            let text = confirm_connect_text(&destination, &endpoint, confirm, &lowered);
             match dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
                 Some(answer) => {
                     let next = with_window(|w| {
@@ -26203,11 +26660,33 @@ fn run_command(hwnd: HWND, command: Command) {
                             destination,
                             endpoint,
                             extras,
+                            confirm,
+                            lowered,
                         });
                     });
                     // SAFETY: our window; replaces any earlier timer with this id.
                     unsafe { SetTimer(Some(hwnd), TIMER_WORKSPACE_ASK, 500, None) };
                 }
+            }
+        }
+        Command::ConfirmFormLosses { ask, connect } => {
+            if dialog(
+                hwnd,
+                &ask.question,
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            ) == Some(IDYES)
+            {
+                let (command, queued) = with_window(|w| {
+                    w.form_losses_ok = Some(ask);
+                    let command = w.form_action(Some(FormAction::Save { connect }));
+                    w.form_losses_ok = None;
+                    (command, std::mem::take(&mut w.queued))
+                })
+                .unwrap_or_default();
+                if let Some(command) = command {
+                    run_command(hwnd, command);
+                }
+                run_commands(hwnd, queued);
             }
         }
         Command::EditWorkspace(name) => {

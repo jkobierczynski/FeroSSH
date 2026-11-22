@@ -294,11 +294,14 @@ pub fn machine<'a>(subject: &Subject<'a>) -> &'a str {
     subject.hostname.unwrap_or(subject.name)
 }
 
-/// The limits for `subject`, with those of every other connection in
-/// `others` that reaches the same machine ([`same_machine`]): the rules
-/// follow the machine, so typing its address, or another alias for it,
-/// does not leave a production host's tag or folder rules behind. Also
-/// the names of the connections whose rules added something.
+/// The limits for `subject`. One that is not itself in `others` (the
+/// saved connections: an address typed by hand, an `ssh://` link, an
+/// alias the Connection manager does not list) also gets those of every
+/// connection in `others` that reaches the same machine
+/// ([`same_machine`]), so typing a production host's address does not
+/// leave its tag or folder rules behind. A saved connection keeps to its
+/// own rules: tagging one of them leaves the others to that host as they
+/// are. Also the names of the connections whose rules added something.
 pub fn policy_with_peers<'a>(
     rules: &[SecurityRule],
     subject: &Subject<'_>,
@@ -306,6 +309,12 @@ pub fn policy_with_peers<'a>(
 ) -> (Policy, Vec<&'a str>) {
     let mut policy = policy_for(rules, subject);
     let mut from = Vec::new();
+    if others
+        .iter()
+        .any(|o| o.name.eq_ignore_ascii_case(subject.name))
+    {
+        return (policy, from);
+    }
     let here = machine(subject);
     for o in others {
         if o.name.eq_ignore_ascii_case(subject.name) || !same_machine(machine(o), here) {
@@ -526,6 +535,17 @@ mod tests {
         let (p, from) = policy_with_peers(&rules, &saved[0], &saved);
         assert!(p.keys_only);
         assert!(from.is_empty());
+        // A second saved connection to db1's machine keeps to its own
+        // rules: db1's tag does not spread to it.
+        let twin = Subject {
+            name: "db1-admin",
+            hostname: Some("db1.example.com"),
+            ..Subject::default()
+        };
+        let mut with_twin = saved.to_vec();
+        with_twin.push(twin);
+        let (p, from) = policy_with_peers(&rules, &twin, &with_twin);
+        assert!(p.is_empty() && from.is_empty());
         // Another machine: nothing.
         let (p, _) = policy_with_peers(&rules, &saved[2], &saved);
         assert!(p.is_empty());

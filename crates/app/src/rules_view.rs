@@ -3,7 +3,8 @@
 //! rule that matches nothing (or far too much) shows. Pure, so it is
 //! tested on any platform; `rules_panel.rs` draws it.
 
-use ferossh_config::host_policy::{SecurityRule, Subject};
+use ferossh_config::host_policy::{self, Policy, SecurityRule, Subject};
+use ferossh_config::limit_record;
 
 /// A saved connection, as the rules see it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -276,6 +277,118 @@ pub fn delete_question(row: &Row) -> String {
     text
 }
 
+/// One connection as it is after a change: `from` is its name before
+/// (its old name when renamed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Changed {
+    pub from: String,
+    pub to: Connection,
+}
+
+fn subject(c: &Connection) -> Subject<'_> {
+    Subject {
+        name: &c.name,
+        hostname: c.hostname.as_deref(),
+        tags: &c.tags,
+        folder: c.folder.as_deref(),
+    }
+}
+
+/// The limits of `c` among `all`, its machine's other connections'
+/// included, as a connection gets them.
+fn limits_of(rules: &[SecurityRule], c: &Connection, all: &[Connection]) -> Policy {
+    let others: Vec<Subject<'_>> = all.iter().map(subject).collect();
+    host_policy::policy_with_peers(rules, &subject(c), &others).0
+}
+
+/// What each connection loses when `before` (under `rules_before`)
+/// becomes `before` with `changes` made (under `rules_after`): the
+/// changed connections, and any other on their machines that shares
+/// their rules (one not saved). Named as after the change, in `before`'s order; only
+/// the ones that lose something.
+pub fn lost_limits(
+    rules_before: &[SecurityRule],
+    rules_after: &[SecurityRule],
+    before: &[Connection],
+    changes: &[Changed],
+) -> Vec<(String, Policy)> {
+    let changed = |name: &str| changes.iter().find(|c| c.from.eq_ignore_ascii_case(name));
+    let after: Vec<Connection> = before
+        .iter()
+        .map(|b| changed(&b.name).map_or_else(|| b.clone(), |c| c.to.clone()))
+        .collect();
+    let machine = |c: &Connection| c.hostname.clone().unwrap_or_else(|| c.name.clone());
+    let machines: Vec<String> = changes
+        .iter()
+        .filter_map(|c| before.iter().find(|b| b.name.eq_ignore_ascii_case(&c.from)))
+        .map(machine)
+        .chain(changes.iter().map(|c| machine(&c.to)))
+        .collect();
+    before
+        .iter()
+        .zip(&after)
+        .filter(|(b, a)| {
+            changed(&b.name).is_some()
+                || machines.iter().any(|m| {
+                    host_policy::same_machine(&machine(b), m)
+                        || host_policy::same_machine(&machine(a), m)
+                })
+        })
+        .filter_map(|(b, a)| {
+            let lost = limit_record::lost(
+                &limits_of(rules_before, b, before),
+                &limits_of(rules_after, a, &after),
+            );
+            (!lost.is_empty()).then(|| (a.name.clone(), lost))
+        })
+        .collect()
+}
+
+/// The question before a change that takes limits away: `what` (`Remove
+/// tag production from 3 connections`) and the connections that lose
+/// limits, each with them. The ones in `changed` (named as after the
+/// change) come first; the rest reach the same host as one of them and
+/// lose what they shared with it.
+pub fn loss_question(what: &str, lost: &[(String, Policy)], changed: &[String]) -> String {
+    const SHOWN: usize = 15;
+    let is_changed = |n: &str| changed.iter().any(|c| c.eq_ignore_ascii_case(n));
+    let (own, peers): (Vec<_>, Vec<_>) = lost.iter().partition(|(n, _)| is_changed(n));
+    let mut text = format!("{what}?\n\nThe security rules themselves stay as they are.");
+    let mut shown = 0;
+    let mut list = |text: &mut String, items: &[&(String, Policy)]| {
+        for (name, p) in items {
+            if shown == SHOWN {
+                break;
+            }
+            text.push_str(&format!("\n{}: {}", clean(name), p.describe().join(", ")));
+            shown += 1;
+        }
+    };
+    if !own.is_empty() {
+        text.push_str(if own.len() == 1 {
+            " They just no longer cover this connection, so it loses these limits:\n"
+        } else {
+            " They just no longer cover these connections, so they lose these limits:\n"
+        });
+        list(&mut text, &own);
+    }
+    if !peers.is_empty() {
+        text.push_str(
+            "\n\nThese other connections reach the same host, and got those limits from it \
+             (rules follow the machine), so they lose them too:\n",
+        );
+        list(&mut text, &peers);
+    }
+    if lost.len() > shown {
+        text.push_str(&format!("\n... and {} more", lost.len() - shown));
+    }
+    text.push_str(
+        "\n\nThey connect without those limits from then on (FeroSSH asks once more before \
+         the first connection). Go ahead?",
+    );
+    text
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -421,5 +534,96 @@ mod tests {
         let shown: Vec<&Row> = rows.iter().collect();
         assert!(summary(&shown, 1).contains("1 rule has lines this FeroSSH does not understand"));
         assert_eq!(filter(&rows, "understood").len(), 1);
+    }
+
+    #[test]
+    fn a_change_names_the_limits_it_takes_away() {
+        let all = all();
+        let change = |from: &str, to: Connection| Changed {
+            from: from.into(),
+            to,
+        };
+        // Tag removed: web loses keys only.
+        let lost = lost_limits(
+            &rules(),
+            &rules(),
+            &all,
+            &[change("web", conn("web", &[], None))],
+        );
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].0, "web");
+        assert!(lost[0].1.keys_only && !lost[0].1.log_session);
+        // Moved out of Lab, renamed on the way: named as now.
+        let lost = lost_limits(
+            &rules(),
+            &rules(),
+            &all,
+            &[change("pi", conn("raspberry", &[], None))],
+        );
+        assert_eq!(lost[0].0, "raspberry");
+        assert!(lost[0].1.log_session);
+        // Into another folder of the same rule, or a new tag that still
+        // matches: nothing lost.
+        assert!(
+            lost_limits(
+                &rules(),
+                &rules(),
+                &all,
+                &[change("db", conn("db", &["prod-eu"], Some("Lab")))]
+            )
+            .is_empty()
+        );
+        // A rule gone: everything it covered.
+        let lost = lost_limits(&rules(), &rules()[1..], &all, &[]);
+        assert!(lost.is_empty(), "only changed connections are compared");
+        // Another saved alias of the same machine keeps the tag: each
+        // saved connection keeps to its own rules, so web loses it, and
+        // the alias (not changed) is not listed.
+        let mut twins = all.clone();
+        twins.push(Connection {
+            name: "web-alias".into(),
+            hostname: Some("web.example".into()),
+            tags: vec!["production".into()],
+            folder: None,
+        });
+        let mut untagged = conn("web", &[], None);
+        untagged.hostname = Some("web.example".into());
+        let lost = lost_limits(
+            &rules(),
+            &rules(),
+            &twins,
+            &[change("web", untagged.clone())],
+        );
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].0, "web");
+        // Both tags go: both lose it.
+        let mut alias_bare = twins[4].clone();
+        alias_bare.tags.clear();
+        let lost = lost_limits(
+            &rules(),
+            &rules(),
+            &twins,
+            &[change("web", untagged), change("web-alias", alias_bare)],
+        );
+        assert_eq!(lost.len(), 2);
+        let q = loss_question(
+            "Remove tag production from 2 connections",
+            &lost,
+            &["web".into(), "web-alias".into()],
+        );
+        assert!(q.starts_with("Remove tag production from 2 connections?\n"));
+        assert!(q.contains("rules themselves stay as they are"));
+        assert!(q.contains("\nweb: keys only"));
+        assert!(!q.contains("same host"));
+        // A connection listed that was not changed (one not saved, that
+        // shared the host's limits) is listed apart.
+        let q = loss_question(
+            "Remove tag production from 1 connection",
+            &lost,
+            &["web".into()],
+        );
+        let (own, peers) = q.split_once("same host").unwrap();
+        assert!(own.contains("\nweb: keys only") && !own.contains("web-alias"));
+        assert!(peers.contains("\nweb-alias: keys only"));
     }
 }
