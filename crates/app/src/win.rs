@@ -2081,7 +2081,7 @@ fn workspaces_dir() -> PathBuf {
 }
 
 /// Settings > Custom themes: a `.theme` file each.
-fn themes_dir() -> PathBuf {
+pub(crate) fn themes_dir() -> PathBuf {
     app_dir().join("themes")
 }
 
@@ -2101,10 +2101,32 @@ fn p_warning(theme: Option<&Theme>) -> bool {
 
 /// A folder that cannot be read is an error, and the themes known
 /// before stay.
+/// The team library's themes come with them (see
+/// [`custom_theme::add_team`]).
+/// When the folder cannot be read, its themes as last read stay, with
+/// the team's as they are now, and the list of broken files says why.
 fn load_custom_themes() -> std::result::Result<custom_theme::Loaded, String> {
-    let (themes, broken) = custom_theme::load(&themes_dir())?;
-    Theme::set_user(themes.iter().map(|t| t.theme.clone()).collect());
-    Ok((themes, broken))
+    use std::sync::{Mutex, PoisonError};
+    static LAST_READ: Mutex<Vec<CustomTheme>> = Mutex::new(Vec::new());
+    let mut loaded = match custom_theme::load(&themes_dir()) {
+        Ok(loaded) => {
+            *LAST_READ.lock().unwrap_or_else(PoisonError::into_inner) = loaded.0.clone();
+            loaded
+        }
+        Err(reason) => (
+            LAST_READ
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+            vec![custom_theme::Broken {
+                file: "themes folder".into(),
+                reason,
+            }],
+        ),
+    };
+    custom_theme::add_team(&mut loaded, &crate::team_lib::current().themes);
+    Theme::set_user(loaded.0.iter().map(|t| t.theme.clone()).collect());
+    Ok(loaded)
 }
 
 /// Whether `menu` is `root` or one of its popups, at any depth. Context
@@ -16148,7 +16170,11 @@ impl Window {
                 (t.name, group)
             })
             .collect();
-        let custom: Vec<&str> = self.custom_themes.iter().map(|c| c.theme.name).collect();
+        let custom: Vec<(&str, bool)> = self
+            .custom_themes
+            .iter()
+            .map(|c| (c.theme.name, c.team))
+            .collect();
         let fonts: Vec<Font> = FONT_CHOICES
             .iter()
             .enumerate()
@@ -16158,7 +16184,14 @@ impl Window {
                 windows: i < WINDOWS_FONTS,
             })
             .collect();
-        rows(&self.settings.theme_rules, &builtin, &custom, &fonts, &all)
+        rows(
+            &self.settings.team.theme_rules,
+            &self.settings.theme_rules,
+            &builtin,
+            &custom,
+            &fonts,
+            &all,
+        )
     }
 
     fn credential_rows(&self) -> Vec<crate::credential_view::Row> {
@@ -16569,10 +16602,33 @@ impl Window {
             return;
         }
         crate::team_lib::set_current(loaded.team.clone());
+        let themes_changed = loaded.team.themes != self.settings.team.themes;
         self.settings.team = loaded.team;
+        if themes_changed {
+            // The team's themes for connections opened from now on, and in
+            // Settings > Custom themes (whose ids index the list, and which
+            // the command palette reads).
+            match custom_themes_menu(self.menu) {
+                Some(menu) => self.fill_custom_themes(menu),
+                None => {
+                    if let Ok((themes, _)) = load_custom_themes() {
+                        self.custom_themes = themes;
+                    }
+                }
+            }
+            // New tabs: the default theme as registered now (a team theme
+            // may have replaced a local one of its name); open panes keep
+            // their colours.
+            if let Some(t) = Theme::by_name(self.default_theme.name) {
+                self.default_theme = t;
+            }
+        }
         self.reload_sessions(None);
         if self.rules_native() {
             self.reload_rules();
+        }
+        if self.themes_native() {
+            self.reload_themes();
         }
         self.refresh_chrome();
     }
@@ -24520,8 +24576,14 @@ fn rules_event(hwnd: HWND, event: rules_panel::Event) {
     use rules_panel::Event;
     match event {
         Event::New => edit_rule(hwnd, None),
+        // A team rule opens to read: all it says, and every connection
+        // it covers.
         Event::Edit(row) | Event::Delete(row) if row.team => {
-            dialog(hwnd, rules_panel::TEAM_RULE, MB_OK | MB_ICONINFORMATION);
+            dialog(
+                hwnd,
+                &crate::rules_view::details(&row),
+                MB_OK | MB_ICONINFORMATION,
+            );
             return;
         }
         Event::Edit(row) => edit_rule(hwnd, Some((row.index, row.rule))),
@@ -24891,6 +24953,15 @@ fn theme_event(hwnd: HWND, event: theme_panel::Event) {
                     dialog(hwnd, THEME_RULE_CHANGED, MB_OK | MB_ICONWARNING);
                 }
             }
+        }
+        // The team's and the built-in rules open to read only.
+        Event::Edit(row) if !row.is_own_rule() => {
+            dialog(
+                hwnd,
+                &crate::theme_view::details(&row),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return;
         }
         Event::Edit(row) => {
             if let Some(rule) = row.rule {

@@ -337,8 +337,9 @@ What the library gives comes before your own settings:
 
 - Its connections show in the **Team** folder (their own folders below it). Their address, user, port, jump hosts and the rest come from the library first, and a connection of your own with the same name is not used. Edit shows them read-only; saving one under a new name makes a copy of your own. They cannot be deleted, moved or retagged here.
 - Their profiles (tags, type, look, credential name) are the library's: a local `Profile` of the same name is not used.
-- Its `SecurityRule` blocks apply together with yours, and since rules only add limits, yours cannot loosen them. Tools > Security rules lists them first as "team 1", "team 2" and so on, and they cannot be changed or deleted there.
-- Its `ThemeRule` blocks are tried before yours.
+- Its `SecurityRule` blocks apply together with yours, and since rules only add limits, yours cannot loosen them. Tools > Security rules lists them first as "team 1", "team 2" and so on. They cannot be changed or deleted there, but Edit (or a double click) shows everything one says: its hosts, tags and folders, every limit and every connection it covers.
+- Its `ThemeRule` blocks are tried before yours. Tools > Theme rules lists them first, under "Team library rules"; Edit shows one read-only.
+- The custom themes its theme rules and connections name come with it, so a PC without that `.theme` file still gets the team's look. They show in Settings > Custom themes and under "Team library themes" in Tools > Theme manager. A theme file of your own with the same name is not used (the Custom themes menu says so); the team's theme is.
 
 A library connection may name a credential. A team security rule for folder `Production` also covers the team's `Team/Production`. No credential travels in the library: each person keeps their own credential of that name, with their own user, key and password. Options in your own `~/.ssh/config` that the library does not set for a connection (a `Host *` block, say) still apply to it, and the security rules still limit it.
 

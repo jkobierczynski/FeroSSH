@@ -134,12 +134,17 @@ fn limits_text(rule: &SecurityRule) -> String {
 }
 
 fn clean(text: &str) -> String {
+    clean_all(text).chars().take(400).collect()
+}
+
+/// `text` without control and direction characters, whole: for the
+/// details of a rule, which must show all of it.
+pub fn clean_all(text: &str) -> String {
     text.chars()
         .filter(|c| {
             !c.is_control()
                 && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         })
-        .take(400)
         .collect()
 }
 
@@ -202,7 +207,56 @@ pub fn summary(shown: &[&Row], total: usize) -> String {
             if odd == 1 { "rule has" } else { "rules have" }
         ));
     }
+    let team = shown.iter().filter(|r| r.team).count();
+    if team > 0 {
+        text.push_str(&format!(
+            " {team} from the team library: Edit shows {} but cannot change {}.",
+            if team == 1 { "it" } else { "them" },
+            if team == 1 { "it" } else { "them" },
+        ));
+    }
     text.push_str(" A rule only tightens: every rule that matches a connection adds its limits.");
+    text
+}
+
+/// Everything `row` says, for reading only: a team library rule, which
+/// cannot be opened to change. Its match, every limit and every
+/// connection it covers (the list cuts them short).
+pub fn details(row: &Row) -> String {
+    let words = |w: &[String]| {
+        if w.is_empty() {
+            "(any)".to_owned()
+        } else {
+            clean_all(&w.join(" "))
+        }
+    };
+    let r = &row.rule;
+    let mut text = format!(
+        "Team rule {}: from the team library. It applies as the team set it and cannot be \
+         changed or deleted here.\n\nHosts: {}\nTags: {}\nFolders: {}\n\nLimits:",
+        row.index + 1,
+        words(&r.hosts),
+        words(&r.tags),
+        words(&r.folders),
+    );
+    let limits = r.limits.describe();
+    if limits.is_empty() {
+        text.push_str(" none");
+    }
+    for l in limits {
+        text.push_str(&format!("\n  - {}", clean_all(l)));
+    }
+    if !r.unknown.is_empty() {
+        text.push_str(&format!(
+            "\n  - not understood by this FeroSSH, so not applied: {}",
+            clean_all(&r.describe_unknown())
+        ));
+    }
+    let names: Vec<String> = row.used_by.iter().map(|n| clean_all(n)).collect();
+    text.push_str(&match names.len() {
+        0 => "\n\nIt covers no connection in the connection manager yet.".to_owned(),
+        n => format!("\n\nConnections it covers ({n}): {}", names.join(", ")),
+    });
     text
 }
 
@@ -226,6 +280,7 @@ pub fn delete_question(row: &Row) -> String {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use ferossh_config::host_policy::Policy;
 
     fn conn(name: &str, tags: &[&str], folder: Option<&str>) -> Connection {
         Connection {
@@ -299,6 +354,37 @@ mod tests {
         let mut evil = rows[2].clone();
         evil.rule.hosts = vec!["a\u{202e}b".into()];
         assert!(!delete_question(&evil).contains('\u{202e}'));
+    }
+
+    #[test]
+    fn team_rule_details_list_every_limit_and_connection() {
+        let team = [SecurityRule {
+            tags: vec!["prod".into()],
+            limits: Policy {
+                keys_only: true,
+                ..Policy::default()
+            },
+            ..SecurityRule::default()
+        }];
+        let all: Vec<Connection> = (1..=13)
+            .map(|i| Connection {
+                name: format!("web{i}"),
+                tags: vec!["prod".into()],
+                ..Connection::default()
+            })
+            .collect();
+        let rows = rows_with_team(&team, &[], &all);
+        let d = details(&rows[0]);
+        assert!(d.starts_with("Team rule 1: from the team library"), "{d}");
+        assert!(d.contains("Tags: prod"));
+        assert!(d.contains("Hosts: (any)"));
+        for i in 1..=13 {
+            assert!(d.contains(&format!("web{i}")), "every connection: {d}");
+        }
+        assert!(d.contains("Connections it covers (13)") && !d.contains("more"));
+        for l in team[0].limits.describe() {
+            assert!(d.contains(l));
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 | Import and export > Import connections... | | Brings saved sessions over from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT (see [Imports](everyday-use.md#importing-from-other-clients)). |
 | Import and export > Import scripts... | | Brings scripts over from Windows Terminal (`sendInput` actions and `.wt.json` scripts), SecureCRT button bars and MobaXterm macros, or makes one from a text file (see [Importing scripts](everyday-use.md#importing-scripts)). |
 | Import and export > Export connections... | | Writes your saved and imported connections and their settings to a `.ferossh` file encrypted with a passphrase, with the saved passwords only if you tick it (see [Backup and sync](everyday-use.md#backup-and-sync-between-pcs)). |
-| Import and export > Export team library... | | Writes your saved connections, their settings and your security and theme rules, with no password or credential, to a `.ferossh-library` file for a team to share once you sign it (see [Team library](everyday-use.md#team-library)). |
+| Import and export > Export team library... | | Writes your saved connections, their settings, your security and theme rules and the custom themes they name, with no password or credential, to a `.ferossh-library` file for a team to share once you sign it (see [Team library](everyday-use.md#team-library)). |
 | Import and export > Import encrypted connections... | | Opens such a file, asks its passphrase, says what it would add and replace, and imports it. Your other connections stay. |
 | Exit | Alt+F4 | Closes FeroSSH. tmux sessions keep running on their servers. |
 

@@ -557,10 +557,6 @@ fn edit() {
     }
 }
 
-/// What a team library rule says when asked to change.
-pub const TEAM_RULE: &str = "This rule comes from the team library. It applies as the team \
-                             set it and cannot be changed or deleted here.";
-
 fn delete(h: Handles) {
     let Some(row) = selected() else {
         return;
