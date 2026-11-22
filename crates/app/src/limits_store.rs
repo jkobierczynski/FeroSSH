@@ -119,16 +119,20 @@ pub fn keep_in(
     now: u64,
 ) -> std::io::Result<()> {
     let _held = crate::inventory_view::lock(dir)?;
-    // Logged only where the records, as they are under the lock, lost no
-    // more than the Yes was given for: another window may have kept more
-    // limits since it was asked, and that connection is asked again.
+    // Nothing is written unless the records, as they are under the lock,
+    // lost no more than the Yes was given for, for every connection on
+    // the way: another window may have kept more limits since it was
+    // asked. The connection is then asked again, and a No to that leaves
+    // no line or record for the jump hosts either.
     let on_disk = read_locked(dir)?;
-    let logged: Vec<&Lowered> = accepted
+    if checks
         .iter()
-        .filter(|l| approved(&on_disk, &l.check, accepted))
-        .collect();
-    if !logged.is_empty() {
-        let text: String = logged
+        .any(|c| worth_keeping(&on_disk, c) && !approved(&on_disk, c, accepted))
+    {
+        return Ok(());
+    }
+    if !accepted.is_empty() {
+        let text: String = accepted
             .iter()
             .map(|l| {
                 limit_record::log_line(
@@ -311,6 +315,35 @@ mod tests {
             std::slice::from_ref(&shown),
             std::slice::from_ref(&shown)
         ));
+        // A jump host's Yes is not written while the destination on the
+        // same route lost more than was shown.
+        let jump = Check {
+            name: "jump1".into(),
+            machine: "jump1.example.com".into(),
+            now: check(true).now,
+        };
+        keep_in(&dir, std::slice::from_ref(&jump), &[], 270).unwrap();
+        let jump_low = Lowered {
+            check: Check {
+                now: Policy::default(),
+                ..jump.clone()
+            },
+            lost: jump.now,
+            since: None,
+        };
+        keep_in(
+            &dir,
+            &[jump_low.check.clone(), check(false)],
+            &[jump_low.clone(), shown.clone()],
+            280,
+        )
+        .unwrap();
+        assert_eq!(
+            lowered_in(&dir, std::slice::from_ref(&jump_low.check)).len(),
+            1
+        );
+        let log = std::fs::read_to_string(dir.join("limit-changes.log")).unwrap();
+        assert!(!log.contains("jump1"));
         // A connection that never had a limit gets no line.
         let typed = Check {
             name: "10.0.0.9".into(),
