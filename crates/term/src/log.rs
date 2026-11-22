@@ -217,7 +217,7 @@ impl<W: Write> LogWriter<W> {
     pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         if self.raw {
             self.out.write_all(bytes)?;
-        } else {
+        } else if !bytes.is_empty() {
             self.parser.advance(&mut self.line, bytes);
             self.write_lines(false)?;
         }
@@ -420,6 +420,9 @@ mod tests {
         w.write(b"pwd\r\n/root\r\n$ ").unwrap();
         at(950);
         w.write(b"exit").unwrap();
+        // An empty write brings no bytes, so it keeps the line's time.
+        at(980);
+        w.write(b"").unwrap();
         at(999);
         let got = String::from_utf8(w.finish("e").unwrap()).unwrap();
         assert_eq!(
