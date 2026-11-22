@@ -292,18 +292,41 @@ pub fn lost_limits(
 
 /// The question before a change that takes limits away: `what` (`Remove
 /// tag production from 3 connections`) and the connections that lose
-/// limits, each with them.
-pub fn loss_question(what: &str, lost: &[(String, Policy)]) -> String {
+/// limits, each with them. The ones in `changed` (named as after the
+/// change) come first; the rest reach the same host as one of them and
+/// lose what they shared with it.
+pub fn loss_question(what: &str, lost: &[(String, Policy)], changed: &[String]) -> String {
     const SHOWN: usize = 15;
-    let mut text = format!(
-        "{what}? These connections lose security limits, unless they still get them some \
-         other way:\n"
-    );
-    for (name, p) in lost.iter().take(SHOWN) {
-        text.push_str(&format!("\n{}: {}", clean(name), p.describe().join(", ")));
+    let is_changed = |n: &str| changed.iter().any(|c| c.eq_ignore_ascii_case(n));
+    let (own, peers): (Vec<_>, Vec<_>) = lost.iter().partition(|(n, _)| is_changed(n));
+    let mut text = format!("{what}?\n\nThe security rules themselves stay as they are.");
+    let mut shown = 0;
+    let mut list = |text: &mut String, items: &[&(String, Policy)]| {
+        for (name, p) in items {
+            if shown == SHOWN {
+                break;
+            }
+            text.push_str(&format!("\n{}: {}", clean(name), p.describe().join(", ")));
+            shown += 1;
+        }
+    };
+    if !own.is_empty() {
+        text.push_str(if own.len() == 1 {
+            " They just no longer cover this connection, so it loses these limits:\n"
+        } else {
+            " They just no longer cover these connections, so they lose these limits:\n"
+        });
+        list(&mut text, &own);
     }
-    if lost.len() > SHOWN {
-        text.push_str(&format!("\n... and {} more", lost.len() - SHOWN));
+    if !peers.is_empty() {
+        text.push_str(
+            "\n\nThese other connections reach the same host, and got those limits from it \
+             (rules follow the machine), so they lose them too:\n",
+        );
+        list(&mut text, &peers);
+    }
+    if lost.len() > shown {
+        text.push_str(&format!("\n... and {} more", lost.len() - shown));
     }
     text.push_str(
         "\n\nThey connect without those limits from then on (FeroSSH asks once more before \
@@ -496,8 +519,23 @@ mod tests {
             &[change("web", untagged), change("web-alias", alias_bare)],
         );
         assert_eq!(lost.len(), 2);
-        let q = loss_question("Remove tag production from 2 connections", &lost);
-        assert!(q.starts_with("Remove tag production from 2 connections? "));
+        let q = loss_question(
+            "Remove tag production from 2 connections",
+            &lost,
+            &["web".into(), "web-alias".into()],
+        );
+        assert!(q.starts_with("Remove tag production from 2 connections?\n"));
+        assert!(q.contains("rules themselves stay as they are"));
         assert!(q.contains("\nweb: keys only"));
+        assert!(!q.contains("same host"));
+        // Only one changed: the alias is listed apart, as sharing the host.
+        let q = loss_question(
+            "Remove tag production from 1 connection",
+            &lost,
+            &["web".into()],
+        );
+        let (own, peers) = q.split_once("same host").unwrap();
+        assert!(own.contains("\nweb: keys only") && !own.contains("web-alias"));
+        assert!(peers.contains("\nweb-alias: keys only"));
     }
 }

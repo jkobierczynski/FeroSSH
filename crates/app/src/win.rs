@@ -16828,7 +16828,14 @@ impl Window {
             changes,
         );
         (!lost.is_empty()).then(|| LossAsk {
-            question: crate::rules_view::loss_question(what, &lost),
+            question: crate::rules_view::loss_question(
+                what,
+                &lost,
+                &changes
+                    .iter()
+                    .map(|c| c.to.name.clone())
+                    .collect::<Vec<_>>(),
+            ),
             lost,
         })
     }
