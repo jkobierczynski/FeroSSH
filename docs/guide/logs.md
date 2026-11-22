@@ -14,7 +14,7 @@ Session > Logs and recordings > Open log folder opens that folder in Explorer.
 
 There are two kinds of log:
 
-- **Plain** (the default) keeps the readable text, as you saw it, without colours or cursor movements. Session > Logs and recordings > Timestamp each log line puts the local time each line started in front of it, to the millisecond:
+- **Plain** (the default) keeps the readable text, as you saw it, without colours or cursor movements. Session > Logs and recordings > Timestamp each log line puts the local time each line ended in front of it, to the millisecond, so a command line shows when you pressed Enter (lines that arrive together share a time):
 
   ```
   [2026-10-26 19:24:49.123] $ uptime
