@@ -249,8 +249,8 @@ fn limits_of(rules: &[SecurityRule], c: &Connection, all: &[Connection]) -> Poli
 
 /// What each connection loses when `before` (under `rules_before`)
 /// becomes `before` with `changes` made (under `rules_after`): the
-/// changed connections, and the others on their machines, which share
-/// their rules. Named as after the change, in `before`'s order; only
+/// changed connections, and any other on their machines that shares
+/// their rules (one not saved). Named as after the change, in `before`'s order; only
 /// the ones that lose something.
 pub fn lost_limits(
     rules_before: &[SecurityRule],
@@ -490,7 +490,9 @@ mod tests {
         // A rule gone: everything it covered.
         let lost = lost_limits(&rules(), &rules()[1..], &all, &[]);
         assert!(lost.is_empty(), "only changed connections are compared");
-        // Another alias of the same machine keeps the tag: nothing lost.
+        // Another saved alias of the same machine keeps the tag: each
+        // saved connection keeps to its own rules, so web loses it, and
+        // the alias (not changed) is not listed.
         let mut twins = all.clone();
         twins.push(Connection {
             name: "web-alias".into(),
@@ -500,16 +502,15 @@ mod tests {
         });
         let mut untagged = conn("web", &[], None);
         untagged.hostname = Some("web.example".into());
-        assert!(
-            lost_limits(
-                &rules(),
-                &rules(),
-                &twins,
-                &[change("web", untagged.clone())]
-            )
-            .is_empty()
+        let lost = lost_limits(
+            &rules(),
+            &rules(),
+            &twins,
+            &[change("web", untagged.clone())],
         );
-        // The alias's tag goes: both lose it.
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].0, "web");
+        // Both tags go: both lose it.
         let mut alias_bare = twins[4].clone();
         alias_bare.tags.clear();
         let lost = lost_limits(
@@ -528,7 +529,8 @@ mod tests {
         assert!(q.contains("rules themselves stay as they are"));
         assert!(q.contains("\nweb: keys only"));
         assert!(!q.contains("same host"));
-        // Only one changed: the alias is listed apart, as sharing the host.
+        // A connection listed that was not changed (one not saved, that
+        // shared the host's limits) is listed apart.
         let q = loss_question(
             "Remove tag production from 1 connection",
             &lost,

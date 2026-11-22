@@ -7582,9 +7582,17 @@ impl Window {
     /// the host) with the limits the security rules give it now.
     fn limit_checks(&self, destination: &str, env: &Env) -> Vec<crate::limits_store::Check> {
         use crate::limits_store::Check;
+        // A saved connection is compared with its own record only, as it
+        // keeps to its own rules; an address typed or an alias not saved
+        // with every record for its machine, whose limits it gets.
+        let saved = self.rule_connections();
         let check = |alias: &str, hostname: Option<&str>, tag: Option<&str>| Check {
             name: alias.to_owned(),
-            machine: hostname.unwrap_or(alias).to_owned(),
+            machine: if saved.iter().any(|c| c.name.eq_ignore_ascii_case(alias)) {
+                alias.to_owned()
+            } else {
+                hostname.unwrap_or(alias).to_owned()
+            },
             now: self.policy_of(alias, hostname, tag),
         };
         if ferossh_config::ssh_config::sftp_url(destination).is_none() {
@@ -7858,9 +7866,13 @@ impl Window {
             folder: folder.as_deref(),
         };
         let mut lines = ferossh_config::host_policy::not_understood(&rules, &subject);
-        // Rules follow the machine: so do the lines they are missing.
+        // Rules follow the machine to an address typed or an alias not
+        // saved: so do the lines they are missing. A saved connection
+        // keeps to its own.
         let here = ferossh_config::host_policy::machine(&subject);
-        for c in self.rule_connections() {
+        let all = self.rule_connections();
+        let saved = all.iter().any(|c| c.name.eq_ignore_ascii_case(alias));
+        for c in all.into_iter().filter(|_| !saved) {
             let peer = Subject {
                 name: &c.name,
                 hostname: c.hostname.as_deref(),
