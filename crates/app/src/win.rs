@@ -2103,8 +2103,27 @@ fn p_warning(theme: Option<&Theme>) -> bool {
 /// before stay.
 /// The team library's themes come with them (see
 /// [`custom_theme::add_team`]).
+/// When the folder cannot be read, its themes as last read stay, with
+/// the team's as they are now, and the list of broken files says why.
 fn load_custom_themes() -> std::result::Result<custom_theme::Loaded, String> {
-    let mut loaded = custom_theme::load(&themes_dir())?;
+    use std::sync::{Mutex, PoisonError};
+    static LAST_READ: Mutex<Vec<CustomTheme>> = Mutex::new(Vec::new());
+    let mut loaded = match custom_theme::load(&themes_dir()) {
+        Ok(loaded) => {
+            *LAST_READ.lock().unwrap_or_else(PoisonError::into_inner) = loaded.0.clone();
+            loaded
+        }
+        Err(reason) => (
+            LAST_READ
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+            vec![custom_theme::Broken {
+                file: "themes folder".into(),
+                reason,
+            }],
+        ),
+    };
     custom_theme::add_team(&mut loaded, &crate::team_lib::current().themes);
     Theme::set_user(loaded.0.iter().map(|t| t.theme.clone()).collect());
     Ok(loaded)

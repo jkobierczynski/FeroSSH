@@ -436,6 +436,13 @@ pub fn add_team(loaded: &mut Loaded, team: &[String]) {
             }),
         }
     }
+    // A team theme that replaces one of the PC's takes its slot, so it
+    // comes before the team's new names when the list is full.
+    added.sort_by_key(|t| {
+        !themes
+            .iter()
+            .any(|own| own.theme.name.eq_ignore_ascii_case(t.theme.name))
+    });
     themes.retain(|own| {
         let shadowed = added
             .iter()
@@ -455,7 +462,7 @@ pub fn add_team(loaded: &mut Loaded, team: &[String]) {
         }
         !shadowed
     });
-    // The PC's own stay; team themes past the limit are left out.
+    // The PC's own stay; new team themes past the limit are left out.
     let room = MAX.saturating_sub(themes.len());
     for extra in added.drain(room.min(added.len())..) {
         broken.push(Broken {
@@ -478,9 +485,10 @@ mod tests {
             .map(|i| parse(&format!("Name Own {i:02}\n"), "x").unwrap())
             .collect();
         let mut loaded: Loaded = (own, Vec::new());
+        // The new name first: the replacement still keeps its slot.
         add_team(
             &mut loaded,
-            &["Name Own 07\n".into(), "Name Extra\n".into()],
+            &["Name Extra\n".into(), "Name Own 07\n".into()],
         );
         let (themes, broken) = loaded;
         assert_eq!(themes.len(), MAX);
