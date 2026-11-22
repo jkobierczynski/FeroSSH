@@ -13,8 +13,10 @@
 //! local connection of the same name is not used, and local security
 //! rules can only add limits to the team's.
 //!
-//! The file is a [`crate::bundle::Bundle`] with `sessions.conf` and
-//! `ferossh.conf`, and nothing secret: a library that holds a password
+//! The file is a [`crate::bundle::Bundle`] with `sessions.conf`,
+//! `ferossh.conf` and a `theme-N.conf` per custom theme its rules and
+//! profiles name (the themes folder's file, so a PC without that file
+//! still has the theme), and nothing secret: a library that holds a password
 //! is refused. A connection may name a credential; each user keeps their
 //! own credential of that name.
 
@@ -38,6 +40,18 @@ pub const FOLDER: &str = "Team";
 /// The largest library read, in bytes.
 pub const MAX_LEN: usize = 8 * 1024 * 1024;
 
+/// The most custom themes a library brings.
+pub const MAX_THEMES: usize = 50;
+
+/// The largest theme file a library brings, in bytes (as the themes
+/// folder reads them).
+pub const MAX_THEME_LEN: usize = 64 * 1024;
+
+/// The bundle file holding a library's theme `n` (from 1).
+fn theme_file(n: usize) -> String {
+    format!("theme-{n}.conf")
+}
+
 /// What a verified library gives.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Team {
@@ -50,6 +64,9 @@ pub struct Team {
     pub profiles: Vec<Profile>,
     pub security_rules: Vec<SecurityRule>,
     pub theme_rules: Vec<ThemeRule>,
+    /// The custom themes it brings: a theme file's text each, read by
+    /// the app as the themes folder's are.
+    pub themes: Vec<String>,
 }
 
 impl Team {
@@ -59,7 +76,10 @@ impl Team {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty() && self.security_rules.is_empty() && self.theme_rules.is_empty()
+        self.names.is_empty()
+            && self.security_rules.is_empty()
+            && self.theme_rules.is_empty()
+            && self.themes.is_empty()
     }
 }
 
@@ -165,12 +185,20 @@ pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
             r
         })
         .collect();
+    // Numbered from 1 with no gaps, as export writes them; one too big
+    // is left out (the PC's own file of that name, if any, is used).
+    let themes = (1..=MAX_THEMES)
+        .map_while(|n| bundle.file(&theme_file(n)))
+        .filter(|t| t.len() <= MAX_THEME_LEN)
+        .map(str::to_owned)
+        .collect();
     Ok(Team {
         hosts_text: saved::to_text(&hosts),
         names,
         profiles,
         security_rules,
         theme_rules: settings.theme_rules,
+        themes,
     })
 }
 
@@ -192,7 +220,11 @@ pub fn load(bytes: &[u8], sig: &str, trusted: &[PublicKey]) -> Result<Team, Refu
 /// The library to export from `sessions` (`sessions.conf` text) and
 /// `settings`: every saved connection with its profile, and the security
 /// and theme rules. No password, credential or other setting goes in.
-pub fn export(sessions: &str, settings: &Settings) -> Vec<u8> {
+///
+/// `themes` are the custom themes on this PC, as (name, theme file
+/// text): those a theme rule or an exported profile names go in, at
+/// most [`MAX_THEMES`].
+pub fn export(sessions: &str, settings: &Settings, themes: &[(String, String)]) -> Vec<u8> {
     let hosts = saved::parse(sessions);
     let part = Settings {
         profiles: settings
@@ -209,7 +241,66 @@ pub fn export(sessions: &str, settings: &Settings) -> Vec<u8> {
     let mut bundle = Bundle::default();
     bundle.set_file("sessions.conf", saved::to_text(&hosts));
     bundle.set_file("ferossh.conf", part.to_text());
+    for (n, (_, text)) in (1..).zip(used_themes(&part, themes)) {
+        bundle.set_file(&theme_file(n), text.clone());
+    }
     bundle.to_bytes().to_vec()
+}
+
+/// The themes of `themes` that `part`'s theme rules or profiles name,
+/// at most [`MAX_THEMES`], each once.
+pub fn used_themes<'a>(
+    part: &Settings,
+    themes: &'a [(String, String)],
+) -> Vec<&'a (String, String)> {
+    let named: Vec<&str> = part
+        .theme_rules
+        .iter()
+        .map(|r| r.theme.as_str())
+        .chain(part.profiles.iter().filter_map(|p| p.theme.as_deref()))
+        .collect();
+    let mut used: Vec<&(String, String)> = Vec::new();
+    for t in themes {
+        if named
+            .iter()
+            .any(|n| n.trim().eq_ignore_ascii_case(t.0.trim()))
+            && t.1.len() <= MAX_THEME_LEN
+            && !used.iter().any(|u| u.0.eq_ignore_ascii_case(&t.0))
+            && used.len() < MAX_THEMES
+        {
+            used.push(t);
+        }
+    }
+    used
+}
+
+/// The names of the custom themes the library from `sessions` and
+/// `settings` would name but `themes` does not have: a PC without them
+/// falls back to its default look for those rules.
+pub fn missing_themes(
+    sessions: &str,
+    settings: &Settings,
+    themes: &[(String, String)],
+    builtin: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let hosts = saved::parse(sessions);
+    let mut out: Vec<String> = Vec::new();
+    let named = settings.theme_rules.iter().map(|r| r.theme.as_str()).chain(
+        settings
+            .profiles
+            .iter()
+            .filter(|p| hosts.iter().any(|h| h.alias.eq_ignore_ascii_case(&p.host)))
+            .filter_map(|p| p.theme.as_deref()),
+    );
+    for n in named.map(str::trim).filter(|n| !n.is_empty()) {
+        if !builtin(n)
+            && !themes.iter().any(|t| t.0.trim().eq_ignore_ascii_case(n))
+            && !out.iter().any(|o| o.eq_ignore_ascii_case(n))
+        {
+            out.push(n.to_owned());
+        }
+    }
+    out
 }
 
 /// Leaves out of `sessions` (`sessions.conf` text) the connections the
@@ -255,9 +346,17 @@ mod tests {
              SecurityRule\n    Tags prod\n    KeysOnly yes\n\
              SecurityRule\n    Folders Web\n    LogSession yes\n\
              ThemeRule\n    Tags prod\n    Theme Production\n\
+             ThemeRule\n    Tags db\n    Theme Sandstorm\n\
              Credential ops\n    User someone\n",
         );
-        export(sessions, &settings)
+        let themes = [
+            (
+                "Sandstorm".to_owned(),
+                "Name Sandstorm\nBackground #2E3440\n".to_owned(),
+            ),
+            ("Unused".to_owned(), "Name Unused\n".to_owned()),
+        ];
+        export(sessions, &settings, &themes)
     }
 
     #[test]
@@ -273,6 +372,8 @@ mod tests {
         assert_eq!(team.profiles[0].credential.as_deref(), Some("ops"));
         assert!(team.security_rules[0].limits.keys_only);
         assert_eq!(team.theme_rules[0].theme, "Production");
+        // The custom theme a rule names travels; one nothing names does not.
+        assert_eq!(team.themes, ["Name Sandstorm\nBackground #2E3440\n"]);
         assert!(team.has("WEB"));
         // No credential travels, only its name.
         assert!(!String::from_utf8_lossy(&bytes).contains("someone"));
@@ -330,6 +431,42 @@ mod tests {
             password: zeroize::Zeroizing::new("p".into()),
         });
         assert_eq!(parse(&bundle.to_bytes()), Err(Refused::HoldsSecrets));
+    }
+
+    #[test]
+    fn themes_named_by_profiles_travel_and_missing_ones_are_listed() {
+        let sessions = "Host web\n    HostName web.example\n";
+        let settings = Settings::parse(
+            "Profile web\n    Theme \"My Blue\"\n\
+             Profile other\n    Theme Hidden\n\
+             ThemeRule\n    Tags x\n    Theme Gone\n\
+             ThemeRule\n    Tags y\n    Theme Nord\n",
+        );
+        let themes = [
+            ("my blue".to_owned(), "Name my blue\n".to_owned()),
+            ("Hidden".to_owned(), "Name Hidden\n".to_owned()),
+            ("Big".to_owned(), "x".repeat(MAX_THEME_LEN + 1)),
+        ];
+        let team = parse(&export(sessions, &settings, &themes)).unwrap();
+        // Not Hidden: its profile is for a connection not exported.
+        assert_eq!(team.themes, ["Name my blue\n"]);
+        let builtin = |n: &str| n == "Nord";
+        assert_eq!(
+            missing_themes(sessions, &settings, &themes, &builtin),
+            ["Gone"]
+        );
+    }
+
+    #[test]
+    fn library_themes_stop_at_a_gap_and_skip_big_ones() {
+        let mut bundle = Bundle::default();
+        bundle.set_file("sessions.conf", "Host a\n".into());
+        bundle.set_file("theme-1.conf", "Name A\n".into());
+        bundle.set_file("theme-2.conf", "x".repeat(MAX_THEME_LEN + 1));
+        bundle.set_file("theme-3.conf", "Name C\n".into());
+        bundle.set_file("theme-5.conf", "Name E\n".into());
+        let team = parse(&bundle.to_bytes()).unwrap();
+        assert_eq!(team.themes, ["Name A\n", "Name C\n"]);
     }
 
     #[test]

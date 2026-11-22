@@ -1,10 +1,11 @@
 //! Tools > Theme manager and Tools > Theme rules: what the two pages
 //! list. The theme manager is the looks: the built-in themes, the
-//! user's own themes (the themes folder) and the terminal fonts, each
-//! with the saved connections that open with it. Theme rules are the
-//! user's rules (tags or host patterns that pick a theme and a font), in
-//! the order they are tried, then the built-in tag rules, each with the
-//! connections it matches. Pure, so it is tested on any platform;
+//! user's own themes (the themes folder), the team library's and the
+//! terminal fonts, each with the saved connections that open with it.
+//! Theme rules are the team library's rules (shown, never changed here)
+//! and the user's (tags or host patterns that pick a theme and a font),
+//! in the order they are tried, then the built-in tag rules, each with
+//! the connections it matches. Pure, so it is tested on any platform;
 //! `theme_panel.rs` draws it.
 
 use ferossh_config::ThemeRule;
@@ -49,6 +50,8 @@ impl Page {
 /// Which group a row is in, in the order shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
+    /// The team library's: tried before the user's, never changed here.
+    TeamRules,
     Rules,
     /// The built-in tag rules (Production, Staging, Nord): enforced and
     /// tried before the user's, so nothing overrides them.
@@ -60,11 +63,14 @@ pub enum Group {
     Classic,
     /// The themes folder's.
     Custom,
+    /// The team library's.
+    TeamThemes,
     Fonts,
 }
 
 impl Group {
-    pub const ALL: [Group; 8] = [
+    pub const ALL: [Group; 10] = [
+        Group::TeamRules,
         Group::Rules,
         Group::BuiltInRules,
         Group::Dark,
@@ -72,11 +78,13 @@ impl Group {
         Group::Warning,
         Group::Classic,
         Group::Custom,
+        Group::TeamThemes,
         Group::Fonts,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
+            Group::TeamRules => "Team library rules (tried first, cannot change)",
             Group::Rules => "Your rules (tried from the top)",
             Group::BuiltInRules => "Built-in rules (always win, cannot change)",
             Group::Dark => "Dark themes",
@@ -84,6 +92,7 @@ impl Group {
             Group::Warning => "Warning themes",
             Group::Classic => "Classic themes",
             Group::Custom => "Your themes",
+            Group::TeamThemes => "Team library themes",
             Group::Fonts => "Fonts",
         }
     }
@@ -91,7 +100,7 @@ impl Group {
     /// The page it is listed on.
     pub fn page(self) -> Page {
         match self {
-            Group::Rules | Group::BuiltInRules => Page::Rules,
+            Group::TeamRules | Group::Rules | Group::BuiltInRules => Page::Rules,
             _ => Page::Looks,
         }
     }
@@ -100,7 +109,12 @@ impl Group {
     pub fn is_themes(self) -> bool {
         matches!(
             self,
-            Group::Dark | Group::Light | Group::Warning | Group::Classic | Group::Custom
+            Group::Dark
+                | Group::Light
+                | Group::Warning
+                | Group::Classic
+                | Group::Custom
+                | Group::TeamThemes
         )
     }
 }
@@ -202,14 +216,16 @@ fn covers(rule: &ThemeRule, c: &Connection) -> bool {
             .is_some_and(|h| rule.applies_to(h, &tags))
 }
 
-/// The rows: `rules` (the user's) and the built-in tag rules, with the
-/// connections each matches; then the looks: the built-in themes
-/// (`builtin`: each with its group, such as [`Group::Dark`]), the user's
-/// own themes and `fonts`.
+/// The rows: `team` (the team library's rules), `rules` (the user's)
+/// and the built-in tag rules, with the connections each matches; then
+/// the looks: the built-in themes (`builtin`: each with its group, such
+/// as [`Group::Dark`]), the custom themes (each with whether the team
+/// library brings it) and `fonts`.
 pub fn rows(
+    team: &[ThemeRule],
     rules: &[ThemeRule],
     builtin: &[(&str, Group)],
-    custom: &[&str],
+    custom: &[(&str, bool)],
     fonts: &[Font],
     all: &[Connection],
 ) -> Vec<Row> {
@@ -229,14 +245,18 @@ pub fn rows(
         in_rules: Vec::new(),
         dim: false,
     };
+    for (index, rule) in team.iter().enumerate() {
+        out.push(rule_row(Group::TeamRules, index, rule));
+    }
     for (index, rule) in rules.iter().enumerate() {
         out.push(rule_row(Group::Rules, index, rule));
     }
     for (index, rule) in ferossh_config::HostThemes::builtin().iter().enumerate() {
         out.push(rule_row(Group::BuiltInRules, index, rule));
     }
-    let all_rules: Vec<&ThemeRule> = rules
+    let all_rules: Vec<&ThemeRule> = team
         .iter()
+        .chain(rules)
         .chain(ferossh_config::HostThemes::builtin())
         .collect();
     let in_rules = |uses: &dyn Fn(&ThemeRule) -> bool| {
@@ -265,8 +285,13 @@ pub fn rows(
     for (index, (name, group)) in builtin.iter().enumerate() {
         out.push(look(*group, index, name, "", false));
     }
-    for (index, name) in custom.iter().enumerate() {
-        out.push(look(Group::Custom, index, name, "", false));
+    for (index, (name, from_team)) in custom.iter().enumerate() {
+        let (group, details) = if *from_team {
+            (Group::TeamThemes, "team library")
+        } else {
+            (Group::Custom, "")
+        };
+        out.push(look(group, index, name, details, false));
     }
     for (index, f) in fonts.iter().enumerate() {
         let details = match (f.installed, f.windows) {
@@ -370,12 +395,43 @@ pub fn summary(page: Page, shown: &[&Row], rules: usize) -> String {
                 1 => "1 theme rule.".to_owned(),
                 n => format!("{n} theme rules."),
             };
+            let rules_text = match count(Group::TeamRules) {
+                0 => rules_text,
+                1 => format!("1 team library rule, tried before yours. {rules_text}"),
+                n => format!("{n} team library rules, tried before yours. {rules_text}"),
+            };
             format!(
                 "{rules_text} The first rule that sets a theme, font or size wins; \
                  a connection's own look beats them all, except what an enforced rule sets."
             )
         }
     }
+}
+
+/// Everything rule `row` says, for reading only (a team library or
+/// built-in rule): its match, its look and every connection it covers.
+pub fn details(row: &Row) -> String {
+    let what = match row.group {
+        Group::TeamRules => format!(
+            "Team rule {}: from the team library. It applies as the team set it and cannot \
+             be changed or deleted here.",
+            row.index + 1
+        ),
+        _ => "A built-in rule: it always applies and cannot be changed.".to_owned(),
+    };
+    let names: Vec<String> = row.used_by.iter().map(|n| clean(n)).collect();
+    let covers = match names.len() {
+        0 => "It covers no saved connection yet.".to_owned(),
+        n => format!(
+            "Connections it covers ({n}): {}",
+            crate::bulk::name_list(&names)
+        ),
+    };
+    format!(
+        "{what}\n\nMatches: {}\nSets: {}\n\n{covers}",
+        clean(&row.name),
+        clean(&row.details)
+    )
 }
 
 /// The question before deleting rule `row`.
@@ -528,16 +584,48 @@ mod tests {
         ];
         let all = [conn("pi", &["Lab"]), conn("web", &["prod"])];
         rows(
+            &[],
             &rules,
             &[
                 ("Nord", Group::Dark),
                 ("Production", Group::Warning),
                 ("Dracula", Group::Dark),
             ],
-            &["Mine"],
+            &[("Mine", false)],
             &fonts,
             &all,
         )
+    }
+
+    #[test]
+    fn team_rules_and_themes_show_apart_and_cannot_be_changed() {
+        let team = [ThemeRule::new("Sandstorm").tags(&["db"])];
+        let mine = [ThemeRule::new("Dracula").tags(&["lab"])];
+        let all = [conn("db1", &["db"])];
+        let rows = rows(
+            &team,
+            &mine,
+            &[("Dracula", Group::Dark)],
+            &[("Sandstorm", true), ("Mine", false)],
+            &[],
+            &all,
+        );
+        let mut on: Vec<&Row> = on_page(&rows, Page::Rules);
+        sort(&mut on, None, false);
+        assert_eq!(on[0].group, Group::TeamRules, "tried first, listed first");
+        assert_eq!(on[0].used_by, ["db1"]);
+        assert!(!on[0].is_own_rule());
+        assert_eq!(on[1].group, Group::Rules);
+        let sand = rows.iter().find(|r| r.name == "Sandstorm").unwrap();
+        assert_eq!(sand.group, Group::TeamThemes);
+        assert_eq!(sand.in_rules, ["tags db"]);
+        assert_eq!(sand.preset_theme(), Some("Sandstorm"));
+        let own = rows.iter().find(|r| r.name == "Mine").unwrap();
+        assert_eq!(own.group, Group::Custom);
+        let d = details(on[0]);
+        assert!(d.starts_with("Team rule 1: from the team library"), "{d}");
+        assert!(d.contains("Matches: tags db") && d.contains("Sets: Sandstorm"));
+        assert!(d.contains("db1"));
     }
 
     #[test]

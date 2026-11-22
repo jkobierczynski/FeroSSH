@@ -61,6 +61,9 @@ pub struct CustomTheme {
     /// Its file ([`load`] sets it; empty for a theme not read from one),
     /// so the colour editor's Save writes it back there, by its own path.
     pub path: std::path::PathBuf,
+    /// From the team library ([`add_team`]): not a file here, and used
+    /// instead of this PC's theme of the same name.
+    pub team: bool,
 }
 
 /// A theme file that could not be used: its file name and why.
@@ -249,6 +252,7 @@ pub fn parse(text: &str, fallback: &str) -> Result<CustomTheme, String> {
         window,
         warnings,
         path: std::path::PathBuf::new(),
+        team: false,
     })
 }
 
@@ -407,10 +411,92 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
     Ok((themes, broken))
 }
 
+/// Adds the team library's themes (`team`: a theme file's text each) to
+/// what [`load`] read. A team theme is used instead of this PC's theme
+/// of the same name, as the team's rules come before the user's; the
+/// PC's file is then listed as not used. A team theme that cannot be
+/// read is listed too. Still at most [`MAX`]: the PC's own go first.
+pub fn add_team(loaded: &mut Loaded, team: &[String]) {
+    let (themes, broken) = loaded;
+    let mut added: Vec<CustomTheme> = Vec::new();
+    for (n, text) in (1..).zip(team) {
+        match parse(text, &format!("Team theme {n}")) {
+            Ok(t)
+                if added
+                    .iter()
+                    .any(|o| o.theme.name.eq_ignore_ascii_case(t.theme.name)) => {}
+            Ok(mut t) => {
+                t.team = true;
+                added.push(t);
+            }
+            Err(reason) => broken.push(Broken {
+                file: format!("team library theme {n}"),
+                reason,
+            }),
+        }
+    }
+    themes.retain(|own| {
+        let shadowed = added
+            .iter()
+            .any(|t| t.theme.name.eq_ignore_ascii_case(own.theme.name));
+        if shadowed {
+            broken.push(Broken {
+                file: own
+                    .path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                reason: format!(
+                    "the team library's theme {} is used instead",
+                    own.theme.name
+                ),
+            });
+        }
+        !shadowed
+    });
+    let room = MAX.saturating_sub(added.len());
+    for own in themes.drain(room.min(themes.len())..).collect::<Vec<_>>() {
+        broken.push(Broken {
+            file: own
+                .path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            reason: format!("more than {MAX} themes with the team library's"),
+        });
+    }
+    added.truncate(MAX);
+    themes.extend(added);
+    themes.sort_by_key(|t| t.theme.name.to_lowercase());
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn team_themes_replace_local_ones_of_the_same_name() {
+        let mut mine = parse("Name Sandstorm\nBackground #000000\n", "x").unwrap();
+        mine.path = std::path::PathBuf::from("Sandstorm.theme");
+        let other = parse("Name Mine\n", "x").unwrap();
+        let mut loaded: Loaded = (vec![mine, other], Vec::new());
+        add_team(
+            &mut loaded,
+            &[
+                "Name sandstorm\nBackground #112233\n".into(),
+                "Name Nord\n".into(),
+            ],
+        );
+        let (themes, broken) = loaded;
+        let names: Vec<&str> = themes.iter().map(|t| t.theme.name).collect();
+        assert_eq!(names, ["Mine", "sandstorm"]);
+        assert!(themes[1].team && !themes[0].team);
+        assert_eq!(themes[1].theme.background, Rgb::hex(0x0011_2233));
+        assert_eq!(broken.len(), 2, "{broken:?}");
+        assert_eq!(broken[0].file, "team library theme 2");
+        assert_eq!(broken[1].file, "Sandstorm.theme");
+    }
 
     #[test]
     fn a_written_theme_reads_back_the_same() {

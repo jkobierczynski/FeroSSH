@@ -241,7 +241,7 @@ mod tests {
     }
 
     fn write_library(dir: &Path, host: &str) -> PathBuf {
-        let bytes = team::export(&format!("Host {host}\n"), &Settings::default());
+        let bytes = team::export(&format!("Host {host}\n"), &Settings::default(), &[]);
         let sig = SshSig::sign(&admin(), team::NAMESPACE, HashAlg::Sha512, &bytes)
             .unwrap()
             .to_pem(LineEnding::LF)

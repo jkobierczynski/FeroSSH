@@ -22,7 +22,7 @@ use windows::core::{PCWSTR, PWSTR, w};
 
 use super::{
     DIALOG_OPEN, KEY_DEFAULTS, SideView, app_dir, app_read, dialog, home, imported_path, pick_file,
-    sessions_path, settings_path, with_window, write_app_file,
+    sessions_path, settings_path, themes_dir, with_window, write_app_file,
 };
 use crate::credman;
 use crate::keymap::Keymap;
@@ -135,9 +135,9 @@ const TEAM_FILTER: PCWSTR =
     w!("FeroSSH team libraries (*.ferossh-library)\0*.ferossh-library\0All files\0*.*\0");
 
 /// File > Import and export > Export team library: the saved connections,
-/// their profiles and the security and theme rules, with no password or
-/// credential, for an administrator to sign and share (see
-/// [`ferossh_config::team`]).
+/// their profiles and the security and theme rules, and the custom themes
+/// they name, with no password or credential, for an administrator to
+/// sign and share (see [`ferossh_config::team`]).
 pub(super) fn export_team(hwnd: HWND) {
     let sessions = app_read(&sessions_path()).unwrap_or_default();
     let hosts = bundle::count_hosts(&sessions);
@@ -149,7 +149,30 @@ pub(super) fn export_team(hwnd: HWND) {
         );
         return;
     }
-    let Some(bytes) = with_window(|w| ferossh_config::team::export(&sessions, &w.settings)) else {
+    // This PC's own theme files, written out again so each holds its
+    // name (a file without a Name line is named by its file). The team
+    // library's own themes are not files here and are not taken.
+    let themes: Vec<(String, String)> = crate::custom_theme::load(&themes_dir())
+        .map(|(t, _)| t)
+        .unwrap_or_default()
+        .iter()
+        .map(|c| {
+            let name = c.theme.name.to_owned();
+            let text =
+                crate::custom_theme::write(&name, &c.theme, c.font.as_deref(), c.size, c.window);
+            (name, text)
+        })
+        .collect();
+    let Some((bytes, missing)) = with_window(|w| {
+        let bytes = ferossh_config::team::export(&sessions, &w.settings, &themes);
+        let missing = ferossh_config::team::missing_themes(
+            &sessions,
+            &w.settings,
+            &themes,
+            &ferossh_render::Theme::is_builtin,
+        );
+        (bytes, missing)
+    }) else {
         return;
     };
     let start = home().join("Documents").join("team.ferossh-library");
@@ -171,9 +194,21 @@ pub(super) fn export_team(hwnd: HWND) {
                      {shown}. No password or credential is in it.\n\nSign it with your SSH key \
                      before sharing it, so FeroSSH accepts it:\n\nssh-keygen -Y sign -f <your \
                      key> -n {} \"{shown}\"\n\nThen put both the file and its .sig on the share, \
-                     and give your team the public key for Settings > Team library.",
+                     and give your team the public key for Settings > Team library.{}",
                     plural(hosts, "connection", "connections"),
                     ferossh_config::team::NAMESPACE,
+                    if missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\n\nNot in it: the theme{} {}, which a rule or connection names \
+                             but which is not in your themes folder. PCs without {} use their \
+                             default look there.",
+                            if missing.len() == 1 { "" } else { "s" },
+                            crate::bulk::name_list(&missing),
+                            if missing.len() == 1 { "it" } else { "them" },
+                        )
+                    },
                 ),
                 MB_OK | MB_ICONINFORMATION,
             );

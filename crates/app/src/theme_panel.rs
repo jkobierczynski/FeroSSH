@@ -717,7 +717,9 @@ fn update_buttons(h: Handles) {
     let own = row.as_ref().filter(|r| r.is_own_rule());
     let look = row.as_ref().is_some_and(|r| r.group.page() == Page::Looks);
     let on = |id| match id {
-        ID_EDIT | ID_DELETE => own.is_some(),
+        // Edit opens any rule; the team's and the built-in ones to read.
+        ID_EDIT => row.as_ref().is_some_and(|r| r.rule.is_some()),
+        ID_DELETE => own.is_some(),
         ID_UP => own.is_some_and(|r| view::moved_to(rules, r.index, Move::Up).is_some()),
         ID_DOWN => own.is_some_and(|r| view::moved_to(rules, r.index, Move::Down).is_some()),
         ID_APPLY | ID_DEFAULT | ID_USE => look,
@@ -780,11 +782,11 @@ fn emit(e: Event) {
     handler(main, e);
 }
 
-/// Enter or a double click: a rule opens, a theme or font goes on the
-/// pane.
+/// Enter or a double click: a rule opens (the team's and the built-in
+/// ones to read only), a theme or font goes on the pane.
 fn edit() {
     match selected() {
-        Some(r) if r.is_own_rule() => emit(Event::Edit(r)),
+        Some(r) if r.rule.is_some() => emit(Event::Edit(r)),
         Some(r) if r.group.page() == Page::Looks => emit(Event::Apply(r)),
         _ => {}
     }
