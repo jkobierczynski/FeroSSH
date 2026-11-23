@@ -8956,7 +8956,13 @@ impl Window {
         // pane is judged once that login has started, not before.
         let swapping = self.swapping_login == Some(id);
         if self.run_login.contains(&id) && !swapping {
-            self.check_run_login(id);
+            if alone {
+                // The new login may not have started (its worker failed):
+                // the row says so instead of waiting.
+                self.run_connected(id);
+            } else {
+                self.check_run_login(id);
+            }
         }
         if self.launch_hidden.contains(&id) && !swapping {
             self.check_launch(id);
