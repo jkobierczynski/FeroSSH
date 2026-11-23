@@ -162,6 +162,7 @@ pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
     }
     let mut hosts: Vec<SavedHost> = Vec::new();
     for mut h in saved::parse(bundle.file("sessions.conf").unwrap_or_default()) {
+        h.identity_file = portable_key(h.identity_file);
         if hosts.iter().any(|o| o.alias.eq_ignore_ascii_case(&h.alias)) {
             continue;
         }
@@ -221,6 +222,19 @@ fn read_serial(text: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// A connection's key file as a team library may carry it: only one in
+/// the user's own home folder (`~/.ssh/id_team`), which names each
+/// person's own file. A full path (`C:\Users\admin\.ssh\id_ed25519`,
+/// a share) names the exporting PC's file and its account, and on another
+/// PC some other file, so it is left out of an export and ignored in a
+/// library; each person's credential or ssh_config gives their key.
+fn portable_key(key: Option<String>) -> Option<String> {
+    key.filter(|k| {
+        let k = k.trim();
+        (k.starts_with("~/") || k.starts_with("~\\")) && !k.contains("..")
+    })
+}
+
 /// `p` without a password manager command, which could hold a password
 /// itself (`echo ...`): each user sets their own, or a named credential.
 fn without_password_command(mut p: Profile) -> Profile {
@@ -250,7 +264,13 @@ pub fn export(
     themes: &[(String, String)],
     serial: u64,
 ) -> Vec<u8> {
-    let hosts = saved::parse(sessions);
+    let hosts: Vec<SavedHost> = saved::parse(sessions)
+        .into_iter()
+        .map(|mut h| {
+            h.identity_file = portable_key(h.identity_file);
+            h
+        })
+        .collect();
     let part = Settings {
         profiles: settings
             .profiles
@@ -494,6 +514,27 @@ mod tests {
         bundle.set_file("theme-5.conf", "Name E\n".into());
         let team = parse(&bundle.to_bytes()).unwrap();
         assert_eq!(team.themes, ["Name A\n", "Name C\n"]);
+    }
+
+    #[test]
+    fn only_home_relative_key_files_travel() {
+        let sessions = "Host a\n    IdentityFile C:\\Users\\admin\\.ssh\\id_ed25519\n\n\
+                        Host b\n    IdentityFile \\\\server\\keys\\id\n\n\
+                        Host c\n    IdentityFile ~/.ssh/id_team\n\n\
+                        Host d\n    IdentityFile ~/../admin/.ssh/id\n";
+        let bytes = export(sessions, &Settings::default(), &[], 1);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("admin") && !text.contains("server"));
+        assert!(text.contains("~/.ssh/id_team"));
+        // A library made by hand with a full path: ignored on reading.
+        let mut bundle = Bundle::default();
+        bundle.set_file(
+            "sessions.conf",
+            "Host a\n    IdentityFile C:\\Users\\admin\\.ssh\\id\n".into(),
+        );
+        let team = parse(&bundle.to_bytes()).unwrap();
+        assert!(!team.hosts_text.contains("admin"));
+        assert!(team.has("a"));
     }
 
     #[test]
