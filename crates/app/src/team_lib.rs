@@ -40,14 +40,20 @@ pub fn set_current(team: Team) {
 /// copy could not be written ([`keep_newest`]).
 static ACCEPTED: Mutex<Vec<Accepted>> = Mutex::new(Vec::new());
 
-/// One entry of [`ACCEPTED`]: the library as read, so its checked copy
-/// can be written from it ([`keep_newest`]).
-struct Accepted {
-    library: String,
-    keys: Vec<String>,
+/// A library as read and checked: its team, and the bytes and signature
+/// its checked copy is written from.
+#[derive(Clone)]
+struct Copy {
     team: Team,
     bytes: Vec<u8>,
     sig: String,
+}
+
+/// One entry of [`ACCEPTED`].
+struct Accepted {
+    library: String,
+    keys: Vec<String>,
+    copy: Copy,
 }
 
 impl Accepted {
@@ -56,73 +62,74 @@ impl Accepted {
     }
 }
 
-/// The newest library accepted for `library` under `keys`: this run's,
-/// or the checked copy's, whichever is newer.
-fn newest_seen(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> {
-    let run = ACCEPTED.lock().ok().and_then(|a| {
-        a.iter()
-            .find(|e| e.is(library, keys))
-            .map(|e| e.team.clone())
-    });
-    let copy = from_cache(library, keys, cache_dir);
-    match (run, copy) {
-        (Some(r), Some(c)) => Some(if c.serial > r.serial { c } else { r }),
-        (r, c) => r.or(c),
+/// Takes `copy` as the newest accepted for `library` under `keys`,
+/// unless a newer one already is, which then comes back. One lock covers
+/// the check and the update; nothing slow happens under it.
+fn record(library: &str, keys: &[String], copy: Copy) -> Option<Team> {
+    let Ok(mut a) = ACCEPTED.lock() else {
+        return None;
+    };
+    match a.iter_mut().find(|e| e.is(library, keys)) {
+        Some(e) if e.copy.team.serial > copy.team.serial => Some(e.copy.team.clone()),
+        Some(e) => {
+            e.copy = copy;
+            None
+        }
+        None => {
+            a.push(Accepted {
+                library: library.trim().to_owned(),
+                keys: keys.to_vec(),
+                copy,
+            });
+            None
+        }
     }
 }
 
-/// Takes `team` as the newest accepted for `library` under `keys`,
-/// unless a newer one was accepted before (this run, or the checked copy
-/// on disk), which then comes back instead. One lock covers the check
-/// and the update.
+/// The newest library seen for `library` under `keys`: the checked copy
+/// on disk (taken into [`ACCEPTED`] too, so it stays the baseline if the
+/// copy later cannot be read) or this run's, whichever is newer.
+fn newest_seen(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> {
+    if let Some(disk) = read_copy(library, keys, cache_dir) {
+        let team = disk.team.clone();
+        return Some(record(library, keys, disk).unwrap_or(team));
+    }
+    ACCEPTED.lock().ok().and_then(|a| {
+        a.iter()
+            .find(|e| e.is(library, keys))
+            .map(|e| e.copy.team.clone())
+    })
+}
+
+/// Takes the library just read (`copy`) as the newest accepted for
+/// `library` under `keys`, unless a newer one was seen before (this run,
+/// or the checked copy on disk), which then comes back instead.
 fn accept_unless_older(
     library: &str,
     keys: &[String],
     cache_dir: &Path,
-    team: &Team,
-    bytes: &[u8],
-    sig: &str,
+    copy: Copy,
 ) -> Option<Team> {
-    let Ok(mut a) = ACCEPTED.lock() else {
-        return newest_seen(library, keys, cache_dir).filter(|k| k.serial > team.serial);
-    };
-    let run = a
-        .iter()
-        .find(|e| e.is(library, keys))
-        .map_or(0, |e| e.team.serial);
-    let copy = from_cache(library, keys, cache_dir);
-    if let Some(c) = copy.filter(|c| c.serial > team.serial && c.serial >= run) {
-        return Some(c);
+    // Read and checked before the lock, so a slow folder never holds it.
+    if let Some(disk) = read_copy(library, keys, cache_dir)
+        && disk.team.serial > copy.team.serial
+    {
+        let team = disk.team.clone();
+        return Some(record(library, keys, disk).unwrap_or(team));
     }
-    let entry = Accepted {
-        library: library.trim().to_owned(),
-        keys: keys.to_vec(),
-        team: team.clone(),
-        bytes: bytes.to_vec(),
-        sig: sig.to_owned(),
-    };
-    match a.iter_mut().find(|e| e.is(library, keys)) {
-        Some(e) if e.team.serial > team.serial => Some(e.team.clone()),
-        Some(e) => {
-            *e = entry;
-            None
-        }
-        None => {
-            a.push(entry);
-            None
-        }
-    }
+    record(library, keys, copy)
 }
 
-/// The newest library accepted this run for `library` under `keys`, if
-/// any: the window puts it back when a later read it published turns out
-/// older (two reads that crossed).
-pub fn newest_accepted(library: Option<&str>, keys: &[String]) -> Option<Team> {
+/// The newest library accepted this run for `library` under `keys`, when
+/// it is newer than serial `than` (the one in use): the window puts it
+/// back when a later read it published turns out older (two reads that
+/// crossed). Cheap: only a newer library is cloned.
+pub fn newest_accepted(library: Option<&str>, keys: &[String], than: u64) -> Option<Team> {
     let library = library.map(str::trim).filter(|l| !l.is_empty())?;
     ACCEPTED.lock().ok().and_then(|a| {
         a.iter()
-            .find(|e| e.is(library, keys))
-            .map(|e| e.team.clone())
+            .find(|e| e.is(library, keys) && e.copy.team.serial > than)
+            .map(|e| e.copy.team.clone())
     })
 }
 
@@ -230,18 +237,19 @@ fn keep_newest(
     // Held while the newest is picked and moved into place, so a read
     // that picked an older one cannot move it in after a newer one.
     let _held = COMMIT.lock();
-    let Some((serial, bytes, sig)) = ACCEPTED.lock().ok().and_then(|a| {
+    let Some(newest) = ACCEPTED.lock().ok().and_then(|a| {
         a.iter()
             .find(|e| e.is(library, keys))
-            .map(|e| (e.team.serial, e.bytes.clone(), e.sig.clone()))
+            .map(|e| e.copy.clone())
     }) else {
         return Ok(());
     };
-    let behind = from_cache(library, keys, cache_dir).is_some_and(|c| c.serial < serial);
+    let behind =
+        read_copy(library, keys, cache_dir).is_some_and(|c| c.team.serial < newest.team.serial);
     if !current() && !behind {
         return Ok(());
     }
-    write_copy(cache_dir, library, &bytes, &sig)
+    write_copy(cache_dir, library, &newest.bytes, &newest.sig)
 }
 
 /// Writes the checked copy for `library` beside it, then moves it over
@@ -292,7 +300,7 @@ pub fn cached(library: Option<&str>, keys: &[String], cache_dir: &Path) -> Team 
 }
 
 /// The copy of `library` in `cache_dir`, if it is still good under `keys`.
-fn from_cache(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> {
+fn read_copy(library: &str, keys: &[String], cache_dir: &Path) -> Option<Copy> {
     let record = read_capped(
         &cache_path(cache_dir, library),
         MAX_LEN + MAX_SIG_LEN + 32 + library.len(),
@@ -311,7 +319,17 @@ fn from_cache(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> 
     let rest = rest.get(1..)?;
     let sig = std::str::from_utf8(rest.get(..len)?).ok()?;
     let bytes = rest.get(len..)?;
-    team::load(bytes, sig, &team::keys(keys)).ok()
+    let team = team::load(bytes, sig, &team::keys(keys)).ok()?;
+    Some(Copy {
+        team,
+        bytes: bytes.to_vec(),
+        sig: sig.to_owned(),
+    })
+}
+
+/// The checked copy's team, if it is still good under `keys`.
+fn from_cache(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> {
+    read_copy(library, keys, cache_dir).map(|c| c.team)
 }
 
 /// What reading the library gave: the team (empty for none) and, when
@@ -346,9 +364,12 @@ pub fn load(
                 // a new one has reason to do. The newer copy stays in use.
                 // Checked and taken as the new baseline in one step, so two
                 // reads at once cannot each pass against an old baseline.
-                if let Some(kept) =
-                    accept_unless_older(library, keys, cache_dir, &team, &bytes, &sig)
-                {
+                let copy = Copy {
+                    team: team.clone(),
+                    bytes: bytes.clone(),
+                    sig: sig.clone(),
+                };
+                if let Some(kept) = accept_unless_older(library, keys, cache_dir, copy) {
                     let note = format!(
                         "The team library {shown} was not used: it is older than the copy \
                          FeroSSH checked last (exported {}, the copy {}), so someone may have \
@@ -364,8 +385,15 @@ pub fn load(
                 }
                 // The baseline is set already, so a copy that cannot be
                 // written only costs the offline fallback.
-                let _ = keep_newest(cache_dir, library, keys, current);
-                return Loaded { team, note: None };
+                let note = keep_newest(cache_dir, library, keys, current)
+                    .err()
+                    .map(|e| {
+                        format!(
+                            "FeroSSH could not keep a copy of the team library {shown} ({e}), so \
+                             it is used now but is not there when the share cannot be read."
+                        )
+                    });
+                return Loaded { team, note };
             }
             Err(why) => format!("was not used: {why}"),
         },
@@ -574,6 +602,34 @@ mod tests {
         write_dated(&share, "old", 100);
         assert!(load(Some(path), &keys, &cache, &|| true).team.has("new"));
         assert!(cached(Some(path), &keys, &cache).has("new"));
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn a_copy_from_disk_stays_the_baseline_when_it_goes() {
+        let share = temp("disk-baseline");
+        let cache = temp("disk-baseline-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let lib = write_dated(&share, "newest", 300);
+        let path = lib.to_str().unwrap();
+        // A copy of 300 on disk, as an earlier run of FeroSSH left it.
+        let bytes = std::fs::read(&lib).unwrap();
+        let sig = std::fs::read_to_string(sig_path(&lib)).unwrap();
+        {
+            let _held = COMMIT.lock();
+            write_copy(&cache, path, &bytes, &sig).unwrap();
+        }
+        // This run first reads 200: refused for the copy of 300.
+        write_dated(&share, "old", 200);
+        assert!(load(Some(path), &keys, &cache, &|| true).team.has("newest"));
+        // The copy then goes; 250 is still older than what was seen.
+        for f in std::fs::read_dir(&cache).unwrap() {
+            std::fs::remove_file(f.unwrap().path()).unwrap();
+        }
+        write_dated(&share, "older", 250);
+        let after = load(Some(path), &keys, &cache, &|| true);
+        assert!(after.team.has("newest") && after.note.is_some());
         let _ = std::fs::remove_dir_all(&share);
         let _ = std::fs::remove_dir_all(&cache);
     }

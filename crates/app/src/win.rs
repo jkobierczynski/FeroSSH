@@ -16898,8 +16898,8 @@ impl Window {
         if let Some(newer) = crate::team_lib::newest_accepted(
             self.settings.team_library.as_deref(),
             &self.settings.team_library_keys,
-        ) && newer.serial > self.settings.team.serial
-        {
+            self.settings.team.serial,
+        ) {
             let note = self.team_note.clone();
             self.use_team(crate::team_lib::Loaded { team: newer, note });
         }
