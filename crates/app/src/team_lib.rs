@@ -74,22 +74,28 @@ fn accepted(library: &str, keys: &[String], team: &Team) {
 /// The serial for a new export at `now` (seconds since 1970): past the
 /// library this PC uses (`current`) and past the last export from this
 /// PC, kept in `dir`, so every export is newer than the one before even
-/// when the clock is behind or two exports fall in the same second.
-pub fn next_serial(dir: Option<&Path>, now: u64, current: u64) -> u64 {
-    let file = dir.map(|d| d.join("team-export-serial"));
-    let last = file
-        .as_ref()
-        .and_then(|f| std::fs::read_to_string(f).ok())
-        .and_then(|t| t.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+/// when the clock is behind or two exports fall in the same second. An
+/// error when the last serial cannot be read or the new one kept: the
+/// export must not go ahead then, or two exports could share a serial.
+pub fn next_serial(dir: &Path, now: u64, current: u64) -> std::io::Result<u64> {
+    let file = dir.join("team-export-serial");
+    let last = match std::fs::read_to_string(&file) {
+        Ok(t) => t
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| std::io::Error::other("team-export-serial is damaged"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e),
+    };
     let serial = now
         .max(current.saturating_add(1))
         .max(last.saturating_add(1));
-    if let (Some(d), Some(f)) = (dir, file) {
-        let _ = std::fs::create_dir_all(d);
-        let _ = std::fs::write(f, format!("{serial}\n"));
-    }
-    serial
+    std::fs::create_dir_all(dir)?;
+    let tmp = write_new(&file, format!("{serial}\n").as_bytes(), serial)?;
+    std::fs::rename(&tmp, &file).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(serial)
 }
 
 /// The signature file beside `library`: its name with `.sig` added, as
@@ -457,13 +463,18 @@ mod tests {
     #[test]
     fn each_export_gets_a_newer_serial() {
         let dir = temp("serial");
-        assert_eq!(next_serial(Some(&dir), 1000, 0), 1000);
+        assert_eq!(next_serial(&dir, 1000, 0).unwrap(), 1000);
         // Same second, and a clock that went back: still newer.
-        assert_eq!(next_serial(Some(&dir), 1000, 0), 1001);
-        assert_eq!(next_serial(Some(&dir), 500, 0), 1002);
+        assert_eq!(next_serial(&dir, 1000, 0).unwrap(), 1001);
+        assert_eq!(next_serial(&dir, 500, 0).unwrap(), 1002);
         // Past the library in use.
-        assert_eq!(next_serial(Some(&dir), 1000, 5000), 5001);
-        assert_eq!(next_serial(None, 10, 0), 10);
+        assert_eq!(next_serial(&dir, 1000, 5000).unwrap(), 5001);
+        // A damaged record, or a folder that cannot hold one: no serial.
+        std::fs::write(dir.join("team-export-serial"), "junk").unwrap();
+        assert!(next_serial(&dir, 1000, 0).is_err());
+        let file = dir.join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(next_serial(&file, 1000, 0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

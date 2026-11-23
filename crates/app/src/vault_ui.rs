@@ -169,11 +169,24 @@ pub(super) fn export_team(hwnd: HWND) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let serial = crate::team_lib::next_serial(
-        crate::portable::local_dir().as_deref(),
-        now,
-        crate::team_lib::current().serial,
-    );
+    let next = crate::portable::local_dir()
+        .ok_or_else(|| std::io::Error::other("FeroSSH has no folder for this PC"))
+        .and_then(|dir| crate::team_lib::next_serial(&dir, now, crate::team_lib::current().serial));
+    let serial = match next {
+        Ok(serial) => serial,
+        Err(e) => {
+            dialog(
+                hwnd,
+                &format!(
+                    "The team library was not exported: FeroSSH could not keep its version \
+                     number ({e}). Each export needs a newer one than the last, so that an \
+                     older library cannot be put back in its place."
+                ),
+                MB_OK | MB_ICONWARNING,
+            );
+            return;
+        }
+    };
     let Some((bytes, missing)) = with_window(|w| {
         let bytes = ferossh_config::team::export(&sessions, &w.settings, &themes, serial);
         let missing = ferossh_config::team::missing_themes(
