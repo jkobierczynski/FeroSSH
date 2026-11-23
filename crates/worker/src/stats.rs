@@ -433,10 +433,16 @@ async fn serve(
                     if let Some(stats) = latest
                         && out.send(Message::Stats { channel, stats }).await.is_err()
                     {
+                        // The UI is gone: the server's session must not
+                        // outlive it.
+                        let _ = write.close().await;
                         break;
                     }
                 }
                 Some(ChannelMsg::Failure) => {
+                    // A refused command still holds a session on the
+                    // server (sshd MaxSessions) until it is closed.
+                    let _ = write.close().await;
                     return "The server would not report its statistics.".into();
                 }
                 Some(ChannelMsg::Close) | None => break,
