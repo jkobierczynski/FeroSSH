@@ -1207,13 +1207,14 @@ impl Tmux {
         }
     }
 
-    /// Asks how many clients the session attached has.
+    /// Asks how many clients the session attached has: a list, since
+    /// before tmux 3.3 `#{session_attached}` leaves control clients out.
     fn ask_clients(&mut self, out: &mut Vec<Action>) {
         let Some((session, _)) = self.session else {
             return;
         };
         self.send(
-            &format!("display-message -p -t ${session} '#{{session_attached}}'"),
+            &format!("list-clients -t ${session} -F '#{{client_name}}'"),
             Tag::Clients(session),
             out,
         );
@@ -1355,15 +1356,25 @@ impl Tmux {
                 // Releases are numbers ("3.4", "3.3a").
                 self.dev_build = !version.starts_with(|c: char| c.is_ascii_digit());
                 // A count asked for after a client came or went is newer.
-                if self.clients.is_none() {
-                    self.clients = words.next().and_then(|c| c.parse().ok());
-                }
+                // Before 3.3 control clients are left out of it: listed
+                // (after what sharing asks, which waits on this reply).
+                let list_clients = if self.version.is_some_and(|v| v >= WINDOW_SIZES_VERSION) {
+                    if self.clients.is_none() {
+                        self.clients = words.next().and_then(|c| c.parse().ok());
+                    }
+                    false
+                } else {
+                    ok && self.clients_asked == 0
+                };
                 if let Some(share) = self.share_pending.take() {
                     self.send(
                         "display-message -p '#{socket_path}'",
                         Tag::ShareSocket(share),
                         out,
                     );
+                }
+                if list_clients {
+                    self.ask_clients(out);
                 }
             }
             Tag::ShareSocket(share) => {
@@ -1645,7 +1656,10 @@ impl Tmux {
                 self.clients_asked = self.clients_asked.saturating_sub(1);
                 if self.session.as_ref().map(|(s, _)| *s) == Some(session) {
                     // A failed count is unknown, never "alone".
-                    self.clients = ok.then(|| first().trim().parse().ok()).flatten();
+                    self.clients = ok
+                        .then(|| lines.iter().filter(|l| !l.is_empty()).count())
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n > 0);
                 }
             }
             Tag::OwnClient(session) => {
@@ -3723,19 +3737,19 @@ mod tests {
         }
         // Another client attached: shared at once, before the count.
         let a = t.feed(&mut ws, b"%client-session-changed /dev/pts/4 $0 main\n");
-        assert_eq!(
-            writes(&a),
-            ["display-message -p -t $0 '#{session_attached}'"]
-        );
+        assert_eq!(writes(&a), ["list-clients -t $0 -F '#{client_name}'"]);
         assert!(t.maybe_shared());
         assert_eq!(t.others_attached(), 0);
-        t.feed(&mut ws, &reply(n + 1, &["2".into()]));
+        t.feed(
+            &mut ws,
+            &reply(n + 1, &["/dev/pts/3".into(), "/dev/pts/4".into()]),
+        );
         assert!(t.maybe_shared());
         assert_eq!(t.others_attached(), 1);
         // It left: still asked about until tmux says so.
         t.feed(&mut ws, b"%client-detached /dev/pts/4\n");
         assert!(t.maybe_shared());
-        t.feed(&mut ws, &reply(n + 2, &["1".into()]));
+        t.feed(&mut ws, &reply(n + 2, &["/dev/pts/3".into()]));
         assert!(!t.maybe_shared());
     }
 
