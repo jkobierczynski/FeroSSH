@@ -47,6 +47,9 @@ pub const MAX_THEMES: usize = 50;
 /// folder reads them).
 pub const MAX_THEME_LEN: usize = 64 * 1024;
 
+/// The bundle file holding the library's [`Team::serial`].
+const VERSION_FILE: &str = "library.conf";
+
 /// The bundle file holding a library's theme `n` (from 1).
 fn theme_file(n: usize) -> String {
     format!("theme-{n}.conf")
@@ -67,6 +70,17 @@ pub struct Team {
     /// The custom themes it brings: a theme file's text each, read by
     /// the app as the themes folder's are.
     pub themes: Vec<String>,
+    /// When it was exported, seconds since 1970, signed with the rest:
+    /// a library older than one already checked is not used, so a share
+    /// cannot be turned back to an earlier signed library (one from
+    /// before a security rule was added, say). 0 for a library exported
+    /// before FeroSSH wrote one.
+    pub serial: u64,
+    /// Read from a library whose signature was checked (or its checked
+    /// copy); false for none at all. A machine policy that requires the
+    /// library connects nowhere without one
+    /// ([`crate::team_policy::check`]).
+    pub verified: bool,
 }
 
 impl Team {
@@ -142,6 +156,27 @@ pub fn verify(bytes: &[u8], sig: &str, trusted: &[PublicKey]) -> Result<(), Refu
         .map_err(|_| Refused::BadSignature)
 }
 
+/// The fingerprint (`SHA256:...`) of the key that made signature `sig`,
+/// for a library [`verify`] accepted: what FeroSSH keeps the newest
+/// library date per, whatever path the library is read from.
+pub fn signer(sig: &str) -> Option<String> {
+    let sig = SshSig::from_pem(sig.trim()).ok()?;
+    Some(
+        sig.public_key()
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string(),
+    )
+}
+
+/// The fingerprints of the keys in `lines` (the `TeamLibraryKey` lines),
+/// as [`signer`] gives them.
+pub fn fingerprints(lines: &[String]) -> Vec<String> {
+    keys(lines)
+        .iter()
+        .map(|k| k.fingerprint(russh::keys::HashAlg::Sha256).to_string())
+        .collect()
+}
+
 /// Reads a library already verified.
 pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
     if bytes.len() > MAX_LEN {
@@ -153,6 +188,7 @@ pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
     }
     let mut hosts: Vec<SavedHost> = Vec::new();
     for mut h in saved::parse(bundle.file("sessions.conf").unwrap_or_default()) {
+        h.identity_file = portable_key(h.identity_file);
         if hosts.iter().any(|o| o.alias.eq_ignore_ascii_case(&h.alias)) {
             continue;
         }
@@ -193,12 +229,36 @@ pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
         .map(str::to_owned)
         .collect();
     Ok(Team {
+        serial: bundle.file(VERSION_FILE).map_or(0, read_serial),
         hosts_text: saved::to_text(&hosts),
         names,
         profiles,
         security_rules,
         theme_rules: settings.theme_rules,
         themes,
+        verified: true,
+    })
+}
+
+/// The `Serial` line of a library's [`VERSION_FILE`]; 0 when there is
+/// none that reads.
+fn read_serial(text: &str) -> u64 {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("Serial "))
+        .find_map(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// A connection's key file as a team library may carry it: only one in
+/// the user's own home folder (`~/.ssh/id_team`), which names each
+/// person's own file. A full path (`C:\Users\admin\.ssh\id_ed25519`,
+/// a share) names the exporting PC's file and its account, and on another
+/// PC some other file, so it is left out of an export and ignored in a
+/// library; each person's credential or ssh_config gives their key.
+fn portable_key(key: Option<String>) -> Option<String> {
+    key.filter(|k| {
+        let k = k.trim();
+        (k.starts_with("~/") || k.starts_with("~\\")) && !k.contains("..")
     })
 }
 
@@ -223,9 +283,21 @@ pub fn load(bytes: &[u8], sig: &str, trusted: &[PublicKey]) -> Result<Team, Refu
 ///
 /// `themes` are the custom themes on this PC, as (name, theme file
 /// text): those a theme rule or an exported profile names go in, at
-/// most [`MAX_THEMES`].
-pub fn export(sessions: &str, settings: &Settings, themes: &[(String, String)]) -> Vec<u8> {
-    let hosts = saved::parse(sessions);
+/// most [`MAX_THEMES`]. `serial` is the export's time, seconds since
+/// 1970 (see [`Team::serial`]).
+pub fn export(
+    sessions: &str,
+    settings: &Settings,
+    themes: &[(String, String)],
+    serial: u64,
+) -> Vec<u8> {
+    let hosts: Vec<SavedHost> = saved::parse(sessions)
+        .into_iter()
+        .map(|mut h| {
+            h.identity_file = portable_key(h.identity_file);
+            h
+        })
+        .collect();
     let part = Settings {
         profiles: settings
             .profiles
@@ -241,6 +313,7 @@ pub fn export(sessions: &str, settings: &Settings, themes: &[(String, String)]) 
     let mut bundle = Bundle::default();
     bundle.set_file("sessions.conf", saved::to_text(&hosts));
     bundle.set_file("ferossh.conf", part.to_text());
+    bundle.set_file(VERSION_FILE, format!("Serial {serial}\n"));
     for (n, (_, text)) in (1..).zip(used_themes(&part, themes)) {
         bundle.set_file(&theme_file(n), text.clone());
     }
@@ -356,7 +429,7 @@ mod tests {
             ),
             ("Unused".to_owned(), "Name Unused\n".to_owned()),
         ];
-        export(sessions, &settings, &themes)
+        export(sessions, &settings, &themes, 1_700_000_000)
     }
 
     #[test]
@@ -375,6 +448,7 @@ mod tests {
         // The custom theme a rule names travels; one nothing names does not.
         assert_eq!(team.themes, ["Name Sandstorm\nBackground #2E3440\n"]);
         assert!(team.has("WEB"));
+        assert_eq!(team.serial, 1_700_000_000);
         // No credential travels, only its name.
         assert!(!String::from_utf8_lossy(&bytes).contains("someone"));
         // Nor a password command, which could hold a password.
@@ -447,7 +521,7 @@ mod tests {
             ("Hidden".to_owned(), "Name Hidden\n".to_owned()),
             ("Big".to_owned(), "x".repeat(MAX_THEME_LEN + 1)),
         ];
-        let team = parse(&export(sessions, &settings, &themes)).unwrap();
+        let team = parse(&export(sessions, &settings, &themes, 0)).unwrap();
         // Not Hidden: its profile is for a connection not exported.
         assert_eq!(team.themes, ["Name my blue\n"]);
         let builtin = |n: &str| n == "Nord";
@@ -467,6 +541,40 @@ mod tests {
         bundle.set_file("theme-5.conf", "Name E\n".into());
         let team = parse(&bundle.to_bytes()).unwrap();
         assert_eq!(team.themes, ["Name A\n", "Name C\n"]);
+    }
+
+    #[test]
+    fn only_home_relative_key_files_travel() {
+        let sessions = "Host a\n    IdentityFile C:\\Users\\admin\\.ssh\\id_ed25519\n\n\
+                        Host b\n    IdentityFile \\\\server\\keys\\id\n\n\
+                        Host c\n    IdentityFile ~/.ssh/id_team\n\n\
+                        Host d\n    IdentityFile ~/../admin/.ssh/id\n";
+        let bytes = export(sessions, &Settings::default(), &[], 1);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("admin") && !text.contains("server"));
+        assert!(text.contains("~/.ssh/id_team"));
+        // A library made by hand with a full path: ignored on reading.
+        let mut bundle = Bundle::default();
+        bundle.set_file(
+            "sessions.conf",
+            "Host a\n    IdentityFile C:\\Users\\admin\\.ssh\\id\n".into(),
+        );
+        let team = parse(&bundle.to_bytes()).unwrap();
+        assert!(!team.hosts_text.contains("admin"));
+        assert!(team.has("a"));
+    }
+
+    #[test]
+    fn signer_names_the_signing_key() {
+        let admin = key(1);
+        let sig = sign(&admin, NAMESPACE, b"x");
+        assert_eq!(
+            signer(&sig).unwrap(),
+            admin.public_key().fingerprint(HashAlg::Sha256).to_string()
+        );
+        assert_eq!(signer("junk"), None);
+        let line = admin.public_key().to_openssh().unwrap();
+        assert_eq!(fingerprints(&[line]), [signer(&sig).unwrap()]);
     }
 
     #[test]
