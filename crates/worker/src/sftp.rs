@@ -24,6 +24,7 @@ use ferossh_sftp::wire::{self, Decoder, Request, Response, pflags};
 use russh::{ChannelMsg, Disconnect, Sig};
 use tokio::sync::{mpsc, watch};
 
+use crate::closing::CloseOnDrop;
 use crate::session::{Connection, Connections};
 
 /// Waiting for the server's version and home folder.
@@ -693,10 +694,14 @@ async fn serve(
     let Ok(ch) = conn.channel_open_session().await else {
         return refused("The server would not open a channel for SFTP.");
     };
-    if ch.request_subsystem(true, "sftp").await.is_err() {
+    // Closed on every way out, closing File transfer included, so the
+    // server frees the session.
+    let (mut read, write) = ch.split();
+    let channel_guard = CloseOnDrop::new(write);
+    if channel_guard.request_subsystem(true, "sftp").await.is_err() {
         return refused("The server has no SFTP.");
     }
-    let (mut read, write) = ch.split();
+    let write = channel_guard.share();
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(64);
     let writer = tokio::spawn(async move {
         while let Some(packet) = write_rx.recv().await {

@@ -43,6 +43,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use crate::closing::CloseOnDrop;
 use crate::crypto_policy::{
     MIN_RSA_BITS, aes_gcm_first, legacy_would_help, preferred_for, terrapin_prone, with_legacy,
     without_terrapin,
@@ -159,6 +160,18 @@ impl fmt::Display for Failure {
                 }
                 _ => write!(f, "The connection broke: {e}."),
             },
+            Failure::Ssh(russh::Error::ChannelOpenFailure(why)) => f.write_str(match why {
+                ChannelOpenFailure::AdministrativelyProhibited => {
+                    "The server refused another session on this connection. sshd allows 10 per \
+                     connection by default (MaxSessions): close some tabs, panes or File transfer \
+                     windows on this host, or raise MaxSessions on the server. Its sshd_config may \
+                     also forbid sessions for this account."
+                }
+                ChannelOpenFailure::ResourceShortage => {
+                    "The server is out of resources for another session on this connection."
+                }
+                _ => "The server refused to open a session.",
+            }),
             Failure::Ssh(e) => write!(f, "{e}."),
             Failure::Refused(why) => f.write_str(why),
             Failure::NoStrictKex => f.write_str(TERRAPIN),
@@ -1723,6 +1736,10 @@ async fn pump(
         return mosh_session(conn, *mosh, inbox, ctx).await;
     }
     let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
+    // Closed on every way out below, a refused request or the tab
+    // closing included, so the server frees the session.
+    let (mut read, write) = channel.split();
+    let channel = CloseOnDrop::new(write);
     // X11 first: its reply is then the first one back.
     let mut x11_reply = false;
     if let Some(auth) = ctx.x11.take() {
@@ -1759,7 +1776,7 @@ async fn pump(
     }
     ctx.send(connected(ctx)).await?;
 
-    let (mut read, write) = channel.split();
+    let write = channel.share();
     // Writes can wait for the server's window; they run in their own task
     // so output keeps flowing meanwhile.
     let (input, mut input_rx) = mpsc::channel::<Message>(64);
@@ -1879,8 +1896,10 @@ async fn mosh_session(
         )));
     };
     let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
-    channel.exec(true, line.as_bytes()).await?;
-    let (mut read, _write) = channel.split();
+    let (mut read, write) = channel.split();
+    // Held for the whole Mosh session, then closed.
+    let write = CloseOnDrop::new(write);
+    write.exec(true, line.as_bytes()).await?;
     let output = async {
         let mut got = Vec::new();
         while got.len() < MAX_OUTPUT {

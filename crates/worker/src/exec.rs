@@ -15,6 +15,7 @@ use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message};
 use russh::ChannelMsg;
 use tokio::sync::mpsc;
 
+use crate::closing::CloseOnDrop;
 use crate::session::{Connection, Connections};
 use crate::sftp::release;
 
@@ -51,10 +52,12 @@ async fn serve(
     let Ok(ch) = conn.channel_open_session().await else {
         return "The server would not open a channel for the command.".into();
     };
-    if ch.exec(true, command).await.is_err() {
+    // Closed on every way out, so the server frees the session.
+    let (mut read, write) = ch.split();
+    let write = CloseOnDrop::new(write);
+    if write.exec(true, command).await.is_err() {
         return "The server would not run the command.".into();
     }
-    let (mut read, write) = ch.split();
     let send = |bytes: &[u8], stderr: bool| {
         let msgs: Vec<Message> = bytes
             .chunks(MAX_DATA_CHUNK)

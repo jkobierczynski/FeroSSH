@@ -1738,3 +1738,84 @@ async fn samples_the_servers_load_for_the_status_bar() {
         }
     }
 }
+
+/// Tabs, panes and File transfer opened and closed again on a shared
+/// connection give their sessions back: sshd's `MaxSessions` counts the
+/// ones still open, and a channel the worker only dropped stayed open on
+/// the server until the server refused new ones ("administratively
+/// prohibited").
+#[cfg(unix)]
+#[tokio::test]
+async fn closed_channels_free_their_sessions() {
+    if !available() {
+        return;
+    }
+    // The login's own shell, plus one more at a time.
+    let server = start("sessions", "MaxSessions 2\nSubsystem sftp internal-sftp");
+    let (to_worker, mut from_worker) = login(&server).await;
+    let mut channel = 10;
+    for round in 0..4 {
+        for sftp in [false, true] {
+            // The server frees a closed session once its shell has gone:
+            // give it a moment, never forever.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                channel += 1;
+                let open = if sftp {
+                    Message::SftpOpen {
+                        channel,
+                        connection: 1,
+                    }
+                } else {
+                    Message::OpenChannel {
+                        channel,
+                        connection: 1,
+                        cols: 80,
+                        rows: 24,
+                        x11: None,
+                        options: Default::default(),
+                    }
+                };
+                to_worker.send(open).await.unwrap();
+                let refused = loop {
+                    let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+                        .await
+                        .expect("timed out")
+                        .expect("worker hung up");
+                    match msg {
+                        Message::Connected { channel: c, .. }
+                        | Message::SftpReady { channel: c, .. }
+                            if c == channel =>
+                        {
+                            break None;
+                        }
+                        Message::Disconnected { channel: c, reason } if c == channel => {
+                            break Some(reason);
+                        }
+                        _ => {}
+                    }
+                };
+                match refused {
+                    None => break,
+                    Some(reason) => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "round {round}, sftp {sftp}: {reason}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            to_worker.send(Message::Close { channel }).await.unwrap();
+            loop {
+                let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+                    .await
+                    .expect("timed out closing")
+                    .expect("worker hung up");
+                if matches!(msg, Message::Disconnected { channel: c, .. } if c == channel) {
+                    break;
+                }
+            }
+        }
+    }
+}
