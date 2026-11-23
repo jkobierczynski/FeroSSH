@@ -3481,10 +3481,7 @@ mod tests {
             channel: 2,
             reason: "The server refused another session on this connection.".into(),
         });
-        assert!(
-            matches!(fx[..], [Effect::Show(_), Effect::LoginAlone]),
-            "{fx:?}"
-        );
+        assert!(matches!(fx[..], [Effect::Show(_), Effect::LoginAlone]));
         assert!(shown(&fx).contains("new connection"));
         assert!(second.solo);
         // The connection takes no more shells.
