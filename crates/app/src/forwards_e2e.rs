@@ -286,7 +286,7 @@ fn local_remote_dynamic_and_x11_forwards() {
                 Effect::Connected => {
                     forwarder.start(session.connection, target.label(), setup.clone());
                 }
-                Effect::Ended | Effect::Reconnect => {}
+                Effect::Ended | Effect::Reconnect | Effect::LoginAlone => {}
                 // No password source in these tests.
                 Effect::FetchPassword
                 | Effect::StorePassword { .. }
@@ -526,6 +526,7 @@ impl Shell {
                     }
                     Effect::Ended
                     | Effect::Reconnect
+                    | Effect::LoginAlone
                     | Effect::FetchPassword
                     | Effect::StorePassword { .. }
                     | Effect::StoreProxyPassword { .. }

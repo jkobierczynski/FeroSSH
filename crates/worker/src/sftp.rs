@@ -25,7 +25,7 @@ use russh::{ChannelMsg, Disconnect, Sig};
 use tokio::sync::{mpsc, watch};
 
 use crate::closing::CloseOnDrop;
-use crate::session::{Connection, Connections};
+use crate::session::{Connection, Connections, MORE_SESSIONS_REFUSED};
 
 /// Waiting for the server's version and home folder.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -691,8 +691,17 @@ async fn serve(
     out: mpsc::Sender<Message>,
 ) -> End {
     let refused = |why: &str| End::Refused(why.to_owned());
-    let Ok(ch) = conn.channel_open_session().await else {
-        return refused("The server would not open a channel for SFTP.");
+    let ch = match conn.channel_open_session().await {
+        Ok(ch) => ch,
+        Err(russh::Error::ChannelOpenFailure(
+            russh::ChannelOpenFailure::AdministrativelyProhibited,
+        )) => {
+            return End::Refused(format!(
+                "{MORE_SESSIONS_REFUSED} For File transfer on such a server, open an SFTP \
+                 connection to it (Type sftp, or sftp://host)."
+            ));
+        }
+        Err(_) => return refused("The server would not open a channel for SFTP."),
     };
     // Closed on every way out, closing File transfer included, so the
     // server frees the session.

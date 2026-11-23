@@ -1475,6 +1475,9 @@ struct Window {
     toast_queue: VecDeque<PaneId>,
     /// SSH panes reconnecting after their connection dropped.
     retries: HashMap<PaneId, Retry>,
+    /// SSH panes whose next login shares no connection: the server refused
+    /// their shell on the one they shared.
+    login_alone: HashSet<PaneId>,
     /// Commands decided outside a handler that returns them; the next
     /// redraw runs them.
     queued: Vec<Command>,
@@ -2973,6 +2976,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 agent_states: Vec::new(),
                 toast_queue: VecDeque::new(),
                 retries: HashMap::new(),
+                login_alone: HashSet::new(),
                 queued: Vec::new(),
                 desktops: HashMap::new(),
                 previews: HashMap::new(),
@@ -8077,7 +8081,11 @@ impl Window {
         });
         // The connection to share, and the host key it was checked with
         // (the shared login sees no key of its own).
-        let shared_with = (!rules.keys_only && !hops_keys_only)
+        // A pane whose shell a shared connection refused logs in alone,
+        // and its own login is not shared either: the server takes one
+        // session per connection.
+        let alone = self.login_alone.remove(&id);
+        let shared_with = (!rules.keys_only && !hops_keys_only && !alone)
             .then(|| {
                 self.panes.values().find_map(|p| match &p.host {
                     Host::Ssh(s) if p.id != id && s.can_share(&target) => {
@@ -8125,6 +8133,7 @@ impl Window {
             .unwrap_or(self.settings.auto_reconnect);
         let mut session = SshSession::new(channel, target, env.known_hosts());
         session.auto_reconnect = auto_reconnect;
+        session.solo = alone;
         if let Some((_, key)) = shared_with {
             session.host_key_seen = key;
         }
@@ -8625,6 +8634,7 @@ impl Window {
     fn apply(&mut self, id: PaneId, effects: Vec<Effect>) {
         // A run's row that ended: the next host may start.
         let mut pump = false;
+        let mut alone = false;
         for effect in effects {
             if matches!(effect, Effect::Connected)
                 && let Some(p) = self.panes.get_mut(&id)
@@ -8890,6 +8900,8 @@ impl Window {
                     self.workspace_shell_gone(id);
                     self.schedule_reconnect(id);
                 }
+                // Once this batch is through: the login replaces the host.
+                Effect::LoginAlone => alone = true,
                 Effect::Ended => {
                     self.workspace_shell_gone(id);
                     self.release_workspace_panes(id, false);
@@ -8957,6 +8969,31 @@ impl Window {
         if pump {
             self.pump_run();
         }
+        if alone {
+            self.login_alone(id);
+        }
+    }
+
+    /// Pane `id`'s shell was refused on the connection it shared: no tab
+    /// shares that connection any more, and the pane logs in on a
+    /// connection of its own, as OpenSSH's multiplexing client does.
+    fn login_alone(&mut self, id: PaneId) {
+        let Some((connection, target)) = (match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => Some((s.connection, s.target.clone())),
+            _ => None,
+        }) else {
+            return;
+        };
+        for p in self.panes.values_mut() {
+            if let Host::Ssh(s) = &mut p.host
+                && s.connection == connection
+            {
+                s.solo = true;
+            }
+        }
+        self.login_alone.insert(id);
+        let env = ssh_env();
+        self.connect_to(id, target, &env);
     }
 
     /// What a closed WinRM session's closer asks for: only messages to

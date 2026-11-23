@@ -431,6 +431,13 @@ async fn open_stream(
                     .await?;
             }
             return Err(failed(match e {
+                russh::Error::ChannelOpenFailure(
+                    russh::ChannelOpenFailure::AdministrativelyProhibited
+                    | russh::ChannelOpenFailure::UnknownChannelType,
+                ) => "the server does not forward connections (AllowTcpForwarding no, a \
+                      restrict option on the key, or a server without forwarding, such as \
+                      tinysshd)."
+                    .to_owned(),
                 russh::Error::ChannelOpenFailure(why) => {
                     format!("the server could not connect ({why:?}).")
                 }

@@ -4,7 +4,7 @@ This page explains each feature in turn. [Menu reference](menus.md) lists every 
 
 ## Tabs and splits
 
-The window starts as one pane, with no tab strip. Ctrl+Shift+T opens a tab and the strip appears; Alt+Shift+= and Alt+Shift+- split the pane right or down. A new tab or pane on a host you are already logged in to opens another channel on the same connection, so there is no second login.
+The window starts as one pane, with no tab strip. Ctrl+Shift+T opens a tab and the strip appears; Alt+Shift+= and Alt+Shift+- split the pane right or down. A new tab or pane on a host you are already logged in to opens another channel on the same connection, so there is no second login. A server that refuses another session on that connection (tinysshd takes one per connection; OpenSSH's sshd 10 by default, its MaxSessions) gets a login of its own for the new pane instead, and later panes on that host do the same. File transfer cannot share a connection on such a server: open an SFTP connection to the host (Type sftp, or `sftp://host`) instead.
 
 - Alt+arrows moves the focus, Alt+Shift+arrows grows the focused pane, and dragging a divider resizes.
 - Ctrl+Tab and Ctrl+Shift+Tab switch tabs. Drag a tab, or press Ctrl+Shift+PgUp and PgDn, to reorder it.

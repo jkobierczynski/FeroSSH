@@ -1368,7 +1368,7 @@ async fn a_jump_host_without_forwarding_refuses_the_tunnel() {
     assert!(
         seen.tunnel_ends
             .iter()
-            .any(|r| r.contains("could not connect")),
+            .any(|r| r.contains("does not forward connections")),
         "{seen:?}"
     );
 }
@@ -1818,4 +1818,184 @@ async fn closed_channels_free_their_sessions() {
             }
         }
     }
+}
+
+/// tinysshd behind ucspi-tcp's `tcpserver`, with the user key appended to
+/// the account's own `~/.ssh/authorized_keys` (tinysshd reads no other),
+/// taken out again when dropped. Only with `FEROSSH_TINYSSHD_TEST=1`, as
+/// it changes that file.
+#[cfg(unix)]
+struct Tiny {
+    server: Server,
+    line: String,
+}
+
+#[cfg(unix)]
+impl Drop for Tiny {
+    fn drop(&mut self) {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path = Path::new(&home).join(".ssh/authorized_keys");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let kept: String = text
+                .lines()
+                .filter(|l| l.trim() != self.line.trim())
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let _ = std::fs::write(&path, kept);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn tinysshd(name: &str) -> Option<Tiny> {
+    if std::env::var_os("FEROSSH_TINYSSHD_TEST").is_none()
+        || !Path::new("/usr/sbin/tinysshd").exists()
+        || Command::new("tcpserver").arg("-h").output().is_err()
+    {
+        return None;
+    }
+    let dir = std::env::temp_dir().join(format!("ferossh-tiny-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = dir.join("keys");
+    assert!(
+        Command::new("/usr/sbin/tinysshd-makekey")
+            .arg(&keys)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let user = dir.join("user_ed25519");
+    keygen(&user, "ed25519");
+    let line = std::fs::read_to_string(user.with_extension("pub")).unwrap();
+    let ssh = Path::new(&std::env::var_os("HOME").unwrap()).join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    let mut ak = std::fs::read_to_string(ssh.join("authorized_keys")).unwrap_or_default();
+    if !ak.is_empty() && !ak.ends_with('\n') {
+        ak.push('\n');
+    }
+    ak.push_str(&line);
+    std::fs::write(ssh.join("authorized_keys"), ak).unwrap();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let child = Command::new("tcpserver")
+        .args([
+            "-HRDl0",
+            "127.0.0.1",
+            &port.to_string(),
+            "/usr/sbin/tinysshd",
+        ])
+        .args(["-x", "sftp=/usr/lib/openssh/sftp-server"])
+        .arg(&keys)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if banner(port) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Some(Tiny {
+        server: Server {
+            dir,
+            port,
+            child,
+            host_key: Vec::new(),
+            user_key: user,
+            ca_key: None,
+        },
+        line,
+    })
+}
+
+/// The reason channel `channel` ended, skipping what comes before.
+#[cfg(unix)]
+async fn ended(from_worker: &mut mpsc::Receiver<Message>, channel: u32) -> Result<(), String> {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+            .await
+            .expect("timed out")
+            .expect("worker hung up");
+        match msg {
+            Message::Connected { channel: c, .. } | Message::SftpReady { channel: c, .. }
+                if c == channel =>
+            {
+                return Ok(());
+            }
+            Message::Disconnected { channel: c, reason } if c == channel => return Err(reason),
+            _ => {}
+        }
+    }
+}
+
+/// tinysshd takes one session per connection: a second shell or SFTP on
+/// the login's connection is refused, and says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn tinysshd_takes_one_session_per_connection() {
+    let Some(tiny) = tinysshd("one") else {
+        return;
+    };
+    let (to_worker, mut from_worker) = login(&tiny.server).await;
+    to_worker
+        .send(Message::Data {
+            channel: 1,
+            bytes: b"echo tiny$((40+2))\n".to_vec(),
+        })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while !String::from_utf8_lossy(&out).contains("tiny42") {
+        match tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+            .await
+            .expect("no shell output")
+            .unwrap()
+        {
+            Message::Data { bytes, .. } => out.extend_from_slice(&bytes),
+            Message::Disconnected { reason, .. } => panic!("{reason}"),
+            _ => {}
+        }
+    }
+    to_worker
+        .send(Message::OpenChannel {
+            channel: 2,
+            connection: 1,
+            cols: 80,
+            rows: 24,
+            x11: None,
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+    let shell = ended(&mut from_worker, 2).await.unwrap_err();
+    eprintln!("second shell: {shell}");
+    to_worker
+        .send(Message::SftpOpen {
+            channel: 3,
+            connection: 1,
+        })
+        .await
+        .unwrap();
+    let sftp = ended(&mut from_worker, 3).await.unwrap_err();
+    eprintln!("sftp: {sftp}");
+    assert!(shell.contains("one session per connection"), "{shell}");
+    assert!(sftp.contains("one session per connection"), "{sftp}");
+
+    // What that message suggests works: an SFTP-only login has its one
+    // session free for SFTP.
+    let (to_worker, mut from_worker) = login_with(&tiny.server, tiny.server.port, false).await;
+    to_worker
+        .send(Message::SftpOpen {
+            channel: 2,
+            connection: 1,
+        })
+        .await
+        .unwrap();
+    ended(&mut from_worker, 2).await.unwrap();
 }

@@ -226,7 +226,7 @@ fn connect_to(
                 }
                 Effect::Connected => effects.extend(session.input(command.as_bytes())),
                 Effect::Ended => return (run, session),
-                Effect::Reconnect => {}
+                Effect::Reconnect | Effect::LoginAlone => {}
                 // No password source in these tests.
                 Effect::FetchPassword
                 | Effect::StorePassword { .. }

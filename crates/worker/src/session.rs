@@ -98,6 +98,11 @@ pub struct Params {
 type DnsLookup =
     tokio::task::JoinHandle<Result<(crate::dns::Answer, std::net::SocketAddr), String>>;
 
+/// Why a server refuses another session on a connection.
+pub(crate) const MORE_SESSIONS_REFUSED: &str = "The server refused another session on this connection. tinysshd takes one session per \
+     connection; OpenSSH's sshd takes 10 by default (MaxSessions), and its sshd_config may also \
+     forbid sessions for this account.";
+
 /// Why a session ended early.
 #[derive(Debug)]
 pub enum Failure {
@@ -161,12 +166,7 @@ impl fmt::Display for Failure {
                 _ => write!(f, "The connection broke: {e}."),
             },
             Failure::Ssh(russh::Error::ChannelOpenFailure(why)) => f.write_str(match why {
-                ChannelOpenFailure::AdministrativelyProhibited => {
-                    "The server refused another session on this connection. sshd allows 10 per \
-                     connection by default (MaxSessions): close some tabs, panes or File transfer \
-                     windows on this host, or raise MaxSessions on the server. Its sshd_config may \
-                     also forbid sessions for this account."
-                }
+                ChannelOpenFailure::AdministrativelyProhibited => MORE_SESSIONS_REFUSED,
                 ChannelOpenFailure::ResourceShortage => {
                     "The server is out of resources for another session on this connection."
                 }
