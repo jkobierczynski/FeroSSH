@@ -302,12 +302,12 @@ mod tests {
 
     #[test]
     fn light_is_the_system_look_and_dark_is_fixed() {
-        let nord = Theme::default();
-        let light = resolve(WindowColours::Light, &nord, &system(true));
+        let default = Theme::default();
+        let light = resolve(WindowColours::Light, &default, &system(true));
         assert!(!light.custom && !light.dark);
         assert_eq!(light.window, system(true).window);
         assert_eq!(light.bar, system(true).menu_bar);
-        let dark = resolve(WindowColours::Dark, &nord, &system(false));
+        let dark = resolve(WindowColours::Dark, &default, &system(false));
         assert!(dark.custom && dark.dark);
         assert_eq!(dark.window, DARK_BACKGROUND);
         // The fixed looks do not change with the pane's theme.
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn neutral_looks_are_grey_readable_and_ordered() {
-        let nord = Theme::default();
+        let default = Theme::default();
         let mut last = f32::INFINITY;
         for mode in WindowColours::ALL {
             let Some((background, ..)) = neutral(mode) else {
@@ -328,7 +328,7 @@ mod tests {
                 continue;
             }
             let name = mode.name();
-            let c = resolve(mode, &nord, &system(false));
+            let c = resolve(mode, &default, &system(false));
             assert!(c.custom, "{name}");
             assert_eq!(c.window, background, "{name}");
             let grey = |x: Rgb| x.r == x.g && x.g == x.b;
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn tinted_looks_are_not_grey_readable_and_ordered() {
-        let nord = Theme::default();
+        let default = Theme::default();
         let mut seen_dark = false;
         let mut count = 0;
         for mode in WindowColours::ALL {
@@ -380,7 +380,7 @@ mod tests {
             };
             count += 1;
             let name = mode.name();
-            let c = resolve(mode, &nord, &system(false));
+            let c = resolve(mode, &default, &system(false));
             assert!(c.custom, "{name}");
             assert_eq!(c.window, background, "{name}");
             assert_eq!(c.text, text, "{name}");
@@ -416,14 +416,14 @@ mod tests {
 
     #[test]
     fn windows_mode_follows_the_app_mode() {
-        let nord = Theme::default();
+        let default = Theme::default();
         assert_eq!(
-            resolve(WindowColours::System, &nord, &system(true)),
-            resolve(WindowColours::Dark, &nord, &system(true))
+            resolve(WindowColours::System, &default, &system(true)),
+            resolve(WindowColours::Dark, &default, &system(true))
         );
         assert_eq!(
-            resolve(WindowColours::System, &nord, &system(false)),
-            resolve(WindowColours::Light, &nord, &system(false))
+            resolve(WindowColours::System, &default, &system(false)),
+            resolve(WindowColours::Light, &default, &system(false))
         );
     }
 }

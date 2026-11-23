@@ -26,7 +26,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `TeamLibrary PATH` | | The team's signed connection library, on a share or in a synced folder (see [Team library](#team-library)). Settings > Team library. |
 | `TeamLibraryKey KEY` | | The public key the library must be signed with, as one line of a `.pub` file. Repeat the line for more than one key. |
 | `ConnectionLogDelete yes` | no | Tools > Connection log offers Delete..., which forgets what the log holds about one connection. Settings > Allow deleting connection log entries. |
-| `DefaultTheme NAME` | Nord | The theme new tabs open with (Theme manager > Set as default). `--theme` and theme rules come before it. |
+| `DefaultTheme NAME` | GitHub Dark | The theme new tabs open with (Theme manager > Set as default). `--theme` and theme rules come before it. |
 | `DefaultFont FAMILY` | Cascadia Mono | The font new tabs open with, when it is installed (Theme manager > Set as default on a font). |
 | `DefaultFontSize POINTS` | | The font size new tabs open with, 4 to 96 points. |
 | `FontLigatures yes` | no | Joins programming ligatures (`->`, `!=`, `===`) in fonts that have them, in every terminal pane. Settings > Font ligatures. |

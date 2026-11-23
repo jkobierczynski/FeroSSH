@@ -201,7 +201,7 @@ Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits; bo
 
 Forty-two built in, shown in three columns of Settings > Theme (each one is a few dozen bytes of colour values, so the exe barely grows):
 
-- **Dark:** Nord (the default), Ayu Mirage, Carbonfox, Catppuccin Frappé, Catppuccin Macchiato, Catppuccin Mocha, Dracula, Everforest, GitHub Dark, Gruvbox Dark, Gruvbox Material, Kanagawa Dragon, Kanagawa Wave, Monokai, Night Owl, Nightfox, One Dark, Rosé Pine, Rosé Pine Moon, Snazzy, Solarized Dark, Tokyo Night, Tokyo Night Storm, Tomorrow Night and Tomorrow Night Eighties.
+- **Dark:** GitHub Dark (the default), Ayu Mirage, Carbonfox, Catppuccin Frappé, Catppuccin Macchiato, Catppuccin Mocha, Dracula, Everforest, Gruvbox Dark, Gruvbox Material, Kanagawa Dragon, Kanagawa Wave, Monokai, Night Owl, Nightfox, Nord, One Dark, Rosé Pine, Rosé Pine Moon, Snazzy, Solarized Dark, Tokyo Night, Tokyo Night Storm, Tomorrow Night and Tomorrow Night Eighties.
 - **Light:** Ayu Light, Catppuccin Latte, Dawnfox, Everforest Light, GitHub Light, Gruvbox Light, Kanagawa Lotus, Rosé Pine Dawn, Solarized Light, Tokyo Night Day and Tomorrow.
 - **Classics:** Campbell, One Half Dark, One Half Light, Tango Dark and Tango Light from Windows Terminal, and PuTTY's own colours for anyone who misses them.
 
