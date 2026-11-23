@@ -8997,11 +8997,23 @@ impl Window {
         // The pane never got its shell: where it was to start, and its log
         // file, carry over to the new login.
         let (start_dir, log) = match self.panes.get_mut(&id) {
-            Some(p) => (p.start_dir.take(), p.log.writer.take()),
+            Some(p) => {
+                // The refused session goes now, so that nothing on the way
+                // (a run's check of its row) judges the pane by it: the run
+                // and its script wait for the new login instead.
+                p.host = Host::Ask(String::new());
+                (p.start_dir.take(), p.log.writer.take())
+            }
             None => (None, None),
         };
+        let script = self.scripts.remove(&id);
         let env = ssh_env();
         self.connect_to(id, target, &env);
+        if let Some(script) = script
+            && self.panes.contains_key(&id)
+        {
+            self.scripts.entry(id).or_insert(script);
+        }
         if let Some(p) = self.panes.get_mut(&id) {
             if p.start_dir.is_none() {
                 p.start_dir = start_dir;
