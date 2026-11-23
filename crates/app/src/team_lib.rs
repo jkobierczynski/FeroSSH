@@ -283,21 +283,54 @@ fn read_signers(dir: &Path) -> Vec<(String, u64)> {
 /// check must be at least that new.
 fn signer_floor(keys: &[String], dir: &Path) -> u64 {
     let fps = team::fingerprints(keys);
-    let run: Vec<(String, u64)> = SIGNERS
+    let disk = read_signers(dir);
+    let mut run = SIGNERS
         .lock()
-        .map(|s| {
-            s.iter()
-                .filter(|(d, _, _)| d == dir)
-                .map(|(_, fp, n)| (fp.clone(), *n))
-                .collect()
-        })
-        .unwrap_or_default();
-    run.into_iter()
-        .chain(read_signers(dir))
-        .filter(|(fp, _)| fps.contains(fp))
-        .map(|(_, serial)| serial)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remember(&mut run, dir, &fps, &disk);
+    run.iter()
+        .filter(|(d, fp, _)| d == dir && fps.contains(fp))
+        .map(|(_, _, n)| *n)
         .max()
         .unwrap_or(0)
+}
+
+/// Takes the dates kept on disk (`disk`, from `dir`) for these
+/// fingerprints into this run's, so what the window's thread offers (from
+/// this run's dates only, see [`newest_accepted`]) honours them too.
+fn remember(
+    run: &mut Vec<(PathBuf, String, u64)>,
+    dir: &Path,
+    fps: &[String],
+    disk: &[(String, u64)],
+) {
+    for (fp, n) in disk.iter().filter(|(fp, _)| fps.contains(fp)) {
+        match run.iter_mut().find(|(d, f, _)| d == dir && f == fp) {
+            Some(e) => e.2 = e.2.max(*n),
+            None => run.push((dir.to_owned(), fp.clone(), *n)),
+        }
+    }
+}
+
+/// Puts `team` to use for new connections ([`set_current`]) unless a
+/// newer date for its keys was taken this run, in one step with the
+/// check, so no date taken meanwhile can slip between them: false, and
+/// nothing changed, when it was overtaken.
+pub fn publish_unless_superseded(team: &Team, keys: &[String], dir: &Path) -> bool {
+    let fps = team::fingerprints(keys);
+    let run = SIGNERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let overtaken = *team != Team::default()
+        && run
+            .iter()
+            .any(|(d, fp, n)| d == dir && fps.contains(fp) && *n > team.serial);
+    if !overtaken {
+        // Taken while SIGNERS is held: a claim waits for it, and comes
+        // after it.
+        set_current(team.clone());
+    }
+    !overtaken
 }
 
 /// Why [`claim_signer`] did not take a library.
@@ -347,15 +380,8 @@ fn claim_signer(
         .map(|(_, n)| n)
         .max()
         .unwrap_or(0);
-    // The dates kept on disk for these keys join this run's, so what the
-    // window's thread offers (from this run's dates only) honours them
-    // too, also when this library is refused below.
-    for (fp, n) in disk.iter().filter(|(fp, _)| fps.contains(fp)) {
-        match run.iter_mut().find(|(d, f, _)| d == dir && f == fp) {
-            Some(e) => e.2 = e.2.max(*n),
-            None => run.push((dir.to_owned(), fp.clone(), *n)),
-        }
-    }
+    // Also when this library is refused below.
+    remember(&mut run, dir, &fps, &disk);
     if serial < floor {
         return Err(Unclaimed::Older(floor));
     }
@@ -1116,6 +1142,48 @@ mod tests {
             .lock()
             .unwrap()
             .retain(|e| !e.is(old.to_str().unwrap(), &keys));
+        let got = load(old.to_str(), &keys, &cache, &|| true);
+        assert_ne!(got.team.serial, 200);
+        assert!(newest_accepted(old.to_str(), &keys, &cache, 0).is_none());
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn an_overtaken_library_is_not_put_to_use() {
+        let share = temp("publish-floor");
+        let cache = temp("publish-floor-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let lib = write_dated(&share, "lib", 150);
+        let team = load(lib.to_str(), &keys, &cache, &|| true).team;
+        assert!(publish_unless_superseded(&team, &keys, &cache));
+        // A read of another path by the same key takes 200 meanwhile.
+        let signer = team::fingerprints(&keys).remove(0);
+        assert!(claim_signer(&cache, &keys, &signer, 200).is_ok());
+        let before = current();
+        assert!(!publish_unless_superseded(&team, &keys, &cache));
+        assert_eq!(current(), before, "nothing changed");
+        assert!(publish_unless_superseded(&Team::default(), &keys, &cache));
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn an_unreadable_library_after_a_restart_offers_no_older_copy() {
+        let share = temp("offer-fallback-floor");
+        let cache = temp("offer-fallback-floor-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let old = write_dated(&share, "old", 200);
+        assert_eq!(load(old.to_str(), &keys, &cache, &|| true).team.serial, 200);
+        let fp = team::fingerprints(&keys).remove(0);
+        std::fs::write(cache.join(SIGNERS_FILE), format!("{fp} 300\n")).unwrap();
+        SIGNERS.lock().unwrap().retain(|(d, _, _)| *d != cache);
+        ACCEPTED
+            .lock()
+            .unwrap()
+            .retain(|e| !e.is(old.to_str().unwrap(), &keys));
+        // The share is gone: only the checked copy (200) is left.
+        std::fs::remove_file(&old).unwrap();
         let got = load(old.to_str(), &keys, &cache, &|| true);
         assert_ne!(got.team.serial, 200);
         assert!(newest_accepted(old.to_str(), &keys, &cache, 0).is_none());

@@ -17016,19 +17016,20 @@ impl Window {
         {
             // A read of another path by the same key that crossed this
             // one may have taken a newer library since: read again (that
-            // read refuses this one) rather than put it to use.
-            if crate::team_lib::superseded(&loaded.team, &keys, &app_dir()) {
+            // read refuses this one) rather than put it to use. The check
+            // and putting it to use for new connections are one step, so
+            // no newer date can be taken between them.
+            if crate::team_lib::publish_unless_superseded(&loaded.team, &keys, &app_dir()) {
+                self.use_team(loaded);
+            } else {
                 self.refresh_team();
                 refreshed = true;
-            } else {
-                self.use_team(loaded);
             }
         }
         // The library in use checked again after any read finishes, the
         // ones no longer wanted too (they still take their key's date):
-        // a newer date taken between the check above and use_team, or by
-        // a read that finished later, is caught here and read again, as
-        // if check and use had been one step.
+        // a newer date taken after the library went into use is caught
+        // here and read again.
         if finished
             && !refreshed
             && crate::team_lib::superseded(&self.settings.team, &keys, &app_dir())
