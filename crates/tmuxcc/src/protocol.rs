@@ -41,6 +41,10 @@ pub enum Notification {
     },
     /// Sessions were made or killed.
     SessionsChanged,
+    /// Another client attached to a session, switched sessions or
+    /// detached (`%client-session-changed`, `%client-detached`): how many
+    /// clients a session has may have changed.
+    ClientsChanged,
     /// The active window of a session changed.
     SessionWindowChanged {
         session: SessionId,
@@ -116,6 +120,7 @@ pub fn parse_notification(line: &[u8]) -> Notification {
                 .map(|(session, name)| Notification::SessionChanged { session, name })
         }
         b"%sessions-changed" => Some(Notification::SessionsChanged),
+        b"%client-session-changed" | b"%client-detached" => Some(Notification::ClientsChanged),
         b"%session-window-changed" => {
             let session = id(&next(), '$');
             let window = id(&next(), '@');
@@ -263,7 +268,11 @@ mod tests {
         assert_eq!(parse_notification(b"%window-add 1"), Notification::Other);
         assert_eq!(
             parse_notification(b"%client-detached c"),
-            Notification::Other
+            Notification::ClientsChanged
+        );
+        assert_eq!(
+            parse_notification(b"%client-session-changed /dev/pts/3 $0 main"),
+            Notification::ClientsChanged
         );
         assert_eq!(parse_notification(b""), Notification::Other);
     }

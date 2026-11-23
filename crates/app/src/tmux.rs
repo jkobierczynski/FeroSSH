@@ -207,6 +207,8 @@ enum Tag {
     /// The size tmux gave a window after we asked for this one, and how
     /// many clients the session has.
     SizeCheck(WindowId, (u16, u16)),
+    /// How many clients session `.0` has.
+    Clients(SessionId),
     /// Our own client's name, before detaching the others of session `.0`.
     OwnClient(SessionId),
     /// The clients of session `.0` to detach, all but ours (`.1`).
@@ -495,6 +497,11 @@ pub struct Tmux {
     sent_layouts: BTreeMap<WindowId, String>,
     /// Other clients were found keeping a window small (asked once).
     crowded_asked: bool,
+    /// How many clients the session attached has, ours included, as
+    /// tmux last said (`#{session_attached}`); `None` until it has.
+    clients: Option<u32>,
+    /// Counts asked for after a client came or went, not answered yet.
+    clients_asked: u32,
     saved_text: Option<String>,
     /// The session to attach again after a reconnect.
     pub reattach: Option<String>,
@@ -652,6 +659,8 @@ impl Tmux {
             sent_client_size: None,
             sent_layouts: BTreeMap::new(),
             crowded_asked: false,
+            clients: None,
+            clients_asked: 0,
             saved_text: None,
             reattach: None,
             keys_wanted: false,
@@ -1033,6 +1042,8 @@ impl Tmux {
                 Event::Terminal(b) => out.push(Action::GatewayOutput(b)),
                 Event::Started => {
                     self.session = None;
+                    self.clients = None;
+                    self.clients_asked = 0;
                     self.version = None;
                     self.joined = self.join_pending.take();
                     self.share_pending = self.share_staged.take();
@@ -1089,6 +1100,14 @@ impl Tmux {
                     self.session = Some((session, name));
                     self.start_restore(out);
                 }
+            }
+            // Asked after the restore's own question too, so the answer
+            // is never older than the change.
+            Notification::ClientsChanged => {
+                if self.session.is_some() {
+                    self.clients_asked += 1;
+                }
+                self.ask_clients(out);
             }
             _ if self.restoring => {}
             Notification::WindowAdd { window } => {
@@ -1155,9 +1174,16 @@ impl Tmux {
         self.sent_client_size = None;
         self.sent_layouts.clear();
         self.crowded_asked = false;
+        self.clients = None;
         self.saved_text = None;
         self.restoring = true;
-        self.send("display-message -p '#{version}'", Tag::Version, out);
+        // With how many clients the session has, so closing can ask
+        // first when others show it too.
+        self.send(
+            "display-message -p '#{version} #{session_attached_list}'",
+            Tag::Version,
+            out,
+        );
         self.send(
             &format!("show-options -v -q {}", saved::MODE_OPTION),
             Tag::ModeOption,
@@ -1179,6 +1205,41 @@ impl Tmux {
         if self.keys_wanted {
             self.send_keys_query(out);
         }
+    }
+
+    /// Asks how many clients the session attached has: a list, since
+    /// before tmux 3.3 `#{session_attached}` leaves control clients out.
+    fn ask_clients(&mut self, out: &mut Vec<Action>) {
+        let Some((session, _)) = self.session else {
+            return;
+        };
+        self.send(
+            &format!("list-clients -t ${session} -F '#{{client_name}}'"),
+            Tag::Clients(session),
+            out,
+        );
+    }
+
+    /// How many other clients (another FeroSSH connection, a terminal)
+    /// show the session this client attached, as tmux last said. Closing
+    /// one of its panes in tmux closes it for them too. A session joined
+    /// (someone else's) counts none: closing there only leaves it.
+    pub fn others_attached(&self) -> u32 {
+        if !self.client.is_control() || self.joined.is_some() {
+            return 0;
+        }
+        self.clients.map_or(0, |c| c.saturating_sub(1))
+    }
+
+    /// Whether other clients may show the session this client attached:
+    /// they do, or tmux has not said yet (no count, or a client came or
+    /// went and the new count is not in). Closing then asks first rather
+    /// than close panes another client shows.
+    pub fn maybe_shared(&self) -> bool {
+        if !self.client.is_control() || self.joined.is_some() {
+            return false;
+        }
+        self.clients.is_none_or(|c| c > 1) || self.clients_asked > 0
     }
 
     fn send_keys_query(&mut self, out: &mut Vec<Action>) {
@@ -1288,15 +1349,38 @@ impl Tmux {
         };
         match tag {
             Tag::Version => {
-                self.version = ok.then(|| Version::parse(&first())).flatten();
+                let reply = first();
+                let mut words = reply.split_whitespace();
+                let version = words.next().unwrap_or_default();
+                self.version = ok.then(|| Version::parse(version)).flatten();
                 // Releases are numbers ("3.4", "3.3a").
-                self.dev_build = !first().starts_with(|c: char| c.is_ascii_digit());
+                self.dev_build = !version.starts_with(|c: char| c.is_ascii_digit());
+                // The session's clients by name, suspended ones too (which
+                // `#{session_attached}` leaves out). A count asked for after
+                // a client came or went is newer. Before 3.3 control clients
+                // can be missing: listed instead (after what sharing asks,
+                // which waits on this reply).
+                let list_clients = if self.version.is_some_and(|v| v >= WINDOW_SIZES_VERSION) {
+                    if self.clients.is_none() {
+                        self.clients = words
+                            .next()
+                            .map(|names| names.split(',').filter(|n| !n.is_empty()).count())
+                            .and_then(|n| u32::try_from(n).ok())
+                            .filter(|n| *n > 0);
+                    }
+                    false
+                } else {
+                    ok && self.clients_asked == 0
+                };
                 if let Some(share) = self.share_pending.take() {
                     self.send(
                         "display-message -p '#{socket_path}'",
                         Tag::ShareSocket(share),
                         out,
                     );
+                }
+                if list_clients {
+                    self.ask_clients(out);
                 }
             }
             Tag::ShareSocket(share) => {
@@ -1572,6 +1656,16 @@ impl Tmux {
                         let line = format!("detach-client -t {}", command::quote(&name));
                         self.send(&line, Tag::Ignore, out);
                     }
+                }
+            }
+            Tag::Clients(session) => {
+                self.clients_asked = self.clients_asked.saturating_sub(1);
+                if self.session.as_ref().map(|(s, _)| *s) == Some(session) {
+                    // A failed count is unknown, never "alone".
+                    self.clients = ok
+                        .then(|| lines.iter().filter(|l| !l.is_empty()).count())
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n > 0);
                 }
             }
             Tag::OwnClient(session) => {
@@ -2052,6 +2146,8 @@ impl Tmux {
         self.agents.clear();
         self.placements.clear();
         self.session = None;
+        self.clients = None;
+        self.clients_asked = 0;
         self.restoring = false;
         self.joined = None;
         out.push(Action::Structure);
@@ -3626,6 +3722,41 @@ mod tests {
             writes(&t.feed(&mut ws, &input)),
             ["split-window -v -c '/home/me/src' -t %0 -P -F '#{pane_id}'"]
         );
+    }
+
+    #[test]
+    fn a_client_coming_or_going_counts_as_shared_until_tmux_answers() {
+        let (mut ws, gateway) = Workspace::new();
+        let mut t = Tmux::new(gateway, Mode::Ferossh, 100);
+        t.feed(&mut ws, START);
+        let mut input = reply(1, &["3.4 /dev/pts/3".into()]);
+        input.extend(reply(2, &[]));
+        input.extend(reply(3, &[]));
+        input.extend(reply(4, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]));
+        let a = t.feed(&mut ws, &input);
+        assert!(!t.maybe_shared(), "alone");
+        // Captures of the restored pane.
+        let mut n = 4;
+        for _ in writes(&a) {
+            n += 1;
+            t.feed(&mut ws, &reply(n, &[]));
+        }
+        // Another client attached: shared at once, before the count.
+        let a = t.feed(&mut ws, b"%client-session-changed /dev/pts/4 $0 main\n");
+        assert_eq!(writes(&a), ["list-clients -t $0 -F '#{client_name}'"]);
+        assert!(t.maybe_shared());
+        assert_eq!(t.others_attached(), 0);
+        t.feed(
+            &mut ws,
+            &reply(n + 1, &["/dev/pts/3".into(), "/dev/pts/4".into()]),
+        );
+        assert!(t.maybe_shared());
+        assert_eq!(t.others_attached(), 1);
+        // It left: still asked about until tmux says so.
+        t.feed(&mut ws, b"%client-detached /dev/pts/4\n");
+        assert!(t.maybe_shared());
+        t.feed(&mut ws, &reply(n + 2, &["/dev/pts/3".into()]));
+        assert!(!t.maybe_shared());
     }
 
     #[test]
