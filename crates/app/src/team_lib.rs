@@ -112,6 +112,9 @@ pub fn newest_accepted(library: Option<&str>, keys: &[String]) -> Option<Team> {
 /// error when the last serial cannot be read or the new one kept: the
 /// export must not go ahead then, or two exports could share a serial.
 pub fn next_serial(dir: &Path, now: u64, current: u64) -> std::io::Result<u64> {
+    // Read, count on and keep under the lock every FeroSSH process takes
+    // for its folder, so two exports at once never share a serial.
+    let _held = crate::inventory_view::lock(dir)?;
     let file = dir.join("team-export-serial");
     let last = match std::fs::read_to_string(&file) {
         Ok(t) => t
@@ -121,10 +124,11 @@ pub fn next_serial(dir: &Path, now: u64, current: u64) -> std::io::Result<u64> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => return Err(e),
     };
-    let serial = now
-        .max(current.saturating_add(1))
-        .max(last.saturating_add(1));
-    std::fs::create_dir_all(dir)?;
+    let past = |n: u64| {
+        n.checked_add(1)
+            .ok_or_else(|| std::io::Error::other("the library's version number cannot go higher"))
+    };
+    let serial = now.max(past(current)?).max(past(last)?);
     let tmp = write_new(&file, format!("{serial}\n").as_bytes(), serial)?;
     std::fs::rename(&tmp, &file).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -477,6 +481,9 @@ mod tests {
         std::fs::remove_file(&lib).unwrap();
         let offline = load(Some(path), &keys, &unwritable, &|| true);
         assert!(offline.team.has("newest"));
+        // Nor with the older copy on disk (serial 200) as the fallback.
+        let offline = load(Some(path), &keys, &cache, &|| true);
+        assert!(offline.team.has("newest"));
         // The same export read again, and a newer one, are used.
         write_dated(&share, "web2", 250);
         assert!(load(Some(path), &keys, &cache, &|| true).note.is_none());
@@ -497,6 +504,8 @@ mod tests {
         assert_eq!(next_serial(&dir, 500, 0).unwrap(), 1002);
         // Past the library in use.
         assert_eq!(next_serial(&dir, 1000, 5000).unwrap(), 5001);
+        // No number past the largest there is.
+        assert!(next_serial(&dir, 1000, u64::MAX).is_err());
         // A damaged record, or a folder that cannot hold one: no serial.
         std::fs::write(dir.join("team-export-serial"), "junk").unwrap();
         assert!(next_serial(&dir, 1000, 0).is_err());
