@@ -17010,6 +17010,7 @@ impl Window {
             Err(_) => return,
         };
         let mut refreshed = false;
+        let finished = loaded.is_some();
         if let Some((read, loaded)) = loaded
             && read == self.team_read
         {
@@ -17021,15 +17022,19 @@ impl Window {
                 refreshed = true;
             } else {
                 self.use_team(loaded);
-                // Checked again once in use: a newer date taken between
-                // the check above and now is caught here, which leaves it
-                // as if it had been taken after the library went into use
-                // (as if check and use were one step), and reads again.
-                if crate::team_lib::superseded(&self.settings.team, &keys, &app_dir()) {
-                    self.refresh_team();
-                    refreshed = true;
-                }
             }
+        }
+        // The library in use checked again after any read finishes, the
+        // ones no longer wanted too (they still take their key's date):
+        // a newer date taken between the check above and use_team, or by
+        // a read that finished later, is caught here and read again, as
+        // if check and use had been one step.
+        if finished
+            && !refreshed
+            && crate::team_lib::superseded(&self.settings.team, &keys, &app_dir())
+        {
+            self.refresh_team();
+            refreshed = true;
         }
         // Two reads that crossed can leave an older library in use than
         // one already accepted for this library and key: never go back.
