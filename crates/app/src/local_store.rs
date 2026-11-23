@@ -57,10 +57,13 @@ fn key() -> Option<Result<(), String>> {
     if !crate::vault::is_open() {
         return None;
     }
+    // 32 random bytes of secret and 16 of salt, in hex.
     let secret = match crate::vault::read(KEY_FILE).map(|t| t.trim().to_owned()) {
-        Some(s) if s.len() >= 64 => zeroize::Zeroizing::new(s),
+        Some(s) if s.len() == 96 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            zeroize::Zeroizing::new(s)
+        }
         _ => {
-            let mut raw = zeroize::Zeroizing::new([0u8; 32]);
+            let mut raw = zeroize::Zeroizing::new([0u8; 48]);
             if getrandom::fill(raw.as_mut()).is_err() {
                 return Some(Err("Windows gave no random bytes.".into()));
             }
@@ -77,8 +80,16 @@ fn key() -> Option<Result<(), String>> {
     if held.as_ref().is_some_and(|(s, _)| *s == *secret) {
         return Some(Ok(()));
     }
+    let (pass, salt_hex) = secret.split_at(64);
+    let mut salt = [0u8; 16];
+    for (i, b) in salt.iter_mut().enumerate() {
+        *b = salt_hex
+            .get(i * 2..i * 2 + 2)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+            .unwrap_or_default();
+    }
     // The secret is random: the KDF adds nothing and runs at its least.
-    match Key::derive(&secret, Kdf::LOWEST, [0; 16]) {
+    match Key::derive(pass, Kdf::LOWEST, salt) {
         Ok(k) => {
             *held = Some((secret.to_string(), k));
             Some(Ok(()))
