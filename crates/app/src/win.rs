@@ -17006,7 +17006,18 @@ impl Window {
         if let Some((read, loaded)) = loaded
             && read == self.team_read
         {
-            self.use_team(loaded);
+            // A read of another path by the same key that crossed this
+            // one may have taken a newer library since: read again (that
+            // read refuses this one) rather than put it to use.
+            if crate::team_lib::superseded(
+                &loaded.team,
+                &self.settings.team_library_keys,
+                &app_dir(),
+            ) {
+                self.refresh_team();
+            } else {
+                self.use_team(loaded);
+            }
         }
         // Two reads that crossed can leave an older library in use than
         // one already accepted for this library and key: never go back.

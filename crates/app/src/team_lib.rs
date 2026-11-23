@@ -105,6 +105,37 @@ fn newest_seen(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team>
     })
 }
 
+/// The newest serial seen for `library` under `keys` (this run's or the
+/// checked copy's), without taking anything: 0 for none.
+fn seen_serial(library: &str, keys: &[String], cache_dir: &Path) -> u64 {
+    let run = ACCEPTED
+        .lock()
+        .ok()
+        .and_then(|a| {
+            a.iter()
+                .find(|e| e.is(library, keys))
+                .map(|e| e.copy.team.serial)
+        })
+        .unwrap_or(0);
+    let disk = read_copy(library, keys, cache_dir).map_or(0, |c| c.team.serial);
+    run.max(disk)
+}
+
+/// Whether `team`, a library read under `keys`, is older than a library
+/// the same key signed that this run has taken since (at another path,
+/// by a read that crossed it): the window then reads it again, and the
+/// read refuses it. This run's dates only, so it never waits on disk.
+pub fn superseded(team: &Team, keys: &[String], dir: &Path) -> bool {
+    if *team == Team::default() {
+        return false;
+    }
+    let fps = team::fingerprints(keys);
+    SIGNERS.lock().is_ok_and(|run| {
+        run.iter()
+            .any(|(d, fp, n)| d == dir && fps.contains(fp) && *n > team.serial)
+    })
+}
+
 /// Takes the library just read (`copy`) as the newest accepted for
 /// `library` under `keys`, unless a newer one was seen before (this run,
 /// or the checked copy on disk), which then comes back instead.
@@ -304,6 +335,9 @@ fn claim_signer(
         Some(e) => e.2 = e.2.max(serial),
         None => run.push((dir.to_owned(), signer.to_owned(), serial)),
     }
+    // Published for this run; the disk write below stays serialised by
+    // the folder lock, and a reader of this run's dates need not wait.
+    drop(run);
     Ok((|| {
         let _held = held?;
         match disk.iter_mut().find(|(fp, _)| fp == signer) {
@@ -489,9 +523,13 @@ pub fn load(
                     // (FeroSSH pointed at an older file, or one put at a new
                     // path). Checked and the key's date raised in one step,
                     // before it is taken as this path's newest.
+                    // A newer copy of this path wins without this library's
+                    // date being claimed: it is not used.
+                    let path_has_newer = seen_serial(library, keys, cache_dir) > team.serial;
                     let signer = team::signer(&sig).unwrap_or_default();
-                    let claimed = claim_signer(cache_dir, keys, &signer, team.serial);
-                    if let Err(Unclaimed::Unchecked(e)) = &claimed {
+                    let claimed = (!path_has_newer)
+                        .then(|| claim_signer(cache_dir, keys, &signer, team.serial));
+                    if let Some(Err(Unclaimed::Unchecked(e))) = &claimed {
                         // The copy checked last, below, as when the share
                         // cannot be read.
                         break 'read format!(
@@ -499,7 +537,7 @@ pub fn load(
                          date ({e})"
                         );
                     }
-                    let kept = if let Err(Unclaimed::Older(floor)) = claimed {
+                    let kept = if let Some(Err(Unclaimed::Older(floor))) = claimed {
                         match newest_seen(library, keys, cache_dir).filter(|t| t.serial >= floor) {
                             Some(kept) => Some(kept),
                             None => {
@@ -527,6 +565,26 @@ pub fn load(
                         };
                         accept_unless_older(library, keys, cache_dir, copy)
                     };
+                    // A newer copy of this path is still no older than a
+                    // library the same key signed since, at another path.
+                    let kept = match kept {
+                        Some(k) if k.serial < signer_floor(keys, cache_dir) => {
+                            let note = format!(
+                                "The team library {shown} was not used, and neither is the copy \
+                                 FeroSSH checked last: both are older than a library signed with \
+                                 the same key that FeroSSH used since (exported {}, the copy {}). \
+                                 Its connections and rules are not available until a newer \
+                                 library is there.",
+                                exported(team.serial),
+                                exported(k.serial),
+                            );
+                            return Loaded {
+                                team: Team::default(),
+                                note: Some(note),
+                            };
+                        }
+                        kept => kept,
+                    };
                     if let Some(kept) = kept {
                         let note = format!(
                             "The team library {shown} was not used: it is older than the copy \
@@ -550,7 +608,7 @@ pub fn load(
                          is used now but is not there when the share cannot be read."
                     ));
                     }
-                    if let Ok(Err(e)) = claimed {
+                    if let Some(Ok(Err(e))) = claimed {
                         notes.push(format!(
                             "FeroSSH could not note the date of the team library {shown} ({e}), so \
                          after a restart it cannot tell an older library signed with the same \
@@ -922,6 +980,64 @@ mod tests {
         assert!(got.note.unwrap().contains("could not check"));
         drop(held);
         assert!(load(lib.to_str(), &keys, &cache, &|| true).team.has("new"));
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn a_library_that_loses_to_its_paths_copy_claims_no_date() {
+        let share = temp("loser");
+        let cache = temp("loser-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let lib = write_dated(&share, "copy", 300);
+        let path = lib.to_str().unwrap();
+        let bytes = std::fs::read(&lib).unwrap();
+        let sig = std::fs::read_to_string(sig_path(&lib)).unwrap();
+        {
+            let _held = COMMIT.lock();
+            write_copy(&cache, path, &bytes, &sig).unwrap();
+        }
+        write_dated(&share, "older", 200);
+        assert!(load(Some(path), &keys, &cache, &|| true).team.has("copy"));
+        assert_eq!(signer_floor(&keys, &cache), 0);
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn a_paths_copy_older_than_the_keys_date_is_not_used_either() {
+        let share = temp("copy-below");
+        let cache = temp("copy-below-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        for d in ["a", "b"] {
+            std::fs::create_dir_all(share.join(d)).unwrap();
+        }
+        // Path b was used at 180 before path a's 200 came.
+        let b = write_dated(&share.join("b"), "b180", 180);
+        let b = b.to_str().unwrap();
+        assert!(load(Some(b), &keys, &cache, &|| true).team.has("b180"));
+        let a = write_dated(&share.join("a"), "a200", 200);
+        assert!(load(a.to_str(), &keys, &cache, &|| true).team.has("a200"));
+        // An older one at b: neither it nor b's copy of 180.
+        write_dated(&share.join("b"), "b150", 150);
+        let got = load(Some(b), &keys, &cache, &|| true);
+        assert!(got.team.names.is_empty() && got.note.is_some());
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn a_read_overtaken_by_a_newer_date_is_superseded() {
+        let share = temp("superseded");
+        let cache = temp("superseded-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let lib = write_dated(&share, "new", 200);
+        let new = load(lib.to_str(), &keys, &cache, &|| true).team;
+        assert!(!superseded(&new, &keys, &cache));
+        let mut older = new.clone();
+        older.serial = 150;
+        assert!(superseded(&older, &keys, &cache));
+        assert!(!superseded(&Team::default(), &keys, &cache));
         let _ = std::fs::remove_dir_all(&share);
         let _ = std::fs::remove_dir_all(&cache);
     }
