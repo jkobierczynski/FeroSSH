@@ -17208,24 +17208,62 @@ impl Window {
     }
 
     fn poll_team(&mut self) {
+        // The library and keys reads use: machine policy's when one is set
+        // (cached, so cheap here).
+        let (library, keys) = crate::machine_policy::team_source(
+            self.settings.team_library.as_deref(),
+            &self.settings.team_library_keys,
+        );
         let loaded = match self.team_loaded.lock() {
             Ok(mut s) => s.take(),
             Err(_) => return,
         };
+        let mut refreshed = false;
+        let finished = loaded.is_some();
         if let Some((read, loaded)) = loaded
             && read == self.team_read
         {
-            self.use_team(loaded);
+            // A read of another path by the same key that crossed this
+            // one may have taken a newer library since: read again (that
+            // read refuses this one) rather than put it to use. The check
+            // and putting it to use for new connections are one step, so
+            // no newer date can be taken between them.
+            if crate::team_lib::publish_unless_superseded(&loaded.team, &keys, &app_dir()) {
+                self.use_team(loaded);
+            } else {
+                self.refresh_team();
+                refreshed = true;
+            }
+        }
+        // The library in use checked again after any read finishes, the
+        // ones no longer wanted too (they still take their key's date):
+        // a newer date taken after the library went into use is caught
+        // here and read again.
+        if finished
+            && !refreshed
+            && crate::team_lib::superseded(&self.settings.team, &keys, &app_dir())
+        {
+            self.refresh_team();
+            refreshed = true;
         }
         // Two reads that crossed can leave an older library in use than
         // one already accepted for this library and key: never go back.
-        if let Some(newer) = crate::team_lib::newest_accepted(
-            self.settings.team_library.as_deref(),
-            &self.settings.team_library_keys,
-            self.settings.team.serial,
-        ) {
-            let note = self.team_note.clone();
-            self.use_team(crate::team_lib::Loaded { team: newer, note });
+        // Not while the read just started is on its way: it decides.
+        if !refreshed
+            && let Some(newer) = crate::team_lib::newest_accepted(
+                library.as_deref(),
+                &keys,
+                &app_dir(),
+                self.settings.team.serial,
+            )
+        {
+            // Checked and put to use in one step, as above.
+            if crate::team_lib::publish_unless_superseded(&newer, &keys, &app_dir()) {
+                let note = self.team_note.clone();
+                self.use_team(crate::team_lib::Loaded { team: newer, note });
+            } else {
+                self.refresh_team();
+            }
         }
         if self.team_note_pending.is_some() {
             if DIALOG_OPEN.get() {
