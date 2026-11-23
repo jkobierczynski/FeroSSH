@@ -607,6 +607,36 @@ mod tests {
     }
 
     #[test]
+    fn a_current_read_that_was_overtaken_writes_the_newer_library() {
+        let share = temp("overtaken");
+        let cache = temp("overtaken-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let read = |host: &str, serial: u64| {
+            let lib = write_dated(&share, host, serial);
+            let bytes = std::fs::read(&lib).unwrap();
+            let sig = std::fs::read_to_string(sig_path(&lib)).unwrap();
+            let team = team::load(&bytes, &sig, &team::keys(&keys)).unwrap();
+            (lib, Copy { team, bytes, sig })
+        };
+        // The current read accepts 100; before it writes its copy, a
+        // later read accepts 200.
+        let (lib, old) = read("old", 100);
+        let path = lib.to_str().unwrap();
+        assert!(accept_unless_older(path, &keys, &cache, old).is_none());
+        let (_, new) = read("new", 200);
+        assert!(accept_unless_older(path, &keys, &cache, new).is_none());
+        // The current read now writes: the newest accepted, 200.
+        keep_newest(&cache, path, &keys, &|| true).unwrap();
+        let copy = cached(Some(path), &keys, &cache);
+        assert!(copy.has("new") && copy.serial == 200);
+        // The later read, no longer current, leaves it as it is.
+        keep_newest(&cache, path, &keys, &|| false).unwrap();
+        assert_eq!(cached(Some(path), &keys, &cache).serial, 200);
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
     fn a_copy_from_disk_stays_the_baseline_when_it_goes() {
         let share = temp("disk-baseline");
         let cache = temp("disk-baseline-cache");
