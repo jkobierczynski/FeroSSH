@@ -29,8 +29,10 @@ pub(crate) fn lock(dir: &std::path::Path) -> std::io::Result<Lock> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join("inventory.lock");
     let mut last = None;
-    // Another window holds it for a few milliseconds at most.
-    for _ in 0..100 {
+    // Another window holds it for a few milliseconds at most; a slow disk
+    // (and a queue of several, each syncing a file) can take longer, so
+    // up to five seconds.
+    for _ in 0..500 {
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(windows)]
