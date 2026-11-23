@@ -55,20 +55,54 @@ fn newest_seen(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team>
     }
 }
 
-/// Notes `team` as accepted for `library` under `keys`, unless a newer
-/// one already is.
-fn accepted(library: &str, keys: &[String], team: &Team) {
+/// Takes `team` as the newest accepted for `library` under `keys`,
+/// unless a newer one was accepted before (this run, or the checked copy
+/// on disk), which then comes back instead. One lock covers the check
+/// and the update.
+fn accept_unless_older(
+    library: &str,
+    keys: &[String],
+    cache_dir: &Path,
+    team: &Team,
+) -> Option<Team> {
     let Ok(mut a) = ACCEPTED.lock() else {
-        return;
+        return newest_seen(library, keys, cache_dir).filter(|k| k.serial > team.serial);
     };
+    let run = a
+        .iter()
+        .find(|(l, k, _)| l == library.trim() && k == keys)
+        .map(|(.., t)| t.serial)
+        .unwrap_or(0);
+    let copy = from_cache(library, keys, cache_dir);
+    if let Some(c) = copy.filter(|c| c.serial > team.serial && c.serial >= run) {
+        return Some(c);
+    }
     match a
         .iter_mut()
         .find(|(l, k, _)| l == library.trim() && k == keys)
     {
-        Some((.., t)) if t.serial <= team.serial => *t = team.clone(),
-        Some(_) => {}
-        None => a.push((library.trim().to_owned(), keys.to_vec(), team.clone())),
+        Some((.., t)) if t.serial > team.serial => Some(t.clone()),
+        Some((.., t)) => {
+            *t = team.clone();
+            None
+        }
+        None => {
+            a.push((library.trim().to_owned(), keys.to_vec(), team.clone()));
+            None
+        }
     }
+}
+
+/// The newest library accepted this run for `library` under `keys`, if
+/// any: the window puts it back when a later read it published turns out
+/// older (two reads that crossed).
+pub fn newest_accepted(library: Option<&str>, keys: &[String]) -> Option<Team> {
+    let library = library.map(str::trim).filter(|l| !l.is_empty())?;
+    ACCEPTED.lock().ok().and_then(|a| {
+        a.iter()
+            .find(|(l, k, _)| l == library && k == keys)
+            .map(|(.., t)| t.clone())
+    })
 }
 
 /// The serial for a new export at `now` (seconds since 1970): past the
@@ -263,18 +297,14 @@ pub fn load(
     let read = read_capped(&path, MAX_LEN).and_then(|b| Ok((b, read_sig(&sig_path(&path))?)));
     let why = match read {
         Ok((bytes, sig)) => match team::load(&bytes, &sig, &team::keys(keys)) {
-            // Signed, but older than the copy checked last: the share was
-            // turned back to an earlier library (one from before a rule
-            // was added, say), which only someone who cannot sign a new
-            // one has reason to do. The newer copy stays in use.
             Ok(team) => {
                 // Signed, but older than the copy checked last: the share
                 // was turned back to an earlier library (one from before a
                 // rule was added, say), which only someone who cannot sign
                 // a new one has reason to do. The newer copy stays in use.
-                if let Some(kept) = newest_seen(library, keys, cache_dir)
-                    && kept.serial > team.serial
-                {
+                // Checked and taken as the new baseline in one step, so two
+                // reads at once cannot each pass against an old baseline.
+                if let Some(kept) = accept_unless_older(library, keys, cache_dir, &team) {
                     let note = format!(
                         "The team library {shown} was not used: it is older than the copy \
                          FeroSSH checked last (exported {}, the copy {}), so someone may have \
@@ -288,10 +318,8 @@ pub fn load(
                         note: Some(note),
                     };
                 }
-                // The baseline for the next read, even when the copy below
-                // cannot be written (which otherwise only costs the
-                // offline fallback).
-                accepted(library, keys, &team);
+                // The baseline is set already, so a copy that cannot be
+                // written only costs the offline fallback.
                 let _ = keep(cache_dir, library, &bytes, &sig, current);
                 return Loaded { team, note: None };
             }

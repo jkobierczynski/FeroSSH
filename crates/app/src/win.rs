@@ -16893,6 +16893,16 @@ impl Window {
         {
             self.use_team(loaded);
         }
+        // Two reads that crossed can leave an older library in use than
+        // one already accepted for this library and key: never go back.
+        if let Some(newer) = crate::team_lib::newest_accepted(
+            self.settings.team_library.as_deref(),
+            &self.settings.team_library_keys,
+        ) && newer.serial > self.settings.team.serial
+        {
+            let note = self.team_note.clone();
+            self.use_team(crate::team_lib::Loaded { team: newer, note });
+        }
         if self.team_note_pending.is_some() {
             if DIALOG_OPEN.get() {
                 // Said once the dialog open now closes: look again soon,
