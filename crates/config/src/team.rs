@@ -156,6 +156,27 @@ pub fn verify(bytes: &[u8], sig: &str, trusted: &[PublicKey]) -> Result<(), Refu
         .map_err(|_| Refused::BadSignature)
 }
 
+/// The fingerprint (`SHA256:...`) of the key that made signature `sig`,
+/// for a library [`verify`] accepted: what FeroSSH keeps the newest
+/// library date per, whatever path the library is read from.
+pub fn signer(sig: &str) -> Option<String> {
+    let sig = SshSig::from_pem(sig.trim()).ok()?;
+    Some(
+        sig.public_key()
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string(),
+    )
+}
+
+/// The fingerprints of the keys in `lines` (the `TeamLibraryKey` lines),
+/// as [`signer`] gives them.
+pub fn fingerprints(lines: &[String]) -> Vec<String> {
+    keys(lines)
+        .iter()
+        .map(|k| k.fingerprint(russh::keys::HashAlg::Sha256).to_string())
+        .collect()
+}
+
 /// Reads a library already verified.
 pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
     if bytes.len() > MAX_LEN {
@@ -541,6 +562,19 @@ mod tests {
         let team = parse(&bundle.to_bytes()).unwrap();
         assert!(!team.hosts_text.contains("admin"));
         assert!(team.has("a"));
+    }
+
+    #[test]
+    fn signer_names_the_signing_key() {
+        let admin = key(1);
+        let sig = sign(&admin, NAMESPACE, b"x");
+        assert_eq!(
+            signer(&sig).unwrap(),
+            admin.public_key().fingerprint(HashAlg::Sha256).to_string()
+        );
+        assert_eq!(signer("junk"), None);
+        let line = admin.public_key().to_openssh().unwrap();
+        assert_eq!(fingerprints(&[line]), [signer(&sig).unwrap()]);
     }
 
     #[test]
