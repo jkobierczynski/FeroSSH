@@ -32,6 +32,10 @@ New-EventLog -LogName Application -Source FeroSSH
 
 That is Windows PowerShell 5.1; deployment tools that run as SYSTEM can run it too.
 
+## Checking that it works
+
+FeroSSH reads the policy when it starts and on each **Refresh** in the connection manager, so restart it (or press Refresh) after you set a value. With the copy on, the line under **Tools > Connection log** ends with *Copied to the Windows event log*, or says why Windows did not take the last event. Events are written as connections are made and end: connect to a host, then look in Event Viewer under **Windows Logs > Application**, filtered on source `FeroSSH`.
+
 ## What it does not do
 
 The policies bind FeroSSH, not the files. A user can still delete FeroSSH's own log file (`%LOCALAPPDATA%\FeroSSH\connections.log`, or `connections.log.sealed` while a master password vault is open), or run another SSH client. The event log copy is the record users cannot remove; use application control (AppLocker or WDAC) if other clients must be blocked too. As with the team library, the policies bind users who are not administrators of their PC.
