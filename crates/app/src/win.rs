@@ -17009,6 +17009,7 @@ impl Window {
             Ok(mut s) => s.take(),
             Err(_) => return,
         };
+        let mut refreshed = false;
         if let Some((read, loaded)) = loaded
             && read == self.team_read
         {
@@ -17017,14 +17018,21 @@ impl Window {
             // read refuses this one) rather than put it to use.
             if crate::team_lib::superseded(&loaded.team, &keys, &app_dir()) {
                 self.refresh_team();
+                refreshed = true;
             } else {
                 self.use_team(loaded);
             }
         }
         // Two reads that crossed can leave an older library in use than
         // one already accepted for this library and key: never go back.
-        if let Some(newer) =
-            crate::team_lib::newest_accepted(library.as_deref(), &keys, self.settings.team.serial)
+        // Not while the read just started is on its way: it decides.
+        if !refreshed
+            && let Some(newer) = crate::team_lib::newest_accepted(
+                library.as_deref(),
+                &keys,
+                &app_dir(),
+                self.settings.team.serial,
+            )
         {
             let note = self.team_note.clone();
             self.use_team(crate::team_lib::Loaded { team: newer, note });

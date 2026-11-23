@@ -159,11 +159,30 @@ fn accept_unless_older(
 /// it is newer than serial `than` (the one in use): the window puts it
 /// back when a later read it published turns out older (two reads that
 /// crossed). Cheap: only a newer library is cloned.
-pub fn newest_accepted(library: Option<&str>, keys: &[String], than: u64) -> Option<Team> {
+///
+/// One older than this run's date for `keys` in `dir` (another path signed
+/// by the same key has taken a newer library since) is not offered: that
+/// would bring back the library the per-key check refused. Only this run's
+/// dates are looked at, not the file, as this runs on the window's thread.
+pub fn newest_accepted(
+    library: Option<&str>,
+    keys: &[String],
+    dir: &Path,
+    than: u64,
+) -> Option<Team> {
     let library = library.map(str::trim).filter(|l| !l.is_empty())?;
+    let fps = team::fingerprints(keys);
+    let floor = SIGNERS.lock().map_or(0, |run| {
+        run.iter()
+            .filter(|(d, fp, _)| d == dir && fps.contains(fp))
+            .map(|(_, _, n)| *n)
+            .max()
+            .unwrap_or(0)
+    });
     ACCEPTED.lock().ok().and_then(|a| {
         a.iter()
             .find(|e| e.is(library, keys) && e.copy.team.serial > than)
+            .filter(|e| e.copy.team.serial >= floor)
             .map(|e| e.copy.team.clone())
     })
 }
@@ -1047,6 +1066,26 @@ mod tests {
         older.serial = 150;
         assert!(superseded(&older, &keys, &cache));
         assert!(!superseded(&Team::default(), &keys, &cache));
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn a_library_below_the_keys_date_is_not_offered_again() {
+        let share = temp("offer-floor");
+        let cache = temp("offer-floor-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let (a, b) = (share.join("a"), share.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let old = write_dated(&a, "old", 200);
+        let new = write_dated(&b, "new", 300);
+        assert_eq!(load(old.to_str(), &keys, &cache, &|| true).team.serial, 200);
+        assert_eq!(load(new.to_str(), &keys, &cache, &|| true).team.serial, 300);
+        // The other path's library was accepted, but the key has moved on.
+        assert!(newest_accepted(old.to_str(), &keys, &cache, 0).is_none());
+        let got = newest_accepted(new.to_str(), &keys, &cache, 0).map(|t| t.serial);
+        assert_eq!(got, Some(300));
         let _ = std::fs::remove_dir_all(&share);
         let _ = std::fs::remove_dir_all(&cache);
     }
