@@ -1478,6 +1478,8 @@ struct Window {
     /// SSH panes whose next login shares no connection: the server refused
     /// their shell on the one they shared.
     login_alone: HashSet<PaneId>,
+    /// The pane whose refused shell is giving way to its own login.
+    swapping_login: Option<PaneId>,
     /// Commands decided outside a handler that returns them; the next
     /// redraw runs them.
     queued: Vec<Command>,
@@ -2977,6 +2979,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 toast_queue: VecDeque::new(),
                 retries: HashMap::new(),
                 login_alone: HashSet::new(),
+                swapping_login: None,
                 queued: Vec::new(),
                 desktops: HashMap::new(),
                 previews: HashMap::new(),
@@ -8949,10 +8952,13 @@ impl Window {
         if alone {
             self.login_alone(id);
         }
-        if self.run_login.contains(&id) {
+        // While a pane's refused shell gives way to its own login, the
+        // pane is judged once that login has started, not before.
+        let swapping = self.swapping_login == Some(id);
+        if self.run_login.contains(&id) && !swapping {
             self.check_run_login(id);
         }
-        if self.launch_hidden.contains(&id) {
+        if self.launch_hidden.contains(&id) && !swapping {
             self.check_launch(id);
         }
         // A hidden pane whose login asks for something shows again.
@@ -8997,18 +9003,18 @@ impl Window {
         // The pane never got its shell: where it was to start, and its log
         // file, carry over to the new login.
         let (start_dir, log) = match self.panes.get_mut(&id) {
-            Some(p) => {
-                // The refused session goes now, so that nothing on the way
-                // (a run's check of its row) judges the pane by it: the run
-                // and its script wait for the new login instead.
-                p.host = Host::Ask(String::new());
-                (p.start_dir.take(), p.log.writer.take())
-            }
+            Some(p) => (p.start_dir.take(), p.log.writer.take()),
             None => (None, None),
         };
+        // Nothing on the way judges the pane by the refused session (ending
+        // it applies effects, which check a run's row and a hidden launch):
+        // the run, its script and the hidden launch wait for the new login,
+        // which the caller's checks then see.
         let script = self.scripts.remove(&id);
         let env = ssh_env();
+        self.swapping_login = Some(id);
         self.connect_to(id, target, &env);
+        self.swapping_login = None;
         if let Some(script) = script
             && self.panes.contains_key(&id)
         {
