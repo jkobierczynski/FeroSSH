@@ -18,8 +18,9 @@
 //!
 //! Event Viewer shows the text as is once the source is registered
 //! (`New-EventLog -LogName Application -Source FeroSSH`, see
-//! `docs/admin/connection-log-policy.md`); unregistered, it shows the same
-//! text after a note that the description is missing.
+//! `docs/admin/connection-log-policy.md`); unregistered, its General
+//! tab shows the Windows error text that has the event's number, and the
+//! text is under Details only.
 
 use ferossh_config::connlog::{Entry, Kind};
 
@@ -77,6 +78,15 @@ fn note(done: Result<(), String>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = done.err();
 }
 
+/// Whether the event source `FeroSSH` is registered on this PC (the
+/// key an administrator's `New-EventLog` makes, which any user can read).
+/// Without it Event Viewer has no message file for FeroSSH's events and
+/// shows the Windows error text that has the event's number instead
+/// (1001: "Recursion too deep"); the text is under Details only.
+pub fn source_registered() -> bool {
+    imp::source_registered()
+}
+
 /// Writes `e` to the event log.
 pub fn report(e: &Entry) {
     let warning = matches!(e.kind, Kind::Lost | Kind::Failed);
@@ -99,6 +109,10 @@ pub fn report_deleted(n: usize) {
 mod imp {
     pub fn write(_id: u32, _warning: bool, _text: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    pub fn source_registered() -> bool {
+        true
     }
 }
 
@@ -136,6 +150,13 @@ mod imp {
             got.ok()?;
             Some(buf)
         }
+    }
+
+    pub fn source_registered() -> bool {
+        crate::machine_policy::reg::Key::open_hklm(
+            r"SYSTEM\CurrentControlSet\Services\EventLog\Application\FeroSSH",
+        )
+        .is_some()
     }
 
     pub fn write(id: u32, warning: bool, text: &str) -> Result<(), String> {
