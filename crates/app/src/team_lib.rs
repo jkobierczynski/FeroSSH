@@ -7,6 +7,10 @@
 //! now, so changing the key drops a copy signed by the old one. Each
 //! library path has its own copy, so setting another library never uses
 //! the copy of the one before.
+//!
+//! A library older than one FeroSSH already used, from the same path
+//! or signed by the same key at any path, is refused: putting an earlier
+//! signed library back does not bring back its connections and rules.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -203,6 +207,74 @@ fn cache_path(dir: &Path, library: &str) -> PathBuf {
 
 /// A file read whole, refused when larger than `max` bytes; the limit
 /// holds while it is read, so a file that grows meanwhile is refused too.
+/// The newest library date FeroSSH has used per signing key, one line
+/// `SHA256:... <serial>` each, in FeroSSH's folder. A library older than
+/// that is refused whatever path it is read from, so pointing FeroSSH at
+/// an older file, or one put at a new path, does not bring back an
+/// earlier library.
+const SIGNERS_FILE: &str = "team-library-signers";
+
+/// This run's dates per folder and signing key, so they hold for the
+/// run even when [`SIGNERS_FILE`] cannot be written.
+static SIGNERS: Mutex<Vec<(PathBuf, String, u64)>> = Mutex::new(Vec::new());
+
+fn read_signers(dir: &Path) -> Vec<(String, u64)> {
+    let Ok(bytes) = read_capped(&dir.join(SIGNERS_FILE), 64 * 1024) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|l| {
+            let (fp, serial) = l.trim().rsplit_once(' ')?;
+            Some((fp.trim().to_owned(), serial.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The newest library date used with any of `keys`: a library they
+/// check must be at least that new.
+fn signer_floor(keys: &[String], dir: &Path) -> u64 {
+    let fps = team::fingerprints(keys);
+    let run: Vec<(String, u64)> = SIGNERS
+        .lock()
+        .map(|s| {
+            s.iter()
+                .filter(|(d, _, _)| d == dir)
+                .map(|(_, fp, n)| (fp.clone(), *n))
+                .collect()
+        })
+        .unwrap_or_default();
+    run.into_iter()
+        .chain(read_signers(dir))
+        .filter(|(fp, _)| fps.contains(fp))
+        .map(|(_, serial)| serial)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Notes that a library dated `serial` signed by `signer` was used.
+fn raise_signer(dir: &Path, signer: &str, serial: u64) -> std::io::Result<()> {
+    if let Ok(mut run) = SIGNERS.lock() {
+        match run.iter_mut().find(|(d, fp, _)| d == dir && fp == signer) {
+            Some(e) => e.2 = e.2.max(serial),
+            None => run.push((dir.to_owned(), signer.to_owned(), serial)),
+        }
+    }
+    let _held = crate::inventory_view::lock(dir)?;
+    let mut all = read_signers(dir);
+    match all.iter_mut().find(|(fp, _)| fp == signer) {
+        Some(e) if e.1 >= serial => return Ok(()),
+        Some(e) => e.1 = serial,
+        None => all.push((signer.to_owned(), serial)),
+    }
+    let text: String = all.iter().map(|(fp, n)| format!("{fp} {n}\n")).collect();
+    let file = dir.join(SIGNERS_FILE);
+    let tmp = write_new(&file, text.as_bytes(), serial)?;
+    std::fs::rename(&tmp, &file).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 fn read_capped(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
@@ -364,12 +436,42 @@ pub fn load(
                 // a new one has reason to do. The newer copy stays in use.
                 // Checked and taken as the new baseline in one step, so two
                 // reads at once cannot each pass against an old baseline.
-                let copy = Copy {
-                    team: team.clone(),
-                    bytes: bytes.clone(),
-                    sig: sig.clone(),
+                // Older than a library the same key signed that FeroSSH
+                // used before, at this path or another: refused too.
+                // Refused too when older than a library the same key
+                // signed that FeroSSH used before, at this path or another
+                // (FeroSSH pointed at an older file, or one put at a new
+                // path). Checked before it is taken as this path's newest.
+                let floor = signer_floor(keys, cache_dir);
+                let kept = if team.serial < floor {
+                    match newest_seen(library, keys, cache_dir).filter(|t| t.serial >= floor) {
+                        Some(kept) => Some(kept),
+                        None => {
+                            let note = format!(
+                                "The team library {shown} was not used: it is older than a \
+                                 library signed with the same key that FeroSSH used before \
+                                 (exported {}, that one {}), so it may be an earlier library \
+                                 put back. Its connections and rules are not available until a \
+                                 newer library is there; ask your administrator to export and \
+                                 sign the library again.",
+                                exported(team.serial),
+                                exported(floor),
+                            );
+                            return Loaded {
+                                team: Team::default(),
+                                note: Some(note),
+                            };
+                        }
+                    }
+                } else {
+                    let copy = Copy {
+                        team: team.clone(),
+                        bytes: bytes.clone(),
+                        sig: sig.clone(),
+                    };
+                    accept_unless_older(library, keys, cache_dir, copy)
                 };
-                if let Some(kept) = accept_unless_older(library, keys, cache_dir, copy) {
+                if let Some(kept) = kept {
                     let note = format!(
                         "The team library {shown} was not used: it is older than the copy \
                          FeroSSH checked last (exported {}, the copy {}), so someone may have \
@@ -385,21 +487,32 @@ pub fn load(
                 }
                 // The baseline is set already, so a copy that cannot be
                 // written only costs the offline fallback.
-                let note = keep_newest(cache_dir, library, keys, current)
-                    .err()
-                    .map(|e| {
-                        format!(
-                            "FeroSSH could not keep a copy of the team library {shown} ({e}), so \
-                             it is used now but is not there when the share cannot be read."
-                        )
-                    });
+                let mut notes = Vec::new();
+                if let Err(e) = keep_newest(cache_dir, library, keys, current) {
+                    notes.push(format!(
+                        "FeroSSH could not keep a copy of the team library {shown} ({e}), so it \
+                         is used now but is not there when the share cannot be read."
+                    ));
+                }
+                if let Some(Err(e)) =
+                    team::signer(&sig).map(|fp| raise_signer(cache_dir, &fp, team.serial))
+                {
+                    notes.push(format!(
+                        "FeroSSH could not note the date of the team library {shown} ({e}), so \
+                         after a restart it cannot tell an older library signed with the same \
+                         key at another path."
+                    ));
+                }
+                let note = (!notes.is_empty()).then(|| notes.join(" "));
                 return Loaded { team, note };
             }
             Err(why) => format!("was not used: {why}"),
         },
         Err(e) => format!("could not be read ({e})"),
     };
-    match newest_seen(library, keys, cache_dir) {
+    // Not a copy older than a library the same key signed since.
+    let floor = signer_floor(keys, cache_dir);
+    match newest_seen(library, keys, cache_dir).filter(|t| t.serial >= floor) {
         Some(team) => Loaded {
             team,
             note: Some(format!(
@@ -656,6 +769,63 @@ mod tests {
         // The later read, no longer current, leaves it as it is.
         keep_newest(&cache, path, &keys, &|| false).unwrap();
         assert_eq!(cached(Some(path), &keys, &cache).serial, 200);
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn an_older_library_by_the_same_key_is_refused_at_any_path() {
+        let share = temp("other-path");
+        let cache = temp("other-path-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        for d in ["a", "b"] {
+            std::fs::create_dir_all(share.join(d)).unwrap();
+        }
+        let new = write_dated(&share.join("a"), "new", 200);
+        let old = write_dated(&share.join("b"), "old", 100);
+        let (new, old) = (new.to_str().unwrap(), old.to_str().unwrap());
+        assert!(load(Some(new), &keys, &cache, &|| true).note.is_none());
+        // Another path, signed by the same key, older: not used.
+        let refused = load(Some(old), &keys, &cache, &|| true);
+        assert!(refused.team.names.is_empty());
+        assert!(refused.note.unwrap().contains("older than a library"));
+        // Kept on disk too, so it holds after a restart.
+        SIGNERS.lock().unwrap().retain(|(d, _, _)| d != &cache);
+        assert!(
+            load(Some(old), &keys, &cache, &|| true)
+                .team
+                .names
+                .is_empty()
+        );
+        // Nor does its old checked copy come back when the share goes.
+        std::fs::remove_file(old).unwrap();
+        assert!(
+            load(Some(old), &keys, &cache, &|| true)
+                .team
+                .names
+                .is_empty()
+        );
+        // Equal or newer at that path is fine.
+        let same = write_dated(&share.join("b"), "same", 200);
+        assert!(
+            load(same.to_str(), &keys, &cache, &|| true)
+                .team
+                .has("same")
+        );
+        // A key that signed nothing newer is not held back.
+        let other = Ed25519Keypair::from_seed(&[9; 32]);
+        let other = PrivateKey::new(KeypairData::Ed25519(other), "other").unwrap();
+        let bytes = team::export("Host theirs\n", &Settings::default(), &[], 50);
+        let sig = SshSig::sign(&other, team::NAMESPACE, HashAlg::Sha512, &bytes)
+            .unwrap()
+            .to_pem(LineEnding::LF)
+            .unwrap();
+        let theirs = share.join("c.ferossh-library");
+        std::fs::write(&theirs, &bytes).unwrap();
+        std::fs::write(sig_path(&theirs), sig).unwrap();
+        let theirs_keys = [other.public_key().to_openssh().unwrap()];
+        let used = load(theirs.to_str(), &theirs_keys, &cache, &|| true);
+        assert!(used.team.has("theirs") && used.note.is_none());
         let _ = std::fs::remove_dir_all(&share);
         let _ = std::fs::remove_dir_all(&cache);
     }
