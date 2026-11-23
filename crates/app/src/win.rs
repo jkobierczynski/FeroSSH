@@ -1633,6 +1633,9 @@ struct Window {
     /// A workspace pane's command, typed once its script's run (by number)
     /// in that pane is over.
     workspace_after: HashMap<PaneId, (u64, String)>,
+    /// Gateways the user chose to detach from a shared tmux session while
+    /// closing it: each closes once control mode has ended.
+    close_after_detach: HashSet<PaneId>,
     /// Production workspace questions that met another open dialog.
     workspace_asks: Vec<Command>,
     /// Panes whose next connection a security rule's question already
@@ -3029,6 +3032,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 workspace_extra: HashMap::new(),
                 layout_owner: claim_last_layout(),
                 workspace_after: HashMap::new(),
+                close_after_detach: HashSet::new(),
                 workspace_asks: Vec::new(),
                 connect_confirmed: HashMap::new(),
                 limits_approved: HashMap::new(),
@@ -4377,6 +4381,20 @@ impl Window {
         }
         if structure {
             self.after_structure_change();
+        }
+        // Detached on the way to closing: the connection closes now.
+        if self.close_after_detach.contains(&gateway)
+            && !self.tmux.get(&gateway).is_some_and(tmux::Tmux::active)
+        {
+            self.close_after_detach.remove(&gateway);
+            if self.panes.contains_key(&gateway) {
+                self.queued.push(Command::CloseSession {
+                    pane: gateway,
+                    label: String::new(),
+                    live: false,
+                    last: false,
+                });
+            }
         }
     }
 
@@ -13911,6 +13929,17 @@ impl Window {
             }
             TmuxKey::Focus(d) => run(cmd::FOCUS + dir_index(d)),
             TmuxKey::Resize(d) => run(cmd::RESIZE + dir_index(d)),
+            TmuxKey::ClosePane | TmuxKey::CloseTab
+                if let Some(shared) = self.shared_close(&[id]) =>
+            {
+                let panes = match action {
+                    TmuxKey::CloseTab => self.ws.tab().map(|t| t.root.panes()).unwrap_or_default(),
+                    _ => vec![id],
+                };
+                Some(Command::CloseShared(
+                    self.shared_close(&panes).unwrap_or(shared),
+                ))
+            }
             TmuxKey::ClosePane => Some(Command::Confirm {
                 text: "Close this tmux pane? tmux ends the program in it (kill-pane).".into(),
                 then: Box::new(Command::Id(cmd::CLOSE_PANE)),
@@ -18692,6 +18721,9 @@ impl Window {
     /// Closes a pane; the last one closes the window. A tmux pane is
     /// closed in tmux, and goes when tmux says it went.
     fn close_pane(&mut self, id: PaneId) -> Option<Command> {
+        if let Some(shared) = self.shared_close(&[id]) {
+            return Some(Command::CloseShared(shared));
+        }
         if let Some(gateway) = self.panes.get(&id).and_then(Pane::gateway)
             && let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active())
         {
@@ -22984,6 +23016,9 @@ impl Window {
 
     fn close_tab(&mut self, i: usize) -> Option<Command> {
         let ids = self.ws.tabs.get(i).map(|t| t.root.panes())?;
+        if let Some(shared) = self.shared_close(&ids) {
+            return Some(Command::CloseShared(shared));
+        }
         for id in ids {
             if let Some(c) = self.close_pane(id) {
                 return Some(c);
@@ -22991,6 +23026,80 @@ impl Window {
         }
         None
     }
+}
+
+impl Window {
+    /// Closing panes `ids` would close tmux windows that other clients
+    /// attached to the same session show too (another FeroSSH connection
+    /// or a terminal): what to ask about the first such session.
+    fn shared_close(&self, ids: &[PaneId]) -> Option<SharedClose> {
+        let (gateway, t) = ids.iter().find_map(|id| {
+            let gateway = self.panes.get(id).and_then(Pane::gateway)?;
+            let t = self.tmux.get(&gateway).filter(|t| t.active())?;
+            (t.others_attached() > 0).then_some((gateway, t))
+        })?;
+        let panes = ids
+            .iter()
+            .copied()
+            .filter(|id| self.panes.get(id).and_then(Pane::gateway) == Some(gateway))
+            .collect();
+        let tabs = self
+            .ws
+            .tabs
+            .iter()
+            .filter(|tab| {
+                tab.root
+                    .panes()
+                    .iter()
+                    .any(|p| self.panes.get(p).and_then(Pane::gateway) == Some(gateway))
+            })
+            .count();
+        Some(SharedClose {
+            gateway,
+            panes,
+            session: t.session_id()?,
+            name: t.session_name().unwrap_or_default().to_owned(),
+            host: self.key_host(gateway).unwrap_or_default(),
+            others: t.others_attached(),
+            tabs,
+        })
+    }
+
+    /// The user's answer about a shared tmux session: `detach` leaves it
+    /// to the other clients and closes this connection once detached;
+    /// otherwise the panes close in tmux, for every client.
+    fn close_shared(&mut self, shared: &SharedClose, detach: bool) {
+        let gateway = shared.gateway;
+        let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active()) else {
+            return;
+        };
+        // Queued output can switch or end the session before the answer.
+        if t.session_id() != Some(shared.session) {
+            return;
+        }
+        let actions = if detach {
+            self.close_after_detach.insert(gateway);
+            t.detach()
+        } else {
+            shared.panes.iter().flat_map(|p| t.close(*p)).collect()
+        };
+        self.run_tmux(gateway, actions);
+    }
+}
+
+/// Closing would close tmux windows other clients show too: asked first.
+#[derive(Debug, Clone)]
+struct SharedClose {
+    gateway: PaneId,
+    /// The panes asked to close, all of `gateway`'s tmux session.
+    panes: Vec<PaneId>,
+    session: ferossh_tmuxcc::SessionId,
+    name: String,
+    host: String,
+    /// Clients of the session besides this one.
+    others: u32,
+    /// Tabs this window shows the session in.
+    tabs: usize,
 }
 
 /// What a menu item's text becomes: its shortcut after a tab (none:
@@ -23372,6 +23481,9 @@ enum Command {
     },
     /// Close tab `i` without asking (it was asked already).
     CloseTabNow(usize),
+    /// Ask whether to detach from a tmux session others show too, or
+    /// close its panes for everyone.
+    CloseShared(SharedClose),
     /// Ask, then remove the snippet at this index.
     DeleteSnippet(usize),
     /// The user clicked the notification of a coding agent asking a
@@ -26250,7 +26362,9 @@ fn run_command(hwnd: HWND, command: Command) {
             live,
             last,
         } => {
-            if live || last {
+            // A tmux session others show too asks its own question.
+            let shared = with_window(|w| w.shared_close(&[pane]).is_some()).unwrap_or(false);
+            if (live || last) && !shared {
                 let mut text = format!("Close {label}?");
                 if live {
                     text.push_str(" Its session ends.");
@@ -26282,6 +26396,48 @@ fn run_command(hwnd: HWND, command: Command) {
                 w.refresh_visible();
             });
         }
+        Command::CloseShared(shared) => {
+            let clients = if shared.others == 1 {
+                "Another client (another FeroSSH connection or a terminal) is".to_owned()
+            } else {
+                format!(
+                    "{} other clients (other FeroSSH connections or terminals) are",
+                    shared.others
+                )
+            };
+            let tabs = if shared.tabs == 1 {
+                "its tab closes".to_owned()
+            } else {
+                format!("its {} tabs close", shared.tabs)
+            };
+            let text = format!(
+                "{clients} attached to tmux session \"{}\" on {} too, and shows the same \
+                 panes. Closing them in tmux would close them there as well.\n\n\
+                 Yes: detach from the session and close this connection; {tabs} here, and \
+                 tmux keeps everything running for the other clients.\n\
+                 No: close {} in tmux for everyone (the programs in {} end).\n\
+                 Cancel: keep everything open.",
+                crate::ssh::sanitize(&shared.name),
+                crate::ssh::sanitize(&shared.host),
+                if shared.panes.len() == 1 {
+                    "this pane"
+                } else {
+                    "these panes"
+                },
+                if shared.panes.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                },
+            );
+            let answer = dialog(hwnd, &text, MB_YESNOCANCEL | MB_ICONWARNING);
+            let detach = match answer {
+                Some(IDYES) => true,
+                Some(IDNO) => false,
+                _ => return,
+            };
+            with_window(|w| w.close_shared(&shared, detach));
+        }
         Command::CloseTabNow(i) => {
             if let Some(next) = with_window(|w| w.close_tab(i)).flatten() {
                 run_command(hwnd, next);
@@ -26289,7 +26445,13 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::CloseTab(i) => {
             let live = with_window(|w| w.live_sessions(Some(i))).unwrap_or(0);
-            if live > 1 {
+            // A tmux session others show too asks its own question.
+            let shared = with_window(|w| {
+                let ids = w.ws.tabs.get(i).map(|t| t.root.panes()).unwrap_or_default();
+                w.shared_close(&ids).is_some()
+            })
+            .unwrap_or(false);
+            if live > 1 && !shared {
                 let text = format!("This tab has {live} open SSH sessions. Close them?");
                 if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != Some(IDYES) {
                     return;

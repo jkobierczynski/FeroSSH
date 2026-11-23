@@ -573,6 +573,42 @@ fn real_tmux_other_client_keeping_the_window_small_is_detached() {
 }
 
 #[test]
+fn real_tmux_counts_the_other_clients_of_the_session() {
+    if !tmux_available() {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-shared-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Tmux);
+    a.until("the first client's pane", |h| !h.panes.is_empty());
+    a.until("the first count", |h| h.tmux.others_attached() == 0);
+
+    // A second connection to the same session: both know of the other,
+    // the first from tmux's notification.
+    let mut b = Harness::attach(&server, Mode::Tmux);
+    b.until("the second client's pane", |h| !h.panes.is_empty());
+    b.until("the second client's count", |h| {
+        h.tmux.others_attached() == 1
+    });
+    a.until("the first client told", |h| h.tmux.others_attached() == 1);
+
+    // The second one leaves by detaching: the session and its window stay
+    // for the first, which counts itself alone again.
+    let actions = b.tmux.detach();
+    b.apply(actions);
+    b.until("the detach", |h| !h.tmux.active());
+    a.until("the first client alone", |h| h.tmux.others_attached() == 0);
+    assert!(a.tmux.active());
+    assert_eq!(a.shown(), 1);
+    let windows = tmux_cmd(
+        &server,
+        &["list-windows", "-t", "e2e", "-F", "#{window_id}"],
+    );
+    assert_eq!(windows.lines().count(), 1, "{windows}");
+}
+
+#[test]
 fn real_tmux_split_in_the_same_directory() {
     // Older tmux is refused before any pane appears.
     if !tmux_available() || version() < MIN_VERSION {

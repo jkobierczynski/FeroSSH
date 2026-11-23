@@ -207,6 +207,8 @@ enum Tag {
     /// The size tmux gave a window after we asked for this one, and how
     /// many clients the session has.
     SizeCheck(WindowId, (u16, u16)),
+    /// How many clients session `.0` has.
+    Clients(SessionId),
     /// Our own client's name, before detaching the others of session `.0`.
     OwnClient(SessionId),
     /// The clients of session `.0` to detach, all but ours (`.1`).
@@ -495,6 +497,9 @@ pub struct Tmux {
     sent_layouts: BTreeMap<WindowId, String>,
     /// Other clients were found keeping a window small (asked once).
     crowded_asked: bool,
+    /// How many clients the session attached has, ours included, as
+    /// tmux last said (`#{session_attached}`); `None` until it has.
+    clients: Option<u32>,
     saved_text: Option<String>,
     /// The session to attach again after a reconnect.
     pub reattach: Option<String>,
@@ -652,6 +657,7 @@ impl Tmux {
             sent_client_size: None,
             sent_layouts: BTreeMap::new(),
             crowded_asked: false,
+            clients: None,
             saved_text: None,
             reattach: None,
             keys_wanted: false,
@@ -1033,6 +1039,7 @@ impl Tmux {
                 Event::Terminal(b) => out.push(Action::GatewayOutput(b)),
                 Event::Started => {
                     self.session = None;
+                    self.clients = None;
                     self.version = None;
                     self.joined = self.join_pending.take();
                     self.share_pending = self.share_staged.take();
@@ -1090,6 +1097,9 @@ impl Tmux {
                     self.start_restore(out);
                 }
             }
+            // Asked after the restore's own question too, so the answer
+            // is never older than the change.
+            Notification::ClientsChanged => self.ask_clients(out),
             _ if self.restoring => {}
             Notification::WindowAdd { window } => {
                 if !self.windows.contains_key(&window) {
@@ -1155,9 +1165,16 @@ impl Tmux {
         self.sent_client_size = None;
         self.sent_layouts.clear();
         self.crowded_asked = false;
+        self.clients = None;
         self.saved_text = None;
         self.restoring = true;
-        self.send("display-message -p '#{version}'", Tag::Version, out);
+        // With how many clients the session has, so closing can ask
+        // first when others show it too.
+        self.send(
+            "display-message -p '#{version} #{session_attached}'",
+            Tag::Version,
+            out,
+        );
         self.send(
             &format!("show-options -v -q {}", saved::MODE_OPTION),
             Tag::ModeOption,
@@ -1179,6 +1196,29 @@ impl Tmux {
         if self.keys_wanted {
             self.send_keys_query(out);
         }
+    }
+
+    /// Asks how many clients the session attached has.
+    fn ask_clients(&mut self, out: &mut Vec<Action>) {
+        let Some((session, _)) = self.session else {
+            return;
+        };
+        self.send(
+            &format!("display-message -p -t ${session} '#{{session_attached}}'"),
+            Tag::Clients(session),
+            out,
+        );
+    }
+
+    /// How many other clients (another FeroSSH connection, a terminal)
+    /// show the session this client attached, as tmux last said. Closing
+    /// one of its panes in tmux closes it for them too. A session joined
+    /// (someone else's) counts none: closing there only leaves it.
+    pub fn others_attached(&self) -> u32 {
+        if !self.client.is_control() || self.joined.is_some() {
+            return 0;
+        }
+        self.clients.map_or(0, |c| c.saturating_sub(1))
     }
 
     fn send_keys_query(&mut self, out: &mut Vec<Action>) {
@@ -1288,9 +1328,16 @@ impl Tmux {
         };
         match tag {
             Tag::Version => {
-                self.version = ok.then(|| Version::parse(&first())).flatten();
+                let reply = first();
+                let mut words = reply.split_whitespace();
+                let version = words.next().unwrap_or_default();
+                self.version = ok.then(|| Version::parse(version)).flatten();
                 // Releases are numbers ("3.4", "3.3a").
-                self.dev_build = !first().starts_with(|c: char| c.is_ascii_digit());
+                self.dev_build = !version.starts_with(|c: char| c.is_ascii_digit());
+                // A count asked for after a client came or went is newer.
+                if self.clients.is_none() {
+                    self.clients = words.next().and_then(|c| c.parse().ok());
+                }
                 if let Some(share) = self.share_pending.take() {
                     self.send(
                         "display-message -p '#{socket_path}'",
@@ -1572,6 +1619,11 @@ impl Tmux {
                         let line = format!("detach-client -t {}", command::quote(&name));
                         self.send(&line, Tag::Ignore, out);
                     }
+                }
+            }
+            Tag::Clients(session) => {
+                if ok && self.session.as_ref().map(|(s, _)| *s) == Some(session) {
+                    self.clients = first().trim().parse().ok();
                 }
             }
             Tag::OwnClient(session) => {
@@ -2052,6 +2104,7 @@ impl Tmux {
         self.agents.clear();
         self.placements.clear();
         self.session = None;
+        self.clients = None;
         self.restoring = false;
         self.joined = None;
         out.push(Action::Structure);
