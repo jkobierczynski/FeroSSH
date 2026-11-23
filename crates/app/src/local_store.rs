@@ -186,17 +186,7 @@ pub fn write(name: &str, was: &Read, text: &str) -> std::io::Result<()> {
     }
     if !locked {
         match with_key(|k| k.seal(text.as_bytes())) {
-            Some(Ok(Ok(sealed))) => {
-                crate::inventory_view::write_whole(&sealed_path(&plain), &sealed)?;
-                // The plain part is in the sealed copy now: left behind,
-                // it would be read twice. Emptied when it cannot go.
-                return match std::fs::remove_file(&plain) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        crate::inventory_view::write_whole(&plain, "").map_err(|_| e)
-                    }
-                    _ => Ok(()),
-                };
-            }
+            Some(Ok(Ok(sealed))) => return seal_in(&plain, &sealed),
             Some(Ok(Err(e)) | Err(e)) => return Err(std::io::Error::other(e)),
             None => {}
         }
@@ -211,6 +201,64 @@ pub fn write(name: &str, was: &Read, text: &str) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Puts `sealed` (the whole text, plain part included) in place of
+/// `plain` and its sealed copy. The plain part, left behind, would be
+/// read twice: it is removed, else emptied, else the sealed copy goes
+/// back to what it was, so a read or a retry never sees an entry twice.
+fn seal_in(plain: &Path, sealed: &str) -> std::io::Result<()> {
+    let at = sealed_path(plain);
+    let before = read_text(&at)?;
+    crate::inventory_view::write_whole(&at, sealed)?;
+    let Err(e) = std::fs::remove_file(plain) else {
+        return Ok(());
+    };
+    if e.kind() == std::io::ErrorKind::NotFound
+        || crate::inventory_view::write_whole(plain, "").is_ok()
+    {
+        return Ok(());
+    }
+    let back = match &before {
+        Some(t) => crate::inventory_view::write_whole(&at, t),
+        None => std::fs::remove_file(&at),
+    };
+    Err(match back {
+        Ok(()) => e,
+        Err(b) => std::io::Error::new(
+            e.kind(),
+            format!(
+                "{e}; {} holds the same entries and could not be put back ({b})",
+                at.display()
+            ),
+        ),
+    })
+}
+
+/// Writes `r` (the plain part and the sealed part) plain as `plain` and
+/// removes the sealed copy; when that cannot go, the plain file goes
+/// back to what it held, so no entry is there twice.
+fn unseal_in(plain: &Path, r: &Read) -> std::io::Result<()> {
+    let before = read_text(plain)?;
+    crate::inventory_view::write_whole(plain, &r.text)?;
+    let e = match std::fs::remove_file(sealed_path(plain)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => e,
+        _ => return Ok(()),
+    };
+    let back = match &before {
+        Some(t) => crate::inventory_view::write_whole(plain, t),
+        None => std::fs::remove_file(plain),
+    };
+    Err(match back {
+        Ok(()) => e,
+        Err(b) => std::io::Error::new(
+            e.kind(),
+            format!(
+                "{e}; {} holds the same entries and could not be put back ({b})",
+                plain.display()
+            ),
+        ),
+    })
 }
 
 /// Reads and writes every file again under its lock: sealed now that a
@@ -248,28 +296,7 @@ pub fn unseal_all() -> Vec<String> {
             problems.push(format!("{name}: the sealed copy could not be opened"));
             continue;
         }
-        let plain = dir.join(name);
-        let before = match read_text(&plain) {
-            Ok(t) => t,
-            Err(e) => {
-                problems.push(format!("{name}: {e}"));
-                continue;
-            }
-        };
-        let done = crate::inventory_view::write_whole(&plain, &r.text).and_then(|()| {
-            match std::fs::remove_file(sealed_path(&plain)) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    // The sealed copy stays: the plain file goes back to
-                    // what it held, so nothing is there twice.
-                    let _ = match &before {
-                        Some(t) => crate::inventory_view::write_whole(&plain, t),
-                        None => std::fs::remove_file(&plain),
-                    };
-                    Err(e)
-                }
-                _ => Ok(()),
-            }
-        });
+        let done = unseal_in(&dir.join(name), &r);
         if let Err(e) = done {
             problems.push(format!("{name}: {e}"));
         }
@@ -321,6 +348,57 @@ mod tests {
         let r = read_in(&dir, "x.log").unwrap();
         assert!(r.locked);
         assert_eq!(r.text, "one\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ferossh-ls-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sealing_never_leaves_an_entry_in_both_copies() {
+        let dir = fresh("seal");
+        let plain = dir.join("x.log");
+        std::fs::write(&plain, "new\n").unwrap();
+        seal_in(&plain, "SEALED old+new").unwrap();
+        assert!(!plain.exists());
+        assert_eq!(
+            std::fs::read_to_string(sealed_path(&plain)).unwrap(),
+            "SEALED old+new"
+        );
+        // A plain part that can be neither removed nor emptied (here a
+        // folder): the sealed copy goes back to what it was.
+        std::fs::create_dir_all(plain.join("busy")).unwrap();
+        assert!(seal_in(&plain, "SEALED twice").is_err());
+        assert_eq!(
+            std::fs::read_to_string(sealed_path(&plain)).unwrap(),
+            "SEALED old+new"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsealing_never_leaves_an_entry_in_both_copies() {
+        let dir = fresh("unseal");
+        let plain = dir.join("x.log");
+        std::fs::write(&plain, "new\n").unwrap();
+        // A sealed copy that cannot be removed (here a folder): the plain
+        // file goes back to what it held.
+        std::fs::create_dir_all(sealed_path(&plain).join("busy")).unwrap();
+        let r = Read {
+            text: "new\nold\n".into(),
+            locked: false,
+        };
+        assert!(unseal_in(&plain, &r).is_err());
+        assert_eq!(std::fs::read_to_string(&plain).unwrap(), "new\n");
+        std::fs::remove_dir_all(sealed_path(&plain)).unwrap();
+        std::fs::write(sealed_path(&plain), "SEALED").unwrap();
+        unseal_in(&plain, &r).unwrap();
+        assert_eq!(std::fs::read_to_string(&plain).unwrap(), "new\nold\n");
+        assert!(!sealed_path(&plain).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
