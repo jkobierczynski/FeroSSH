@@ -583,6 +583,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The folder lock opens its file with no sharing, which Windows
+    /// enforces per handle: two handles in one process exclude each
+    /// other exactly as two processes do.
+    #[cfg(windows)]
+    #[test]
+    fn exports_at_once_never_share_a_serial() {
+        let dir = temp("serial-race");
+        {
+            let _held = crate::inventory_view::lock(&dir).unwrap();
+            assert!(crate::inventory_view::lock(&dir).is_err());
+        }
+        let serials: Vec<u64> = std::thread::scope(|s| {
+            let all: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| next_serial(&dir, 1000, 0).unwrap()))
+                .collect();
+            all.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let mut sorted = serials.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, (1000..1008).collect::<Vec<_>>(), "{serials:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn crossed_reads_leave_the_newer_copy() {
         let share = temp("crossed");
