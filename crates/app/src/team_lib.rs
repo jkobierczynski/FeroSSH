@@ -37,16 +37,32 @@ pub fn set_current(team: Team) {
 
 /// The newest library this run accepted, per library path and the keys
 /// it was checked against: the rollback check's baseline even when its
-/// copy could not be written ([`keep`]).
-static ACCEPTED: Mutex<Vec<(String, Vec<String>, Team)>> = Mutex::new(Vec::new());
+/// copy could not be written ([`keep_newest`]).
+static ACCEPTED: Mutex<Vec<Accepted>> = Mutex::new(Vec::new());
+
+/// One entry of [`ACCEPTED`]: the library as read, so its checked copy
+/// can be written from it ([`keep_newest`]).
+struct Accepted {
+    library: String,
+    keys: Vec<String>,
+    team: Team,
+    bytes: Vec<u8>,
+    sig: String,
+}
+
+impl Accepted {
+    fn is(&self, library: &str, keys: &[String]) -> bool {
+        self.library == library.trim() && self.keys == keys
+    }
+}
 
 /// The newest library accepted for `library` under `keys`: this run's,
 /// or the checked copy's, whichever is newer.
 fn newest_seen(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> {
     let run = ACCEPTED.lock().ok().and_then(|a| {
         a.iter()
-            .find(|(l, k, _)| l == library.trim() && k == keys)
-            .map(|(.., t)| t.clone())
+            .find(|e| e.is(library, keys))
+            .map(|e| e.team.clone())
     });
     let copy = from_cache(library, keys, cache_dir);
     match (run, copy) {
@@ -64,30 +80,35 @@ fn accept_unless_older(
     keys: &[String],
     cache_dir: &Path,
     team: &Team,
+    bytes: &[u8],
+    sig: &str,
 ) -> Option<Team> {
     let Ok(mut a) = ACCEPTED.lock() else {
         return newest_seen(library, keys, cache_dir).filter(|k| k.serial > team.serial);
     };
     let run = a
         .iter()
-        .find(|(l, k, _)| l == library.trim() && k == keys)
-        .map(|(.., t)| t.serial)
-        .unwrap_or(0);
+        .find(|e| e.is(library, keys))
+        .map_or(0, |e| e.team.serial);
     let copy = from_cache(library, keys, cache_dir);
     if let Some(c) = copy.filter(|c| c.serial > team.serial && c.serial >= run) {
         return Some(c);
     }
-    match a
-        .iter_mut()
-        .find(|(l, k, _)| l == library.trim() && k == keys)
-    {
-        Some((.., t)) if t.serial > team.serial => Some(t.clone()),
-        Some((.., t)) => {
-            *t = team.clone();
+    let entry = Accepted {
+        library: library.trim().to_owned(),
+        keys: keys.to_vec(),
+        team: team.clone(),
+        bytes: bytes.to_vec(),
+        sig: sig.to_owned(),
+    };
+    match a.iter_mut().find(|e| e.is(library, keys)) {
+        Some(e) if e.team.serial > team.serial => Some(e.team.clone()),
+        Some(e) => {
+            *e = entry;
             None
         }
         None => {
-            a.push((library.trim().to_owned(), keys.to_vec(), team.clone()));
+            a.push(entry);
             None
         }
     }
@@ -100,8 +121,8 @@ pub fn newest_accepted(library: Option<&str>, keys: &[String]) -> Option<Team> {
     let library = library.map(str::trim).filter(|l| !l.is_empty())?;
     ACCEPTED.lock().ok().and_then(|a| {
         a.iter()
-            .find(|(l, k, _)| l == library && k == keys)
-            .map(|(.., t)| t.clone())
+            .find(|e| e.is(library, keys))
+            .map(|e| e.team.clone())
     })
 }
 
@@ -195,16 +216,38 @@ fn read_sig(path: &Path) -> std::io::Result<String> {
         .map_err(|_| std::io::Error::other("not text"))
 }
 
-/// Keeps library `bytes` and its signature `sig` as the checked copy
-/// for `library`: written beside it, then moved over the old one, so a
-/// failed write leaves the old copy as it was.
-fn keep(
+/// Writes the newest library accepted this run for `library` under
+/// `keys` as its checked copy, so the copy never falls behind it: when
+/// this read is still the newest (`current`), or when the copy there is
+/// one these keys check and older. Two reads that cross therefore leave
+/// the newer library on disk, whichever finishes last.
+fn keep_newest(
     cache_dir: &Path,
     library: &str,
-    bytes: &[u8],
-    sig: &str,
+    keys: &[String],
     current: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
+    // Held while the newest is picked and moved into place, so a read
+    // that picked an older one cannot move it in after a newer one.
+    let _held = COMMIT.lock();
+    let Some((serial, bytes, sig)) = ACCEPTED.lock().ok().and_then(|a| {
+        a.iter()
+            .find(|e| e.is(library, keys))
+            .map(|e| (e.team.serial, e.bytes.clone(), e.sig.clone()))
+    }) else {
+        return Ok(());
+    };
+    let behind = from_cache(library, keys, cache_dir).is_some_and(|c| c.serial < serial);
+    if !current() && !behind {
+        return Ok(());
+    }
+    write_copy(cache_dir, library, &bytes, &sig)
+}
+
+/// Writes the checked copy for `library` beside it, then moves it over
+/// the old one, so a failed write leaves the old copy as it was. The
+/// caller holds [`COMMIT`].
+fn write_copy(cache_dir: &Path, library: &str, bytes: &[u8], sig: &str) -> std::io::Result<()> {
     /// Numbers each write, so two never share a temporary file.
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let file = cache_path(cache_dir, library);
@@ -213,13 +256,8 @@ fn keep(
     let mut record = format!("{}\n{}\n{sig}", library.trim(), sig.len()).into_bytes();
     record.extend_from_slice(bytes);
     let tmp = write_new(&file, &record, WRITES.fetch_add(1, Ordering::Relaxed))?;
-    let _held = COMMIT.lock();
-    let done = if current() {
-        std::fs::rename(&tmp, &file)
-    } else {
-        Ok(())
-    };
-    // Still there when not moved: an older read's, or a failed rename.
+    let done = std::fs::rename(&tmp, &file);
+    // Still there when the rename failed.
     let _ = std::fs::remove_file(&tmp);
     done
 }
@@ -308,7 +346,9 @@ pub fn load(
                 // a new one has reason to do. The newer copy stays in use.
                 // Checked and taken as the new baseline in one step, so two
                 // reads at once cannot each pass against an old baseline.
-                if let Some(kept) = accept_unless_older(library, keys, cache_dir, &team) {
+                if let Some(kept) =
+                    accept_unless_older(library, keys, cache_dir, &team, &bytes, &sig)
+                {
                     let note = format!(
                         "The team library {shown} was not used: it is older than the copy \
                          FeroSSH checked last (exported {}, the copy {}), so someone may have \
@@ -324,7 +364,7 @@ pub fn load(
                 }
                 // The baseline is set already, so a copy that cannot be
                 // written only costs the offline fallback.
-                let _ = keep(cache_dir, library, &bytes, &sig, current);
+                let _ = keep_newest(cache_dir, library, keys, current);
                 return Loaded { team, note: None };
             }
             Err(why) => format!("was not used: {why}"),
@@ -513,5 +553,28 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         assert!(next_serial(&file, 1000, 0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crossed_reads_leave_the_newer_copy() {
+        let share = temp("crossed");
+        let cache = temp("crossed-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let lib = write_dated(&share, "old", 100);
+        let path = lib.to_str().unwrap();
+        // The newest read sees serial 100 and writes its copy.
+        assert!(load(Some(path), &keys, &cache, &|| true).team.has("old"));
+        // An older read that finishes later saw serial 200: no longer
+        // the newest, it still puts its newer library on disk.
+        write_dated(&share, "new", 200);
+        assert!(load(Some(path), &keys, &cache, &|| false).team.has("new"));
+        let copy = cached(Some(path), &keys, &cache);
+        assert!(copy.has("new") && copy.serial == 200);
+        // And a current read of 100 after that does not write it back.
+        write_dated(&share, "old", 100);
+        assert!(load(Some(path), &keys, &cache, &|| true).team.has("new"));
+        assert!(cached(Some(path), &keys, &cache).has("new"));
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
     }
 }
