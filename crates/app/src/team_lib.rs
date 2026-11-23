@@ -205,8 +205,6 @@ fn cache_path(dir: &Path, library: &str) -> PathBuf {
     dir.join(format!("team-library-{hash:016x}.cache"))
 }
 
-/// A file read whole, refused when larger than `max` bytes; the limit
-/// holds while it is read, so a file that grows meanwhile is refused too.
 /// The newest library date FeroSSH has used per signing key, one line
 /// `SHA256:... <serial>` each, in FeroSSH's folder. A library older than
 /// that is refused whatever path it is read from, so pointing FeroSSH at
@@ -252,29 +250,58 @@ fn signer_floor(keys: &[String], dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Notes that a library dated `serial` signed by `signer` was used.
-fn raise_signer(dir: &Path, signer: &str, serial: u64) -> std::io::Result<()> {
-    if let Ok(mut run) = SIGNERS.lock() {
-        match run.iter_mut().find(|(d, fp, _)| d == dir && fp == signer) {
-            Some(e) => e.2 = e.2.max(serial),
-            None => run.push((dir.to_owned(), signer.to_owned(), serial)),
+/// Checks a library dated `serial` and signed by `signer` against the
+/// newest date used with any of `keys` and, unless it is older, raises
+/// `signer`'s date to `serial`: one step under [`SIGNERS`] (and the
+/// folder lock, between FeroSSH processes), so two reads at once, of
+/// two paths, cannot each pass against the date from before either.
+/// `Err` with that date when the library is older; otherwise whether
+/// the new date could be kept on disk (it holds for the run either way).
+fn claim_signer(
+    dir: &Path,
+    keys: &[String],
+    signer: &str,
+    serial: u64,
+) -> Result<std::io::Result<()>, u64> {
+    let held = crate::inventory_view::lock(dir);
+    let mut run = SIGNERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fps = team::fingerprints(keys);
+    let mut disk = read_signers(dir);
+    let floor = run
+        .iter()
+        .filter(|(d, _, _)| d == dir)
+        .map(|(_, fp, n)| (fp, *n))
+        .chain(disk.iter().map(|(fp, n)| (fp, *n)))
+        .filter(|(fp, _)| fps.contains(fp))
+        .map(|(_, n)| n)
+        .max()
+        .unwrap_or(0);
+    if serial < floor {
+        return Err(floor);
+    }
+    match run.iter_mut().find(|(d, fp, _)| d == dir && fp == signer) {
+        Some(e) => e.2 = e.2.max(serial),
+        None => run.push((dir.to_owned(), signer.to_owned(), serial)),
+    }
+    Ok(held.and_then(|_held| {
+        match disk.iter_mut().find(|(fp, _)| fp == signer) {
+            Some(e) if e.1 >= serial => return Ok(()),
+            Some(e) => e.1 = serial,
+            None => disk.push((signer.to_owned(), serial)),
         }
-    }
-    let _held = crate::inventory_view::lock(dir)?;
-    let mut all = read_signers(dir);
-    match all.iter_mut().find(|(fp, _)| fp == signer) {
-        Some(e) if e.1 >= serial => return Ok(()),
-        Some(e) => e.1 = serial,
-        None => all.push((signer.to_owned(), serial)),
-    }
-    let text: String = all.iter().map(|(fp, n)| format!("{fp} {n}\n")).collect();
-    let file = dir.join(SIGNERS_FILE);
-    let tmp = write_new(&file, text.as_bytes(), serial)?;
-    std::fs::rename(&tmp, &file).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+        let text: String = disk.iter().map(|(fp, n)| format!("{fp} {n}\n")).collect();
+        let file = dir.join(SIGNERS_FILE);
+        let tmp = write_new(&file, text.as_bytes(), serial)?;
+        std::fs::rename(&tmp, &file).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    }))
 }
 
+/// A file read whole, refused when larger than `max` bytes; the limit
+/// holds while it is read, so a file that grows meanwhile is refused too.
 fn read_capped(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
@@ -436,14 +463,14 @@ pub fn load(
                 // a new one has reason to do. The newer copy stays in use.
                 // Checked and taken as the new baseline in one step, so two
                 // reads at once cannot each pass against an old baseline.
-                // Older than a library the same key signed that FeroSSH
-                // used before, at this path or another: refused too.
                 // Refused too when older than a library the same key
                 // signed that FeroSSH used before, at this path or another
                 // (FeroSSH pointed at an older file, or one put at a new
-                // path). Checked before it is taken as this path's newest.
-                let floor = signer_floor(keys, cache_dir);
-                let kept = if team.serial < floor {
+                // path). Checked and the key's date raised in one step,
+                // before it is taken as this path's newest.
+                let signer = team::signer(&sig).unwrap_or_default();
+                let claimed = claim_signer(cache_dir, keys, &signer, team.serial);
+                let kept = if let Err(floor) = claimed {
                     match newest_seen(library, keys, cache_dir).filter(|t| t.serial >= floor) {
                         Some(kept) => Some(kept),
                         None => {
@@ -494,9 +521,7 @@ pub fn load(
                          is used now but is not there when the share cannot be read."
                     ));
                 }
-                if let Some(Err(e)) =
-                    team::signer(&sig).map(|fp| raise_signer(cache_dir, &fp, team.serial))
-                {
+                if let Ok(Err(e)) = claimed {
                     notes.push(format!(
                         "FeroSSH could not note the date of the team library {shown} ({e}), so \
                          after a restart it cannot tell an older library signed with the same \
@@ -831,6 +856,57 @@ mod tests {
         let theirs_keys = [other.public_key().to_openssh().unwrap()];
         let used = load(theirs.to_str(), &theirs_keys, &cache, &|| true);
         assert!(used.team.has("theirs") && used.note.is_none());
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn the_key_date_is_checked_and_raised_in_one_step() {
+        let cache = temp("claim");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let fp = team::fingerprints(&keys).pop().unwrap();
+        // Two reads of two paths: once the newer one is claimed, the
+        // older one fails against it, whichever started first.
+        assert!(matches!(claim_signer(&cache, &keys, &fp, 200), Ok(Ok(()))));
+        assert_eq!(claim_signer(&cache, &keys, &fp, 150).err(), Some(200));
+        assert!(matches!(claim_signer(&cache, &keys, &fp, 200), Ok(Ok(()))));
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn reads_of_several_paths_at_once_end_at_the_newest_date() {
+        let share = temp("paths-at-once");
+        let cache = temp("paths-at-once-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let paths: Vec<(PathBuf, u64)> = (1..=8u64)
+            .map(|n| {
+                let dir = share.join(n.to_string());
+                std::fs::create_dir_all(&dir).unwrap();
+                (write_dated(&dir, &format!("lib{n}"), n * 100), n * 100)
+            })
+            .collect();
+        let start = std::sync::Barrier::new(paths.len());
+        let used: Vec<(u64, bool)> = std::thread::scope(|s| {
+            let all: Vec<_> = paths
+                .iter()
+                .map(|(path, serial)| {
+                    let (start, keys, cache) = (&start, &keys, &cache);
+                    s.spawn(move || {
+                        start.wait();
+                        let got = load(path.to_str(), keys, cache, &|| true);
+                        (*serial, got.team.serial == *serial)
+                    })
+                })
+                .collect();
+            all.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        // The newest is never refused, and nothing older gets past it now.
+        assert!(used.contains(&(800, true)), "{used:?}");
+        assert_eq!(signer_floor(&keys, &cache), 800);
+        for (path, serial) in paths.iter().filter(|(_, n)| *n < 800) {
+            let again = load(path.to_str(), &keys, &cache, &|| true);
+            assert_ne!(again.team.serial, *serial);
+        }
         let _ = std::fs::remove_dir_all(&share);
         let _ = std::fs::remove_dir_all(&cache);
     }
