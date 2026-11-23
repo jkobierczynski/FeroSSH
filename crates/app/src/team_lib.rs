@@ -293,7 +293,7 @@ pub fn load(
         },
         Err(e) => format!("could not be read ({e})"),
     };
-    match from_cache(library, keys, cache_dir) {
+    match newest_seen(library, keys, cache_dir) {
         Some(team) => Loaded {
             team,
             note: Some(format!(
@@ -443,6 +443,11 @@ mod tests {
         write_dated(&share, "between", 220);
         let between = load(Some(path), &keys, &unwritable, &|| true);
         assert!(between.team.has("newest") && between.note.is_some());
+        // And when the share then cannot be read, that one stays too,
+        // not the older copy on disk.
+        std::fs::remove_file(&lib).unwrap();
+        let offline = load(Some(path), &keys, &unwritable, &|| true);
+        assert!(offline.team.has("newest"));
         // The same export read again, and a newer one, are used.
         write_dated(&share, "web2", 250);
         assert!(load(Some(path), &keys, &cache, &|| true).note.is_none());
