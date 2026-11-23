@@ -602,6 +602,10 @@ pub enum Effect {
     /// The connection dropped (or a reconnect could not reach the host):
     /// try again after a pause. [`Effect::Ended`] follows.
     Reconnect,
+    /// A shell opened on another tab's connection was refused before it
+    /// started (tinysshd, say, takes one session per connection): log in
+    /// on a connection of this pane's own instead. Nothing follows.
+    LoginAlone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,6 +702,9 @@ pub struct SshSession {
     /// The host key the server showed: its type and SHA-256 fingerprint,
     /// for the inventory.
     pub host_key_seen: Option<(String, String)>,
+    /// The server refused a second session on this login's connection (or
+    /// on the one this pane first tried to share): no new tab shares it.
+    pub solo: bool,
     /// The kind of the server prompt being answered.
     prompt_kind: Option<PromptKind>,
     /// The source was asked once; a second password prompt is typed.
@@ -951,6 +958,7 @@ impl SshSession {
             remember_password: false,
             keys_only: false,
             host_key_seen: None,
+            solo: false,
             prompt_kind: None,
             source_tried: false,
             source_used: false,
@@ -1635,10 +1643,18 @@ impl SshSession {
         ]
     }
 
+    /// Whether this shell was opened on another tab's connection rather
+    /// than by a login of its own.
+    pub fn shares_a_connection(&self) -> bool {
+        self.connection != self.channel
+    }
+
     /// Whether a new tab for `target` can share this session's connection:
     /// same host, port and user, and logged in.
     pub fn can_share(&self, target: &Target) -> bool {
         self.state == State::Connected
+            // The server takes one session per connection.
+            && !self.solo
             && self.target.hostname.eq_ignore_ascii_case(&target.hostname)
             && self.target.port == target.port
             && self.target.user == target.user
@@ -2009,6 +2025,20 @@ impl SshSession {
                 if was_blocked {
                     // The warning stays on screen; nothing to add.
                     return vec![Effect::Ended];
+                }
+                // A shell asked for on another tab's connection that never
+                // opened: the server takes no more sessions on it, or the
+                // connection went away meanwhile. Either way a login of
+                // this pane's own gets a shell.
+                if was == State::Connecting && self.shares_a_connection() && !self.jump {
+                    self.solo = true;
+                    return vec![
+                        Effect::Show(dim(
+                            "The server would not open another shell on this connection. \
+                             Logging in on a new connection...",
+                        )),
+                        Effect::LoginAlone,
+                    ];
                 }
                 let mut text = sanitize(&reason);
                 if self.jump {
@@ -3429,6 +3459,55 @@ mod tests {
         );
         assert_eq!(second.connection, 1);
         assert!(shown(&fx).contains("new shell"));
+    }
+
+    #[test]
+    fn a_refused_shared_shell_logs_in_alone() {
+        let dir = temp("alone");
+        let e = env(&dir);
+        let mut first = SshSession::new(1, Target::resolve("prod", &e).unwrap(), e.known_hosts());
+        first.start(80, 24);
+        first.on_worker(Message::Connected {
+            channel: 1,
+            kex: "k".into(),
+            cipher: "c".into(),
+            host_key: "h".into(),
+        });
+        let target = first.target.clone();
+        let mut second = SshSession::new(2, target.clone(), e.known_hosts());
+        second.start_on(1, 80, 24);
+        // tinysshd takes one session per connection.
+        let fx = second.on_worker(Message::Disconnected {
+            channel: 2,
+            reason: "The server refused another session on this connection.".into(),
+        });
+        assert!(matches!(fx[..], [Effect::Show(_), Effect::LoginAlone]));
+        assert!(shown(&fx).contains("new connection"));
+        assert!(second.solo);
+        // The connection takes no more shells.
+        first.solo = true;
+        assert!(!first.can_share(&target));
+
+        // A shell that opened and later ended is not retried that way.
+        let mut third = SshSession::new(3, target, e.known_hosts());
+        third.start_on(1, 80, 24);
+        third.on_worker(Message::Connected {
+            channel: 3,
+            kex: "k".into(),
+            cipher: "c".into(),
+            host_key: "h".into(),
+        });
+        let fx = third.on_worker(Message::Disconnected {
+            channel: 3,
+            reason: "The shell closed; the connection stays open for the other tabs.".into(),
+        });
+        assert!(!fx.iter().any(|f| matches!(f, Effect::LoginAlone)));
+        // Nor is a login of its own.
+        let fx = first.on_worker(Message::Disconnected {
+            channel: 1,
+            reason: "Connection closed.".into(),
+        });
+        assert!(!fx.iter().any(|f| matches!(f, Effect::LoginAlone)));
     }
 
     #[test]
