@@ -48,6 +48,12 @@ mod colour_editor;
 #[cfg(windows)]
 mod conn_view;
 #[cfg(windows)]
+mod connlog_panel;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod connlog_store;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod connlog_view;
+#[cfg(windows)]
 mod conpty;
 #[cfg(windows)]
 mod credential_panel;
@@ -64,6 +70,8 @@ mod desktop;
 #[cfg_attr(not(windows), allow(dead_code))]
 #[path = "desktop_off.rs"]
 mod desktop;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod eventlog;
 #[cfg(windows)]
 mod fields_view;
 #[cfg(windows)]
@@ -76,8 +84,6 @@ mod fwd_panel;
 mod hosts_panel;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod hosts_view;
-#[cfg(windows)]
-mod inventory_panel;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod inventory_view;
 #[cfg(windows)]
@@ -90,6 +96,8 @@ mod known_hosts_panel;
 mod limits_store;
 #[cfg(windows)]
 mod live_panel;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod local_store;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
