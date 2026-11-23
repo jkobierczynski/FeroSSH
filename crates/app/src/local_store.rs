@@ -81,13 +81,16 @@ fn key() -> Option<Result<(), String>> {
         return Some(Ok(()));
     }
     let (pass, salt_hex) = secret.split_at(64);
-    let mut salt = [0u8; 16];
-    for (i, b) in salt.iter_mut().enumerate() {
-        *b = salt_hex
-            .get(i * 2..i * 2 + 2)
-            .and_then(|h| u8::from_str_radix(h, 16).ok())
-            .unwrap_or_default();
-    }
+    let salt: Option<Vec<u8>> = (0..16)
+        .map(|i| {
+            salt_hex
+                .get(i * 2..i * 2 + 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        })
+        .collect();
+    let Some(salt) = salt.and_then(|v| <[u8; 16]>::try_from(v).ok()) else {
+        return Some(Err("The vault's key for local records is damaged.".into()));
+    };
     // The secret is random: the KDF adds nothing and runs at its least.
     match Key::derive(pass, Kdf::LOWEST, salt) {
         Ok(k) => {
