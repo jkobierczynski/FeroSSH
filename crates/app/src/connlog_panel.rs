@@ -502,6 +502,24 @@ fn fill(keep: &[Entry]) {
         if !s.can_delete {
             s.status.push_str(" Your organisation keeps every entry.");
         }
+        // Whether the policy's copy to the Windows event log is on, and
+        // working: what an administrator checks first.
+        if crate::machine_policy::log().event_log {
+            match crate::eventlog::last_error() {
+                None if crate::eventlog::source_registered() => {
+                    s.status.push_str(" Copied to the Windows event log.");
+                }
+                // Event Viewer would show a Windows error text in place
+                // of FeroSSH's until an administrator registers it.
+                None => s.status.push_str(
+                    " Copied to the Windows event log, but its source FeroSSH is not \
+                     registered: Event Viewer shows the text under Details only.",
+                ),
+                Some(e) => s
+                    .status
+                    .push_str(&format!(" Not copied to the Windows event log: {e}")),
+            }
+        }
         // Every row shown is one of `s.rows`: its index from its address.
         let base = s.rows.as_ptr() as usize;
         let size = std::mem::size_of::<Entry>().max(1);

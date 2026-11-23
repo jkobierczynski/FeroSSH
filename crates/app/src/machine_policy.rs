@@ -85,7 +85,7 @@ fn read() -> Option<TeamPolicy> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-mod reg {
+pub(crate) mod reg {
     //! The few registry reads the policy needs. Each unsafe block is a
     //! direct, documented call.
 

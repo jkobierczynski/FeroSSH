@@ -18,8 +18,9 @@
 //!
 //! Event Viewer shows the text as is once the source is registered
 //! (`New-EventLog -LogName Application -Source FeroSSH`, see
-//! `docs/admin/connection-log-policy.md`); unregistered, it shows the same
-//! text after a note that the description is missing.
+//! `docs/admin/connection-log-policy.md`); unregistered, its General
+//! tab shows the Windows error text that has the event's number, and the
+//! text is under Details only.
 
 use ferossh_config::connlog::{Entry, Kind};
 
@@ -59,28 +60,60 @@ pub fn text(e: &Entry) -> String {
     out
 }
 
-/// Writes `e` to the event log; failures are not reported (the file
-/// still has the entry).
+/// Why the last copy to the event log failed, if it did (shown on the
+/// Connection log page; the file still has the entry).
+static LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Why the last copy to the event log failed; `None` after a success.
+pub fn last_error() -> Option<String> {
+    LAST_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn note(done: Result<(), String>) {
+    *LAST_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = done.err();
+}
+
+/// Whether the event source `FeroSSH` is registered on this PC (the
+/// key an administrator's `New-EventLog` makes, which any user can read).
+/// Without it Event Viewer has no message file for FeroSSH's events and
+/// shows the Windows error text that has the event's number instead
+/// (1001: "Recursion too deep"); the text is under Details only.
+pub fn source_registered() -> bool {
+    imp::source_registered()
+}
+
+/// Writes `e` to the event log.
 pub fn report(e: &Entry) {
     let warning = matches!(e.kind, Kind::Lost | Kind::Failed);
-    imp::write(event_id(e.kind), warning, &text(e));
+    note(imp::write(event_id(e.kind), warning, &text(e)));
 }
 
 /// Says in the event log that `n` entries were deleted from the file.
 pub fn report_deleted(n: usize) {
-    imp::write(
+    note(imp::write(
         DELETED_ID,
         true,
         &format!(
             "FeroSSH connection log: the user deleted {n} entr{} from the log file.",
             if n == 1 { "y" } else { "ies" }
         ),
-    );
+    ));
 }
 
 #[cfg(not(windows))]
 mod imp {
-    pub fn write(_id: u32, _warning: bool, _text: &str) {}
+    pub fn write(_id: u32, _warning: bool, _text: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn source_registered() -> bool {
+        true
+    }
 }
 
 #[cfg(windows)]
@@ -119,21 +152,28 @@ mod imp {
         }
     }
 
-    pub fn write(id: u32, warning: bool, text: &str) {
+    pub fn source_registered() -> bool {
+        crate::machine_policy::reg::Key::open_hklm(
+            r"SYSTEM\CurrentControlSet\Services\EventLog\Application\FeroSSH",
+        )
+        .is_some()
+    }
+
+    pub fn write(id: u32, warning: bool, text: &str) -> Result<(), String> {
         let user = token_user();
         // SAFETY: the source handle is ours and closed below; the string
         // and the SID (inside `user`) live through the call.
         unsafe {
-            let Ok(source) = RegisterEventSourceW(PCWSTR::null(), w!("FeroSSH")) else {
-                return;
-            };
+            let source = RegisterEventSourceW(PCWSTR::null(), w!("FeroSSH")).map_err(|e| {
+                format!("Windows refused the event source FeroSSH: {}", e.message())
+            })?;
             let sid = user
                 .as_ref()
                 .map(|u| (*u.as_ptr().cast::<TOKEN_USER>()).User.Sid)
                 .filter(|s: &PSID| !s.is_invalid());
             let text = HSTRING::from(text);
             let strings = [PCWSTR(text.as_ptr())];
-            let _ = ReportEventW(
+            let done = ReportEventW(
                 source,
                 if warning {
                     EVENTLOG_WARNING_TYPE
@@ -148,6 +188,7 @@ mod imp {
                 None,
             );
             let _ = DeregisterEventSource(source);
+            done.map_err(|e| format!("Windows did not take the event: {}", e.message()))
         }
     }
 }
@@ -176,5 +217,21 @@ mod tests {
         assert_eq!(t.matches("Connection:").count(), 2);
         assert!(t.ends_with("Details: refused Connection: forged"));
         assert_eq!(event_id(Kind::Failed), 1004);
+    }
+
+    /// On Windows the event really goes to the Application log, as a
+    /// user who is not an administrator (the CI runner's account is one,
+    /// but writing needs no rights beyond any user's).
+    #[cfg(windows)]
+    #[test]
+    fn writes_to_the_application_log() {
+        assert_eq!(
+            imp::write(
+                DELETED_ID,
+                true,
+                "FeroSSH test: the connection log copy works."
+            ),
+            Ok(())
+        );
     }
 }

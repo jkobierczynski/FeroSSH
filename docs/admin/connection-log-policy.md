@@ -24,13 +24,23 @@ Each entry has the connection's name, `user@host:port`, the protocol (`ssh`, `te
 
 ## Registering the event source
 
-Run this once per PC, as an administrator, so Event Viewer shows each event's text without a "description cannot be found" note (the text is in the event either way):
+Run this once per PC, as an administrator. Until you do, Event Viewer has no message file for FeroSSH's events and shows the Windows error text that happens to have the event's number on the **General** tab (for 1001, "Recursion too deep; the stack overflowed."). FeroSSH's own text is still in every event, under **Details**, and a SIEM that reads the event data gets it either way. Registering fixes the display of events already logged too.
 
 ```
 New-EventLog -LogName Application -Source FeroSSH
 ```
 
-That is Windows PowerShell 5.1; deployment tools that run as SYSTEM can run it too.
+That is Windows PowerShell 5.1; deployment tools that run as SYSTEM can run it too. It points the source at .NET's `EventLogMessages.dll`, which shows each event's text as it is. Without PowerShell, the same as one registry value (Group Policy Preferences can push it):
+
+```
+reg add HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\FeroSSH /v EventMessageFile /t REG_EXPAND_SZ /d "%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\EventLogMessages.dll" /f
+```
+
+While the source is not registered, the line under **Tools > Connection log** says so.
+
+## Checking that it works
+
+FeroSSH reads the policy when it starts and on each **Refresh** in the connection manager, so restart it (or press Refresh) after you set a value. With the copy on, the line under **Tools > Connection log** ends with *Copied to the Windows event log*, or says why Windows did not take the last event. Events are written as connections are made and end: connect to a host, then look in Event Viewer under **Windows Logs > Application**, filtered on source `FeroSSH`.
 
 ## What it does not do
 

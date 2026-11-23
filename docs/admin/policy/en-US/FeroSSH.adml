@@ -54,7 +54,7 @@ This setting binds FeroSSH, not the file: a user can still delete the log file i
 
 Event IDs: 1001 connected, 1002 disconnected, 1003 lost (reconnecting), 1004 failed, 1005 opened (Remote Desktop), 1010 entries deleted.
 
-Register the event source once per PC, as an administrator, so Event Viewer shows the text without a warning: New-EventLog -LogName Application -Source FeroSSH
+Register the event source once per PC, as an administrator, or Event Viewer shows an unrelated Windows message in place of the text: New-EventLog -LogName Application -Source FeroSSH
 
 Disabled or not configured: the log is kept only in FeroSSH's own file.</string>
     </stringTable>
