@@ -163,8 +163,15 @@ pub(super) fn export_team(hwnd: HWND) {
             (name, text)
         })
         .collect();
+    // The export's time, signed with it: FeroSSH refuses a library older
+    // than one it already checked. Past the library this PC uses, so a
+    // clock that is behind cannot make the new one look older.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let serial = now.max(crate::team_lib::current().serial.saturating_add(1));
     let Some((bytes, missing)) = with_window(|w| {
-        let bytes = ferossh_config::team::export(&sessions, &w.settings, &themes);
+        let bytes = ferossh_config::team::export(&sessions, &w.settings, &themes, serial);
         let missing = ferossh_config::team::missing_themes(
             &sessions,
             &w.settings,

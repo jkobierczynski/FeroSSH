@@ -47,6 +47,9 @@ pub const MAX_THEMES: usize = 50;
 /// folder reads them).
 pub const MAX_THEME_LEN: usize = 64 * 1024;
 
+/// The bundle file holding the library's [`Team::serial`].
+const VERSION_FILE: &str = "library.conf";
+
 /// The bundle file holding a library's theme `n` (from 1).
 fn theme_file(n: usize) -> String {
     format!("theme-{n}.conf")
@@ -67,6 +70,12 @@ pub struct Team {
     /// The custom themes it brings: a theme file's text each, read by
     /// the app as the themes folder's are.
     pub themes: Vec<String>,
+    /// When it was exported, seconds since 1970, signed with the rest:
+    /// a library older than one already checked is not used, so a share
+    /// cannot be turned back to an earlier signed library (one from
+    /// before a security rule was added, say). 0 for a library exported
+    /// before FeroSSH wrote one.
+    pub serial: u64,
 }
 
 impl Team {
@@ -193,6 +202,7 @@ pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
         .map(str::to_owned)
         .collect();
     Ok(Team {
+        serial: bundle.file(VERSION_FILE).map_or(0, read_serial),
         hosts_text: saved::to_text(&hosts),
         names,
         profiles,
@@ -200,6 +210,15 @@ pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
         theme_rules: settings.theme_rules,
         themes,
     })
+}
+
+/// The `Serial` line of a library's [`VERSION_FILE`]; 0 when there is
+/// none that reads.
+fn read_serial(text: &str) -> u64 {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("Serial "))
+        .find_map(|v| v.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// `p` without a password manager command, which could hold a password
@@ -223,8 +242,14 @@ pub fn load(bytes: &[u8], sig: &str, trusted: &[PublicKey]) -> Result<Team, Refu
 ///
 /// `themes` are the custom themes on this PC, as (name, theme file
 /// text): those a theme rule or an exported profile names go in, at
-/// most [`MAX_THEMES`].
-pub fn export(sessions: &str, settings: &Settings, themes: &[(String, String)]) -> Vec<u8> {
+/// most [`MAX_THEMES`]. `serial` is the export's time, seconds since
+/// 1970 (see [`Team::serial`]).
+pub fn export(
+    sessions: &str,
+    settings: &Settings,
+    themes: &[(String, String)],
+    serial: u64,
+) -> Vec<u8> {
     let hosts = saved::parse(sessions);
     let part = Settings {
         profiles: settings
@@ -241,6 +266,7 @@ pub fn export(sessions: &str, settings: &Settings, themes: &[(String, String)]) 
     let mut bundle = Bundle::default();
     bundle.set_file("sessions.conf", saved::to_text(&hosts));
     bundle.set_file("ferossh.conf", part.to_text());
+    bundle.set_file(VERSION_FILE, format!("Serial {serial}\n"));
     for (n, (_, text)) in (1..).zip(used_themes(&part, themes)) {
         bundle.set_file(&theme_file(n), text.clone());
     }
@@ -356,7 +382,7 @@ mod tests {
             ),
             ("Unused".to_owned(), "Name Unused\n".to_owned()),
         ];
-        export(sessions, &settings, &themes)
+        export(sessions, &settings, &themes, 1_700_000_000)
     }
 
     #[test]
@@ -375,6 +401,7 @@ mod tests {
         // The custom theme a rule names travels; one nothing names does not.
         assert_eq!(team.themes, ["Name Sandstorm\nBackground #2E3440\n"]);
         assert!(team.has("WEB"));
+        assert_eq!(team.serial, 1_700_000_000);
         // No credential travels, only its name.
         assert!(!String::from_utf8_lossy(&bytes).contains("someone"));
         // Nor a password command, which could hold a password.
@@ -447,7 +474,7 @@ mod tests {
             ("Hidden".to_owned(), "Name Hidden\n".to_owned()),
             ("Big".to_owned(), "x".repeat(MAX_THEME_LEN + 1)),
         ];
-        let team = parse(&export(sessions, &settings, &themes)).unwrap();
+        let team = parse(&export(sessions, &settings, &themes, 0)).unwrap();
         // Not Hidden: its profile is for a connection not exported.
         assert_eq!(team.themes, ["Name my blue\n"]);
         let builtin = |n: &str| n == "Nord";

@@ -200,7 +200,31 @@ pub fn load(
     let read = read_capped(&path, MAX_LEN).and_then(|b| Ok((b, read_sig(&sig_path(&path))?)));
     let why = match read {
         Ok((bytes, sig)) => match team::load(&bytes, &sig, &team::keys(keys)) {
+            // Signed, but older than the copy checked last: the share was
+            // turned back to an earlier library (one from before a rule
+            // was added, say), which only someone who cannot sign a new
+            // one has reason to do. The newer copy stays in use.
             Ok(team) => {
+                // Signed, but older than the copy checked last: the share
+                // was turned back to an earlier library (one from before a
+                // rule was added, say), which only someone who cannot sign
+                // a new one has reason to do. The newer copy stays in use.
+                if let Some(kept) = from_cache(library, keys, cache_dir)
+                    && kept.serial > team.serial
+                {
+                    let note = format!(
+                        "The team library {shown} was not used: it is older than the copy \
+                         FeroSSH checked last (exported {}, the copy {}), so someone may have \
+                         put an earlier library back on the share. FeroSSH uses the newer copy; \
+                         ask your administrator to export and sign the library again.",
+                        exported(team.serial),
+                        exported(kept.serial),
+                    );
+                    return Loaded {
+                        team: kept,
+                        note: Some(note),
+                    };
+                }
                 // A copy that cannot be written only costs the offline
                 // fallback.
                 let _ = keep(cache_dir, library, &bytes, &sig, current);
@@ -226,6 +250,15 @@ pub fn load(
     }
 }
 
+/// When a library with serial `serial` was exported, for a note.
+fn exported(serial: u64) -> String {
+    if serial == 0 {
+        "before FeroSSH dated its libraries".to_owned()
+    } else {
+        format!("{} UTC", ferossh_config::limit_record::utc(serial))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -241,7 +274,11 @@ mod tests {
     }
 
     fn write_library(dir: &Path, host: &str) -> PathBuf {
-        let bytes = team::export(&format!("Host {host}\n"), &Settings::default(), &[]);
+        write_dated(dir, host, 1)
+    }
+
+    fn write_dated(dir: &Path, host: &str, serial: u64) -> PathBuf {
+        let bytes = team::export(&format!("Host {host}\n"), &Settings::default(), &[], serial);
         let sig = SshSig::sign(&admin(), team::NAMESPACE, HashAlg::Sha512, &bytes)
             .unwrap()
             .to_pem(LineEnding::LF)
@@ -308,6 +345,34 @@ mod tests {
         // No library set: nothing, and nothing to say.
         let off = load(None, &keys, &cache, &|| true);
         assert!(off.team.is_empty() && off.note.is_none());
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn an_older_signed_library_does_not_replace_a_newer_copy() {
+        let share = temp("rollback");
+        let cache = temp("rollback-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let lib = write_dated(&share, "web", 200);
+        let path = lib.to_str().unwrap();
+        assert!(load(Some(path), &keys, &cache, &|| true).team.has("web"));
+        // An earlier library, signed by the same key, put back.
+        write_dated(&share, "old", 100);
+        let back = load(Some(path), &keys, &cache, &|| true);
+        assert!(back.team.has("web") && !back.team.has("old"));
+        assert!(back.note.unwrap().contains("older than the copy"));
+        assert!(cached(Some(path), &keys, &cache).has("web"));
+        // One from before libraries were dated is older too.
+        write_dated(&share, "undated", 0);
+        assert!(load(Some(path), &keys, &cache, &|| true).team.has("web"));
+        // The same export read again, and a newer one, are used.
+        write_dated(&share, "web2", 200);
+        assert!(load(Some(path), &keys, &cache, &|| true).note.is_none());
+        write_dated(&share, "db", 300);
+        let newer = load(Some(path), &keys, &cache, &|| true);
+        assert!(newer.team.has("db") && newer.note.is_none());
+        assert!(cached(Some(path), &keys, &cache).has("db"));
         let _ = std::fs::remove_dir_all(&share);
         let _ = std::fs::remove_dir_all(&cache);
     }
