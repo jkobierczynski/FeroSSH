@@ -72,10 +72,18 @@ pub(crate) fn write_whole(path: &std::path::Path, text: &str) -> std::io::Result
         .and_then(|()| file.sync_all());
     drop(file);
     let written = written.and_then(|()| std::fs::rename(&tmp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = written {
+        // The copy holds the text (plain, for an unsealed record): one
+        // that cannot be removed is named, not left behind unsaid.
+        return Err(match std::fs::remove_file(&tmp) {
+            Err(r) if r.kind() != std::io::ErrorKind::NotFound => std::io::Error::new(
+                e.kind(),
+                format!("{e}; the copy {} could not be removed ({r})", tmp.display()),
+            ),
+            _ => e,
+        });
     }
-    written
+    Ok(())
 }
 
 /// Reads the file again, changes it and writes it back, all under one
@@ -154,6 +162,22 @@ mod tests {
     use ferossh_config::inventory::SystemInfo;
 
     use super::*;
+
+    #[test]
+    fn a_failed_write_leaves_no_copy() {
+        let dir = std::env::temp_dir().join(format!("ferossh-ww-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The target is a folder that is not empty: the rename fails.
+        let target = dir.join("connections.log");
+        std::fs::create_dir_all(target.join("inside")).unwrap();
+        assert!(write_whole(&target, "secret\n").is_err());
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["connections.log"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn host(name: &str, folder: Option<&str>, tags: &[&str]) -> HostItem {
         HostItem {
