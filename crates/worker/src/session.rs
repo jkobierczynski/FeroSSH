@@ -43,7 +43,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
-use crate::closing::CloseOnDrop;
+use crate::closing::{self, CloseOnDrop};
 use crate::crypto_policy::{
     MIN_RSA_BITS, aes_gcm_first, legacy_would_help, preferred_for, terrapin_prone, with_legacy,
     without_terrapin,
@@ -1727,6 +1727,26 @@ async fn run_task(task: &mut Option<Task<'_>>) -> Option<Message> {
     }
 }
 
+/// Opens a session channel on `conn` while answering the UI; when the tab
+/// closes before the server answers, a channel it confirms late is closed
+/// again ([`closing::close_late`]) instead of staying open on the server.
+async fn open_session(
+    conn: &Connection,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+) -> Result<russh::Channel<russh::client::Msg>, Failure> {
+    let open = conn.channel_open_session();
+    tokio::pin!(open);
+    match drive(&mut open, inbox, ctx).await {
+        Ok(opened) => Ok(opened?),
+        Err(Failure::Cancelled) => {
+            closing::close_late(open).await;
+            Err(Failure::Cancelled)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 async fn pump(
     conn: &Connection,
     inbox: &mut mpsc::Receiver<Message>,
@@ -1735,7 +1755,7 @@ async fn pump(
     if let Some(mosh) = ctx.options.mosh.clone() {
         return mosh_session(conn, *mosh, inbox, ctx).await;
     }
-    let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
+    let channel = open_session(conn, inbox, ctx).await?;
     // Closed on every way out below, a refused request or the tab
     // closing included, so the server frees the session.
     let (mut read, write) = channel.split();
@@ -1895,7 +1915,7 @@ async fn mosh_session(
             mosh.server
         )));
     };
-    let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
+    let channel = open_session(conn, inbox, ctx).await?;
     let (mut read, write) = channel.split();
     // Held for the whole Mosh session, then closed.
     let write = CloseOnDrop::new(write);

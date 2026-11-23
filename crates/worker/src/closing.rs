@@ -48,3 +48,20 @@ impl Drop for CloseOnDrop {
         }
     }
 }
+
+/// How long a session open the tab no longer wants is still waited for,
+/// so that a channel the server confirms late is closed, not left open.
+pub(crate) const LATE_OPEN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sees an open the caller gave up on (the tab closed while the server
+/// had not answered yet) through: a channel the server confirms within
+/// [`LATE_OPEN`] is closed again at once, so it does not hold one of the
+/// connection's sessions (sshd `MaxSessions`) until the connection ends.
+pub(crate) async fn close_late<F>(open: F)
+where
+    F: std::future::Future<Output = Result<russh::Channel<Msg>, russh::Error>>,
+{
+    if let Ok(Ok(ch)) = tokio::time::timeout(LATE_OPEN, open).await {
+        let _ = ch.close().await;
+    }
+}
