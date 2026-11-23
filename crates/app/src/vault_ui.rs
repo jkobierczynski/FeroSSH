@@ -15,8 +15,8 @@ use windows::Win32::UI::Controls::Dialogs::{
     OPENFILENAMEW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    HCURSOR, IDC_WAIT, IDYES, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONWARNING, MB_OK, MB_YESNO, SetCursor,
+    HCURSOR, IDC_WAIT, IDRETRY, IDYES, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_RETRYCANCEL, MB_YESNO, SetCursor,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -1460,15 +1460,21 @@ pub(super) fn unlock_at_start() -> bool {
         busy();
         match vault::unlock(&path, &answer.passphrase) {
             Ok(()) => {
-                let problems = crate::local_store::seal_all();
-                if !problems.is_empty() {
-                    super::message(
-                        &format!(
-                            "Could not encrypt the connection log with the vault:\n\n{}",
-                            problems.join("\n")
-                        ),
-                        MB_OK | MB_ICONWARNING,
+                // Records left plain are said, with a retry (a file
+                // another program holds open, say).
+                loop {
+                    let problems = crate::local_store::seal_all();
+                    if problems.is_empty() {
+                        break;
+                    }
+                    let text = format!(
+                        "Could not encrypt the connection log with the vault; these stay \
+                         unencrypted for now:\n\n{}\n\nRetry, or Cancel to start anyway.",
+                        problems.join("\n")
                     );
+                    if super::message(&text, MB_RETRYCANCEL | MB_ICONWARNING) != Some(IDRETRY) {
+                        break;
+                    }
                 }
                 return true;
             }
