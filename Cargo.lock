@@ -866,7 +866,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferossh"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "ferossh-auth",
  "ferossh-config",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-auth"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "ferossh-ipc",
  "getrandom 0.4.3",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-config"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "argon2",
  "base64ct",
@@ -923,28 +923,28 @@ dependencies = [
 
 [[package]]
 name = "ferossh-forward"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "zeroize",
 ]
 
 [[package]]
 name = "ferossh-images"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "miniz_oxide 0.9.1",
 ]
 
 [[package]]
 name = "ferossh-ipc"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "zeroize",
 ]
 
 [[package]]
 name = "ferossh-mosh"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "aes",
  "miniz_oxide 0.9.1",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-render"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "windows",
  "windows-core",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-sftp"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "ferossh-ipc",
  "sha2",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-term"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "alacritty_terminal",
  "ferossh-images",
@@ -984,11 +984,11 @@ dependencies = [
 
 [[package]]
 name = "ferossh-tmuxcc"
-version = "1.5.1"
+version = "1.6.0"
 
 [[package]]
 name = "ferossh-update"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "base64ct",
  "ring",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-viewer"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "des",
  "ironrdp-blocking",
@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-worker"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "base64ct",
  "ferossh-auth",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-zmodem"
-version = "1.5.1"
+version = "1.6.0"
 
 [[package]]
 name = "ferostream-client"
