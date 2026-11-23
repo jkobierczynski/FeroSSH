@@ -35,6 +35,63 @@ pub fn set_current(team: Team) {
     }
 }
 
+/// The newest library this run accepted, per library path and the keys
+/// it was checked against: the rollback check's baseline even when its
+/// copy could not be written ([`keep`]).
+static ACCEPTED: Mutex<Vec<(String, Vec<String>, Team)>> = Mutex::new(Vec::new());
+
+/// The newest library accepted for `library` under `keys`: this run's,
+/// or the checked copy's, whichever is newer.
+fn newest_seen(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> {
+    let run = ACCEPTED.lock().ok().and_then(|a| {
+        a.iter()
+            .find(|(l, k, _)| l == library.trim() && k == keys)
+            .map(|(.., t)| t.clone())
+    });
+    let copy = from_cache(library, keys, cache_dir);
+    match (run, copy) {
+        (Some(r), Some(c)) => Some(if c.serial > r.serial { c } else { r }),
+        (r, c) => r.or(c),
+    }
+}
+
+/// Notes `team` as accepted for `library` under `keys`, unless a newer
+/// one already is.
+fn accepted(library: &str, keys: &[String], team: &Team) {
+    let Ok(mut a) = ACCEPTED.lock() else {
+        return;
+    };
+    match a
+        .iter_mut()
+        .find(|(l, k, _)| l == library.trim() && k == keys)
+    {
+        Some((.., t)) if t.serial <= team.serial => *t = team.clone(),
+        Some(_) => {}
+        None => a.push((library.trim().to_owned(), keys.to_vec(), team.clone())),
+    }
+}
+
+/// The serial for a new export at `now` (seconds since 1970): past the
+/// library this PC uses (`current`) and past the last export from this
+/// PC, kept in `dir`, so every export is newer than the one before even
+/// when the clock is behind or two exports fall in the same second.
+pub fn next_serial(dir: Option<&Path>, now: u64, current: u64) -> u64 {
+    let file = dir.map(|d| d.join("team-export-serial"));
+    let last = file
+        .as_ref()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let serial = now
+        .max(current.saturating_add(1))
+        .max(last.saturating_add(1));
+    if let (Some(d), Some(f)) = (dir, file) {
+        let _ = std::fs::create_dir_all(d);
+        let _ = std::fs::write(f, format!("{serial}\n"));
+    }
+    serial
+}
+
 /// The signature file beside `library`: its name with `.sig` added, as
 /// `ssh-keygen -Y sign` writes it.
 pub fn sig_path(library: &Path) -> PathBuf {
@@ -209,7 +266,7 @@ pub fn load(
                 // was turned back to an earlier library (one from before a
                 // rule was added, say), which only someone who cannot sign
                 // a new one has reason to do. The newer copy stays in use.
-                if let Some(kept) = from_cache(library, keys, cache_dir)
+                if let Some(kept) = newest_seen(library, keys, cache_dir)
                     && kept.serial > team.serial
                 {
                     let note = format!(
@@ -225,8 +282,10 @@ pub fn load(
                         note: Some(note),
                     };
                 }
-                // A copy that cannot be written only costs the offline
-                // fallback.
+                // The baseline for the next read, even when the copy below
+                // cannot be written (which otherwise only costs the
+                // offline fallback).
+                accepted(library, keys, &team);
                 let _ = keep(cache_dir, library, &bytes, &sig, current);
                 return Loaded { team, note: None };
             }
@@ -366,8 +425,21 @@ mod tests {
         // One from before libraries were dated is older too.
         write_dated(&share, "undated", 0);
         assert!(load(Some(path), &keys, &cache, &|| true).team.has("web"));
+        // A newer one whose copy could not be written still sets the
+        // baseline: one between it and the copy is refused.
+        let unwritable = cache.join("not-a-folder");
+        std::fs::write(&unwritable, b"").unwrap();
+        write_dated(&share, "newest", 250);
+        assert!(
+            load(Some(path), &keys, &unwritable, &|| true)
+                .team
+                .has("newest")
+        );
+        write_dated(&share, "between", 220);
+        let between = load(Some(path), &keys, &unwritable, &|| true);
+        assert!(between.team.has("newest") && between.note.is_some());
         // The same export read again, and a newer one, are used.
-        write_dated(&share, "web2", 200);
+        write_dated(&share, "web2", 250);
         assert!(load(Some(path), &keys, &cache, &|| true).note.is_none());
         write_dated(&share, "db", 300);
         let newer = load(Some(path), &keys, &cache, &|| true);
@@ -375,5 +447,18 @@ mod tests {
         assert!(cached(Some(path), &keys, &cache).has("db"));
         let _ = std::fs::remove_dir_all(&share);
         let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn each_export_gets_a_newer_serial() {
+        let dir = temp("serial");
+        assert_eq!(next_serial(Some(&dir), 1000, 0), 1000);
+        // Same second, and a clock that went back: still newer.
+        assert_eq!(next_serial(Some(&dir), 1000, 0), 1001);
+        assert_eq!(next_serial(Some(&dir), 500, 0), 1002);
+        // Past the library in use.
+        assert_eq!(next_serial(Some(&dir), 1000, 5000), 5001);
+        assert_eq!(next_serial(None, 10, 0), 10);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
