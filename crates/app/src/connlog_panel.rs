@@ -1,24 +1,22 @@
-//! Tools > Connection log (the inventory) as native Windows controls, on a panel over the
+//! Tools > Connection log as native Windows controls, on a panel over the
 //! uncovered part of the tools pane like Known hosts: every connection
-//! with when it was last connected to, its host key and, where switched
-//! on, the server's OS and kernel (see `inventory_view.rs`).
+//! event (connected, disconnected, lost, failed, opened), newest first
+//! (see `connlog_view.rs`).
 //!
-//! The search box takes the connection manager's search words; a click
-//! on a column heading sorts by it (again: the other way). Save CSV
-//! writes the rows shown, in their order, to the download folder.
-//! Connect (Enter in the list, a double click) opens the picked
-//! connection; Reload (F5) reads the inventory again. Delete... (the
-//! Delete key), shown only when Settings > Allow deleting connection log
-//! entries is on, forgets what the log holds about the picked one. Keys work as in
-//! `known_hosts_panel`: [`pre_translate`] runs in the message loop,
-//! passes Ctrl+Shift shortcuts on to the main window, turns typing in the
-//! list into a search, and gives Tab, Enter and Escape their dialog
-//! meaning.
+//! The search box takes words (`web`, `failed`, `-lost`, `"two words"`);
+//! a click on a column heading sorts by it (again: the other way). Save
+//! CSV asks where to write the rows shown, in their order. Connect (Enter
+//! in the list, a double click) opens the picked entry's connection;
+//! Reload (F5) reads the log again. Delete... (the Delete key) removes the
+//! picked entries after a question; it is not there when machine policy
+//! keeps every entry. Keys work as in `known_hosts_panel`:
+//! [`pre_translate`] runs in the message loop, passes Ctrl+Shift shortcuts
+//! on to the main window, turns typing in the list into a search, and
+//! gives Tab, Enter and Escape their dialog meaning.
 
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -33,8 +31,8 @@ use windows::Win32::UI::Controls::{
     LVM_ENSUREVISIBLE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
     LVN_COLUMNCLICK, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
-    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK, NM_SETFOCUS, NMHDR, NMLISTVIEW,
-    SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
+    LVS_REPORT, LVS_SHOWSELALWAYS, NM_DBLCLK, NM_SETFOCUS, NMHDR, NMLISTVIEW, SetWindowTheme,
+    WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F5, VK_RETURN, VK_SHIFT,
@@ -50,7 +48,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
-use crate::inventory_view::{self, Column, Row};
+use ferossh_config::connlog::Entry;
+
+use crate::connlog_view::{self, Column};
 use crate::layout::Rect;
 use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
 
@@ -59,11 +59,13 @@ use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wi
 pub enum Event {
     /// Open this connection (Connect, Enter, a double click).
     Connect(String),
-    /// Read the inventory again (F5, the Reload button).
+    /// Read the log again (F5, the Reload button).
     Reload,
-    /// Forget what the log holds about this connection (Delete...,
-    /// the Delete key), when the setting allows it.
-    Delete(String),
+    /// Remove these entries (Delete..., the Delete key), when policy
+    /// allows it.
+    Delete(Vec<Entry>),
+    /// Save this CSV text (Save CSV).
+    SaveCsv(String),
     /// One of the controls got the keyboard.
     Focused,
     /// Escape with no search: back to the terminal.
@@ -80,8 +82,8 @@ const ID_CSV: usize = 211;
 const ID_RELOAD: usize = 212;
 const ID_DELETE: usize = 213;
 
-/// Buttons: width in DIPs. The last, Delete..., shows only when the
-/// setting allows it.
+/// Buttons: width in DIPs. The last, Delete..., shows only when policy
+/// allows it.
 const BUTTONS: [i32; 4] = [80, 88, 64, 72];
 
 /// The height of the summary line above the buttons, in DIPs.
@@ -102,20 +104,19 @@ struct State {
     font: HFONT,
     title_font: HFONT,
     dpi: u32,
-    rows: Vec<Row>,
+    rows: Vec<Entry>,
+    /// A sealed part of the log could not be read.
+    locked: bool,
     /// Indices into `rows`, in the order shown.
     shown: Vec<usize>,
     sort: Column,
     descending: bool,
-    /// What the line above the buttons says: the summary, or where Save
-    /// CSV wrote.
+    /// What the line above the buttons says: the summary, or what Save
+    /// CSV did.
     status: String,
     /// Where the summary line ends: just above the buttons (see `place`).
     status_bottom: i32,
-    /// Where Save CSV writes.
-    save_dir: PathBuf,
-    /// Whether Delete... shows (Settings > Allow deleting connection
-    /// log entries).
+    /// Whether Delete... shows (machine policy may keep every entry).
     can_delete: bool,
 }
 
@@ -137,7 +138,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
     // static strings; they are destroyed with `main`.
     unsafe {
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
-        let class = w!("FeroSSHInventory");
+        let class = w!("FeroSSHConnectionLog");
         let wc = WNDCLASSW {
             // Redrawn whole when resized: the title row is laid out on
             // the width.
@@ -188,8 +189,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 ID_SEARCH,
             )?;
             SendMessageW(search, EM_LIMITTEXT, Some(WPARAM(200)), None);
-            let cue =
-                wide("Search: words, tag:prod, folder:db, -tag:legacy, an OS or a fingerprint");
+            let cue = wide("Search: words, a host, failed, -lost, \"two words\"");
             SendMessageW(
                 search,
                 EM_SETCUEBANNER,
@@ -199,7 +199,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             let list = child(
                 WC_LISTVIEWW,
                 w!(""),
-                LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                LVS_REPORT | LVS_SHOWSELALWAYS,
                 ID_LIST,
             )?;
             let _ = SetWindowTheme(list, w!("Explorer"), PCWSTR::null());
@@ -258,12 +258,12 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 title_font,
                 dpi,
                 rows: Vec::new(),
+                locked: false,
                 shown: Vec::new(),
-                sort: Column::Name,
-                descending: false,
+                sort: Column::Time,
+                descending: true,
                 status: String::new(),
                 status_bottom: 0,
-                save_dir: PathBuf::new(),
                 can_delete: false,
             });
         });
@@ -403,16 +403,22 @@ pub fn paste(text: &str) {
     }
 }
 
-/// Shows `rows` (read afresh), with Save CSV writing to `save_dir`. The
-/// picked connection stays picked when it is still listed.
-pub fn set_rows(rows: Vec<Row>, save_dir: PathBuf, can_delete: bool) {
-    let keep = selected();
+/// Shows `rows` (read afresh, oldest first); `locked` when a sealed part
+/// could not be read. The picked entry stays picked when it is still
+/// listed.
+pub fn set_rows(rows: Vec<Entry>, locked: bool, can_delete: bool) {
+    let keep = selected().into_iter().next();
     with(|s| {
         s.rows = rows;
-        s.save_dir = save_dir;
+        s.locked = locked;
         s.can_delete = can_delete;
     });
-    fill(keep.as_deref());
+    fill(keep.as_ref());
+}
+
+/// Shows `text` on the line above the buttons (what Save CSV did).
+pub fn set_note(text: String) {
+    set_status(text);
 }
 
 /// Gives the search box the keyboard (as the tool opens).
@@ -436,7 +442,7 @@ fn focus_list() {
 
 /// A time as the list shows it: local date and time.
 fn local(secs: u64) -> String {
-    crate::files_panel::when(i64::try_from(secs).ok())
+    crate::files_panel::when_seconds(i64::try_from(secs).ok())
 }
 
 /// Shows `text` on the line above the buttons until the list is filled
@@ -478,31 +484,34 @@ fn set_state(list: HWND, index: usize) {
 }
 
 /// The rows the search keeps, in the chosen order, and the summary; the
-/// connection named `keep` stays picked, else the first row is.
-fn fill(keep: Option<&str>) {
-    let Some((h, cells, names)) = with(|s| {
+/// entry `keep` stays picked, else the first row is.
+fn fill(keep: Option<&Entry>) {
+    let Some((h, cells, entries)) = with(|s| {
         let query = search_text(s.h.search);
-        let mut shown = inventory_view::filter(&s.rows, &query);
-        inventory_view::sort(&mut shown, s.sort, s.descending);
-        s.status = inventory_view::summary(&shown, s.rows.len());
+        let mut shown = connlog_view::filter(&s.rows, &query);
+        connlog_view::sort(&mut shown, s.sort, s.descending);
+        s.status = connlog_view::summary(&shown, s.rows.len(), s.locked);
+        if !s.can_delete {
+            s.status.push_str(" Your organisation keeps every entry.");
+        }
         // Every row shown is one of `s.rows`: its index from its address.
         let base = s.rows.as_ptr() as usize;
-        let size = std::mem::size_of::<Row>().max(1);
+        let size = std::mem::size_of::<Entry>().max(1);
         s.shown = shown
             .iter()
-            .map(|r| (std::ptr::from_ref::<Row>(*r) as usize - base) / size)
+            .map(|r| (std::ptr::from_ref::<Entry>(*r) as usize - base) / size)
             .collect();
         let cells: Vec<Vec<String>> = shown
             .iter()
             .map(|r| {
                 Column::ALL
                     .iter()
-                    .map(|&c| inventory_view::text(r, c, local))
+                    .map(|&c| connlog_view::text(r, c, local))
                     .collect()
             })
             .collect();
-        let names: Vec<String> = shown.iter().map(|r| r.host.name.clone()).collect();
-        (s.h, cells, names)
+        let entries: Vec<Entry> = shown.iter().map(|r| (*r).clone()).collect();
+        (s.h, cells, entries)
     }) else {
         return;
     };
@@ -544,77 +553,67 @@ fn fill(keep: Option<&str>) {
         let _ = InvalidateRect(Some(h.panel), None, false);
     }
     let at = keep
-        .and_then(|k| names.iter().position(|n| n == k))
-        .or((!names.is_empty()).then_some(0));
+        .and_then(|k| entries.iter().position(|e| e == k))
+        .or((!entries.is_empty()).then_some(0));
     if let Some(i) = at {
         set_state(h.list, i);
     }
 }
 
-/// The picked connection's name.
-fn selected() -> Option<String> {
-    let h = handles()?;
+/// The picked entries, in the list's order.
+fn selected() -> Vec<Entry> {
+    let Some(h) = handles() else {
+        return Vec::new();
+    };
+    let mut at = Vec::new();
     // SAFETY: plain messages to our own control; the struct lives
     // through the call.
-    let at = unsafe {
-        let i = SendMessageW(
-            h.list,
-            LVM_GETNEXTITEM,
-            Some(WPARAM(usize::MAX)),
-            Some(LPARAM(LVNI_SELECTED as isize)),
-        )
-        .0;
-        if i < 0 {
-            return None;
+    unsafe {
+        let mut i = -1isize;
+        loop {
+            i = SendMessageW(
+                h.list,
+                LVM_GETNEXTITEM,
+                Some(WPARAM(i as usize)),
+                Some(LPARAM(LVNI_SELECTED as isize)),
+            )
+            .0;
+            if i < 0 {
+                break;
+            }
+            let mut item = LVITEMW {
+                mask: LVIF_PARAM,
+                iItem: i as i32,
+                ..Default::default()
+            };
+            SendMessageW(
+                h.list,
+                LVM_GETITEMW,
+                Some(WPARAM(0)),
+                Some(LPARAM(&raw mut item as isize)),
+            );
+            if let Ok(n) = usize::try_from(item.lParam.0) {
+                at.push(n);
+            }
         }
-        let mut item = LVITEMW {
-            mask: LVIF_PARAM,
-            iItem: i as i32,
-            ..Default::default()
-        };
-        SendMessageW(
-            h.list,
-            LVM_GETITEMW,
-            Some(WPARAM(0)),
-            Some(LPARAM(&raw mut item as isize)),
-        );
-        usize::try_from(item.lParam.0).ok()?
-    };
+    }
     with(|s| {
-        s.shown
-            .get(at)
-            .and_then(|&i| s.rows.get(i))
-            .map(|r| r.host.name.clone())
+        at.iter()
+            .filter_map(|&n| s.shown.get(n).and_then(|&i| s.rows.get(i)).cloned())
+            .collect()
     })
-    .flatten()
+    .unwrap_or_default()
 }
 
-/// Writes the rows shown to the download folder.
+/// Asks the main window to save the rows shown as CSV.
 fn save_csv() {
-    let Some((text, dir)) = with(|s| {
-        let rows: Vec<&Row> = s.shown.iter().filter_map(|&i| s.rows.get(i)).collect();
-        (inventory_view::csv(&rows), s.save_dir.clone())
+    let Some(text) = with(|s| {
+        let rows: Vec<&Entry> = s.shown.iter().filter_map(|&i| s.rows.get(i)).collect();
+        connlog_view::csv(&rows)
     }) else {
         return;
     };
-    let stamp = inventory_view::iso_utc(inventory_view::now())
-        .replace(['-', ':'], "")
-        .replace('T', "-")
-        .replace('Z', "");
-    let stem = format!("ferossh-connection-log-{stamp}");
-    let note = match inventory_view::write_new(&dir, &stem, "csv", &text) {
-        Ok(path) => format!("Saved the list as {}.", path.display()),
-        Err(e) => format!("Could not save the list in {}: {e}", dir.display()),
-    };
-    if let Some(h) = with(|s| {
-        s.status = note;
-        s.h
-    }) {
-        // SAFETY: our own window.
-        unsafe {
-            let _ = InvalidateRect(Some(h.panel), None, false);
-        }
-    }
+    emit(Event::SaveCsv(text));
 }
 
 fn emit(e: Event) {
@@ -627,16 +626,20 @@ fn emit(e: Event) {
 }
 
 fn connect() {
-    if let Some(name) = selected() {
-        emit(Event::Connect(name));
+    if let Some(e) = selected().into_iter().next()
+        && !e.name.is_empty()
+    {
+        emit(Event::Connect(e.name));
     }
 }
 
 fn delete() {
-    if with(|s| s.can_delete) == Some(true)
-        && let Some(name) = selected()
-    {
-        emit(Event::Delete(name));
+    if with(|s| s.can_delete) != Some(true) {
+        return;
+    }
+    let picked = selected();
+    if !picked.is_empty() {
+        emit(Event::Delete(picked));
     }
 }
 
@@ -705,8 +708,8 @@ pub fn pre_translate(msg: &MSG) -> bool {
 fn command(h: Handles, id: usize, code: u32) {
     match (id, code) {
         (ID_SEARCH, EN_CHANGE) => {
-            let keep = selected();
-            fill(keep.as_deref());
+            let keep = selected().into_iter().next();
+            fill(keep.as_ref());
         }
         (ID_SEARCH, EN_SETFOCUS) => emit(Event::Focused),
         // Enter in the search box goes to the list, where it connects.
@@ -751,12 +754,12 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                             s.descending = !s.descending;
                         } else {
                             s.sort = c;
-                            // The latest logins first.
-                            s.descending = c == Column::LastConnected;
+                            // The latest first.
+                            s.descending = c == Column::Time;
                         }
                     });
-                    let keep = selected();
-                    fill(keep.as_deref());
+                    let keep = selected().into_iter().next();
+                    fill(keep.as_ref());
                 }
             }
             _ => {}

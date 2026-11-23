@@ -1,34 +1,23 @@
-//! The connection manager's Inventory: a row per connection with what
-//! FeroSSH learnt when it last logged in (when, the host key, and with
-//! `SystemInfo yes` the server's OS and kernel), searched with the
-//! connection manager's search words, sorted by any column, and saved as
-//! CSV. Platform-neutral, so it is tested on any host; the native window
-//! is in `inventory_panel.rs`.
+//! The inventory: what FeroSSH learnt about each connection when it last
+//! logged in (when, the host key, and with `SystemInfo yes` the server's
+//! OS and kernel). Tools > Hosts shows it by machine (`hosts_view.rs`);
+//! Tools > Connection log is the log of every connection
+//! (`connlog_view.rs`). Kept with [`crate::local_store`].
 
 use ferossh_config::Settings;
-use ferossh_config::host_query::Query;
 use ferossh_config::inventory::{Inventory, Record};
 
-use crate::batch::csv_field;
 use crate::sessions::HostItem;
 
-/// `inventory.conf` in FeroSSH's folder for this PC.
-fn store_path() -> Option<std::path::PathBuf> {
-    Some(crate::portable::local_dir()?.join("inventory.conf"))
-}
+/// The inventory's file in FeroSSH's folder for this PC (see
+/// [`crate::local_store`]).
+pub const FILE: &str = "inventory.conf";
 
 /// The inventory as kept: empty when there is no file yet, an error when
 /// there is one that cannot be read ([`update`] never writes over such a
-/// file either).
+/// file either). A part sealed with a vault that is not open is left out.
 pub fn read() -> std::io::Result<Inventory> {
-    let Some(path) = store_path() else {
-        return Ok(Inventory::default());
-    };
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Inventory::parse(&text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Inventory::default()),
-        Err(e) => Err(e),
-    }
+    Ok(Inventory::parse(&crate::local_store::read(FILE)?.text))
 }
 
 /// Held while the inventory is read, changed and written: an exclusive
@@ -93,53 +82,18 @@ pub(crate) fn write_whole(path: &std::path::Path, text: &str) -> std::io::Result
 /// lock, so two FeroSSH windows each keep what the other wrote. A file
 /// that cannot be read is left as it is, and the error comes back.
 pub fn update(change: impl FnOnce(&mut Inventory)) -> std::io::Result<()> {
-    let Some(path) = store_path() else {
+    let Some(dir) = crate::portable::local_dir() else {
         return Ok(());
     };
-    let Some(dir) = path.parent() else {
-        return Ok(());
-    };
-    let _held = lock(dir)?;
-    let mut inv = read()?;
+    let _held = lock(&dir)?;
+    let was = crate::local_store::read(FILE)?;
+    let mut inv = Inventory::parse(&was.text);
     let before = inv.clone();
     change(&mut inv);
     if inv == before {
         return Ok(());
     }
-    write_whole(&path, &inv.to_text())
-}
-
-/// Writes `text` to a new file `stem.ext` in `dir`, or `stem-2.ext` and
-/// on when that is taken: an earlier export is never written over.
-pub fn write_new(
-    dir: &std::path::Path,
-    stem: &str,
-    ext: &str,
-    text: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    use std::io::Write;
-    std::fs::create_dir_all(dir)?;
-    for n in 1..=100 {
-        let name = if n == 1 {
-            format!("{stem}.{ext}")
-        } else {
-            format!("{stem}-{n}.{ext}")
-        };
-        let path = dir.join(name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => return f.write_all(text.as_bytes()).map(|()| path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "a hundred exports of this second are there already",
-    ))
+    crate::local_store::write(FILE, &was, &inv.to_text())
 }
 
 /// Seconds since 1970, now.
@@ -158,68 +112,6 @@ pub struct Row {
     pub system_info: bool,
 }
 
-/// What a column shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Column {
-    Name,
-    Address,
-    Type,
-    Folder,
-    Tags,
-    LastConnected,
-    KeyType,
-    Fingerprint,
-    Os,
-    Kernel,
-}
-
-impl Column {
-    /// In the list's order.
-    pub const ALL: [Self; 10] = [
-        Self::Name,
-        Self::Address,
-        Self::Type,
-        Self::Folder,
-        Self::Tags,
-        Self::LastConnected,
-        Self::KeyType,
-        Self::Fingerprint,
-        Self::Os,
-        Self::Kernel,
-    ];
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Name => "Name",
-            Self::Address => "Address",
-            Self::Type => "Type",
-            Self::Folder => "Folder",
-            Self::Tags => "Tags",
-            Self::LastConnected => "Last connected",
-            Self::KeyType => "Host key",
-            Self::Fingerprint => "Fingerprint",
-            Self::Os => "OS",
-            Self::Kernel => "Kernel",
-        }
-    }
-
-    /// The column's width in the list, in DIPs.
-    pub fn width(self) -> i32 {
-        match self {
-            Self::Name => 140,
-            Self::Address => 170,
-            Self::Type => 60,
-            Self::Folder => 100,
-            Self::Tags => 110,
-            Self::LastConnected => 120,
-            Self::KeyType => 80,
-            Self::Fingerprint => 200,
-            Self::Os => 190,
-            Self::Kernel => 160,
-        }
-    }
-}
-
 /// Every listed connection with what the inventory holds on it.
 pub fn rows(hosts: &[HostItem], inventory: &Inventory, settings: &Settings) -> Vec<Row> {
     hosts
@@ -230,86 +122,6 @@ pub fn rows(hosts: &[HostItem], inventory: &Inventory, settings: &Settings) -> V
             system_info: settings.profile(&h.name).is_some_and(|p| p.system_info),
         })
         .collect()
-}
-
-/// The rows a connection manager search (`tag:prod -os`, plain words)
-/// keeps; each plain word also looks at the OS, kernel and fingerprint,
-/// and a field word (`folder:db`) only at its field.
-pub fn filter<'a>(rows: &'a [Row], query: &str) -> Vec<&'a Row> {
-    let q = Query::parse(query);
-    rows.iter()
-        .filter(|r| {
-            let more = [
-                r.record.os.as_str(),
-                r.record.kernel.as_str(),
-                r.record.fingerprint.as_str(),
-            ];
-            q.matches_with(&r.host.facts(), &more)
-        })
-        .collect()
-}
-
-/// Sorts by `column`, newest first for the last login; ties by name.
-pub fn sort(rows: &mut [&Row], column: Column, descending: bool) {
-    let key = |r: &Row| -> String { text(r, column, |_| String::new()) };
-    rows.sort_by(|a, b| {
-        let o = match column {
-            Column::LastConnected => a.record.last_connected.cmp(&b.record.last_connected),
-            _ => key(a).to_lowercase().cmp(&key(b).to_lowercase()),
-        };
-        let o = if descending { o.reverse() } else { o };
-        o.then_with(|| a.host.name.to_lowercase().cmp(&b.host.name.to_lowercase()))
-    });
-}
-
-/// The column's text; `when` shows a time.
-pub fn text(r: &Row, column: Column, when: impl Fn(u64) -> String) -> String {
-    match column {
-        Column::Name => r.host.name.clone(),
-        Column::Address => r.host.detail.clone(),
-        Column::Type => r.host.kind.name().to_owned(),
-        Column::Folder => r.host.folder.clone().unwrap_or_default(),
-        Column::Tags => r.host.tags.join(" "),
-        Column::LastConnected => r.record.last_connected.map(when).unwrap_or_default(),
-        Column::KeyType => r.record.key_type.clone(),
-        Column::Fingerprint => r.record.fingerprint.clone(),
-        Column::Os => r.record.os.clone(),
-        Column::Kernel => r.record.kernel.clone(),
-    }
-}
-
-/// How the window says what it shows: "12 of 40 connections; 3 never
-/// connected".
-pub fn summary(shown: &[&Row], all: usize) -> String {
-    // Only SSH logins are recorded: a Telnet or WinRM row is never
-    // counted as not connected to.
-    let never = shown
-        .iter()
-        .filter(|r| {
-            r.host.kind == ferossh_config::SessionKind::Ssh && r.record.last_connected.is_none()
-        })
-        .count();
-    let what = if shown.len() == all {
-        format!("{all} connection{}", if all == 1 { "" } else { "s" })
-    } else {
-        format!("{} of {all} connections", shown.len())
-    };
-    let off = shown
-        .iter()
-        .filter(|r| r.host.kind == ferossh_config::SessionKind::Ssh && !r.system_info)
-        .count();
-    let mut out = what;
-    if never > 0 {
-        out.push_str(&format!("; {never} not connected to yet"));
-    }
-    if off > 0 {
-        out.push_str(&format!(
-            "; OS and kernel are read for SSH connections with Inventory on in their form ({off} \
-             off)"
-        ));
-    }
-    out.push('.');
-    out
 }
 
 /// `secs` since 1970 as UTC, `2026-11-20T18:04:05Z`, which spreadsheets
@@ -333,27 +145,6 @@ pub fn iso_utc(secs: u64) -> String {
         rest / 60 % 60,
         rest % 60
     )
-}
-
-/// The rows as CSV, in their order, times in UTC. Fields a spreadsheet
-/// would read as a formula start with `'` (the OS and kernel come from
-/// the servers).
-pub fn csv(rows: &[&Row]) -> String {
-    let mut out = Column::ALL
-        .iter()
-        .map(|c| c.title())
-        .collect::<Vec<_>>()
-        .join(",");
-    out.push_str("\r\n");
-    for r in rows {
-        let line: Vec<String> = Column::ALL
-            .iter()
-            .map(|&c| csv_field(&text(r, c, iso_utc)))
-            .collect();
-        out.push_str(&line.join(","));
-        out.push_str("\r\n");
-    }
-    out
 }
 
 #[cfg(test)]
@@ -408,92 +199,9 @@ mod tests {
     }
 
     #[test]
-    fn searches_with_field_words_and_server_text() {
-        let rows = sample();
-        let names = |q: &str| -> Vec<String> {
-            filter(&rows, q)
-                .iter()
-                .map(|r| r.host.name.clone())
-                .collect()
-        };
-        assert_eq!(names("tag:prod -tag:web"), ["db"]);
-        assert_eq!(names("linux"), ["db"]);
-        assert_eq!(names("sha256:aaa"), ["web"]);
-        assert_eq!(names(""), ["web", "db", "lab"]);
-        assert_eq!(names("folder:nothing"), Vec::<String>::new());
-        // Field and plain words together, each word on its own.
-        assert_eq!(names("tag:prod linux"), ["db"]);
-        assert_eq!(names("tag:prod -linux"), ["web"]);
-        assert_eq!(names("\"linux 6\""), ["db"]);
-        // A field word looks only at its field, not at the server's text.
-        assert_eq!(names("folder:linux"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn exports_never_write_over_an_earlier_one() {
-        let dir = std::env::temp_dir().join(format!("ferossh-inv-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let a = write_new(&dir, "inv", "csv", "a").unwrap();
-        let b = write_new(&dir, "inv", "csv", "b").unwrap();
-        assert_eq!(a.file_name().unwrap(), "inv.csv");
-        assert_eq!(b.file_name().unwrap(), "inv-2.csv");
-        assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn sorts_by_any_column() {
-        let rows = sample();
-        let mut shown = filter(&rows, "");
-        sort(&mut shown, Column::LastConnected, true);
-        let order: Vec<&str> = shown.iter().map(|r| r.host.name.as_str()).collect();
-        assert_eq!(order, ["web", "db", "lab"]);
-        sort(&mut shown, Column::Name, false);
-        let order: Vec<&str> = shown.iter().map(|r| r.host.name.as_str()).collect();
-        assert_eq!(order, ["db", "lab", "web"]);
-        sort(&mut shown, Column::KeyType, false);
-        assert_eq!(shown[0].host.name, "lab", "empty first");
-    }
-
-    #[test]
-    fn csv_has_a_header_utc_times_and_no_formulas() {
-        let rows = sample();
-        let shown = filter(&rows, "");
-        let text = csv(&shown);
-        let lines: Vec<&str> = text.split("\r\n").collect();
-        assert_eq!(
-            lines[0],
-            "Name,Address,Type,Folder,Tags,Last connected,Host key,Fingerprint,OS,Kernel"
-        );
-        assert_eq!(
-            lines[1],
-            "web,root@web.example,ssh,prod,prod web,2025-11-20T14:46:40Z,ED25519,SHA256:aaa,,"
-        );
-        assert!(lines[2].contains(",'=cmd|' /c calc'!A1,"), "{}", lines[2]);
-        assert_eq!(lines[3], "lab,root@lab.example,ssh,,,,,,,");
-    }
-
-    #[test]
     fn utc_dates() {
         assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso_utc(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(iso_utc(1_763_650_000), "2025-11-20T14:46:40Z");
-    }
-
-    #[test]
-    fn summary_says_what_is_missing() {
-        let rows = sample();
-        let shown = filter(&rows, "");
-        assert_eq!(
-            summary(&shown, 3),
-            "3 connections; 1 not connected to yet; OS and kernel are read for SSH connections \
-             with Inventory on in their form (2 off)."
-        );
-        let one = filter(&rows, "db");
-        assert_eq!(summary(&one, 3), "1 of 3 connections.");
-        // Telnet logins are not recorded: never counted as not connected.
-        let mut telnet = rows[2].clone();
-        telnet.host.kind = SessionKind::Telnet;
-        assert_eq!(summary(&[&telnet], 1), "1 connection.");
     }
 }

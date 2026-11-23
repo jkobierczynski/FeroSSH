@@ -63,7 +63,7 @@ impl EditField {
             Self::FontSize => "Font size",
             Self::Tmux => "tmux session",
             Self::StartDir => "Start directory",
-            Self::SystemInfo => "Connection log: OS and kernel",
+            Self::SystemInfo => "Hosts page: OS and kernel",
         }
     }
 
