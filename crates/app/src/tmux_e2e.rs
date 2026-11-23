@@ -574,7 +574,7 @@ fn real_tmux_other_client_keeping_the_window_small_is_detached() {
 
 #[test]
 fn real_tmux_counts_the_other_clients_of_the_session() {
-    if !tmux_available() {
+    if !tmux_available() || version() < MIN_VERSION {
         return;
     }
     let server = Server {
@@ -594,11 +594,14 @@ fn real_tmux_counts_the_other_clients_of_the_session() {
     a.until("the first client told", |h| h.tmux.others_attached() == 1);
 
     // The second one leaves by detaching: the session and its window stay
-    // for the first, which counts itself alone again.
+    // for the first, which counts itself alone again (tmux 3.2 and later
+    // tell control clients when another detaches).
     let actions = b.tmux.detach();
     b.apply(actions);
     b.until("the detach", |h| !h.tmux.active());
-    a.until("the first client alone", |h| h.tmux.others_attached() == 0);
+    if version() >= (Version { major: 3, minor: 2 }) {
+        a.until("the first client alone", |h| h.tmux.others_attached() == 0);
+    }
     assert!(a.tmux.active());
     assert_eq!(a.shown(), 1);
     let windows = tmux_cmd(
