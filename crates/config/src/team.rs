@@ -76,6 +76,11 @@ pub struct Team {
     /// before a security rule was added, say). 0 for a library exported
     /// before FeroSSH wrote one.
     pub serial: u64,
+    /// Read from a library whose signature was checked (or its checked
+    /// copy); false for none at all. A machine policy that requires the
+    /// library connects nowhere without one
+    /// ([`crate::team_policy::check`]).
+    pub verified: bool,
 }
 
 impl Team {
@@ -210,6 +215,7 @@ pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
         security_rules,
         theme_rules: settings.theme_rules,
         themes,
+        verified: true,
     })
 }
 

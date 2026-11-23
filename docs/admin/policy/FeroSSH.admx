@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FeroSSH machine policy: the team library every user of the PC must use.
+     Copy FeroSSH.admx to C:\Windows\PolicyDefinitions (or the domain's
+     Central Store) and en-US\FeroSSH.adml to its en-US folder, or import
+     both into Intune (Devices > Configuration > Import ADMX).
+     See docs/admin/team-library-policy.md. -->
+<policyDefinitions xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   revision="1.0" schemaVersion="1.0"
+                   xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <policyNamespaces>
+    <target prefix="ferossh" namespace="FeroSSH.Policies.FeroSSH" />
+    <using prefix="windows" namespace="Microsoft.Policies.Windows" />
+  </policyNamespaces>
+  <resources minRequiredRevision="1.0" />
+  <supportedOn>
+    <definitions>
+      <definition name="SUPPORTED_FeroSSH_TeamPolicy" displayName="$(string.SUPPORTED_FeroSSH_TeamPolicy)" />
+    </definitions>
+  </supportedOn>
+  <categories>
+    <category name="FeroSSH" displayName="$(string.FeroSSH)" />
+  </categories>
+  <policies>
+    <policy name="TeamLibrary" class="Machine"
+            displayName="$(string.TeamLibrary)"
+            explainText="$(string.TeamLibrary_Explain)"
+            presentation="$(presentation.TeamLibrary)"
+            key="Software\Policies\FeroSSH">
+      <parentCategory ref="FeroSSH" />
+      <supportedOn ref="SUPPORTED_FeroSSH_TeamPolicy" />
+      <elements>
+        <text id="TeamLibraryPath" valueName="TeamLibrary" required="true" maxLength="1024" />
+        <list id="TrustedKeys" key="Software\Policies\FeroSSH\TrustedKeys" valuePrefix="" />
+      </elements>
+    </policy>
+    <policy name="RequireTeamLibrary" class="Machine"
+            displayName="$(string.RequireTeamLibrary)"
+            explainText="$(string.RequireTeamLibrary_Explain)"
+            key="Software\Policies\FeroSSH" valueName="RequireTeamLibrary">
+      <parentCategory ref="FeroSSH" />
+      <supportedOn ref="SUPPORTED_FeroSSH_TeamPolicy" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="OnlyTeamConnections" class="Machine"
+            displayName="$(string.OnlyTeamConnections)"
+            explainText="$(string.OnlyTeamConnections_Explain)"
+            key="Software\Policies\FeroSSH" valueName="OnlyTeamConnections">
+      <parentCategory ref="FeroSSH" />
+      <supportedOn ref="SUPPORTED_FeroSSH_TeamPolicy" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+  </policies>
+</policyDefinitions>
