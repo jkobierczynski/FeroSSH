@@ -441,6 +441,22 @@ pub fn read(name: &str) -> Option<String> {
     })
 }
 
+/// File `name` in the vault; when there is none, `text` is stored as it
+/// and given back. The read and the write happen under one lock, so two
+/// FeroSSH processes on this PC never both store one (across PCs, as for
+/// every change, the last save wins).
+pub fn read_or_write(name: &str, text: &str) -> Result<String, String> {
+    with(|v| {
+        let v = v.as_mut().ok_or("No vault is open.")?;
+        v.refresh()?;
+        if let Some(t) = v.bundle.file(name) {
+            return Ok(t.to_owned());
+        }
+        v.change(|b| b.set_file(name, text.to_owned()))?;
+        Ok(text.to_owned())
+    })
+}
+
 /// Sets `name` to `text` in the vault and seals it to disk.
 pub fn write(name: &str, text: &str) -> Result<(), String> {
     with(|v| {

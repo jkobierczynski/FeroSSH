@@ -73,10 +73,17 @@ fn key() -> Option<Result<(), String>> {
                 return Some(Err("Windows gave no random bytes.".into()));
             }
             let s: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-            if let Err(e) = crate::vault::write(KEY_FILE, &format!("{s}\n")) {
-                return Some(Err(e));
+            // Another FeroSSH may have made one since: theirs is kept.
+            match crate::vault::read_or_write(KEY_FILE, &format!("{s}\n")) {
+                Ok(t) => {
+                    let t = t.trim().to_owned();
+                    if t.len() != 96 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Some(Err("The vault's key for local records is damaged.".into()));
+                    }
+                    zeroize::Zeroizing::new(t)
+                }
+                Err(e) => return Some(Err(e)),
             }
-            zeroize::Zeroizing::new(s)
         }
     };
     let mut held = KEY

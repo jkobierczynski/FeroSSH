@@ -1324,7 +1324,16 @@ pub(super) fn remove(hwnd: HWND) {
     let removed = match vault::remove() {
         Ok(r) => r,
         Err(e) => {
-            dialog(hwnd, &e, MB_OK | MB_ICONERROR);
+            // The vault stays: so do the seals on the local records.
+            let mut text = e;
+            let problems = crate::local_store::seal_all();
+            if !problems.is_empty() {
+                text.push_str(&format!(
+                    "\n\nCould not encrypt the connection log with the vault again:\n\n{}",
+                    problems.join("\n")
+                ));
+            }
+            dialog(hwnd, &text, MB_OK | MB_ICONERROR);
             return;
         }
     };

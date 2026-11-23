@@ -560,10 +560,18 @@ fn fill(keep: &[Entry]) {
         }
         let _ = InvalidateRect(Some(h.panel), None, false);
     }
+    // As many of each entry as were picked: two alike, one picked, stays
+    // one picked.
+    let mut left: Vec<Option<&Entry>> = keep.iter().map(Some).collect();
     let at: Vec<usize> = entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| keep.contains(e))
+        .filter(|(_, e)| {
+            left.iter_mut()
+                .find(|k| k.is_some_and(|k| k == *e))
+                .map(|k| k.take())
+                .is_some()
+        })
         .map(|(i, _)| i)
         .collect();
     if at.is_empty() {

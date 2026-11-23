@@ -6022,7 +6022,10 @@ impl Window {
                         .map(|j| format!("{}@{}", j.user, host_port(&j.hostname, j.port))),
                 );
                 e.via = via.join(" > ");
-                if t.typed != t.alias {
+                if t.sftp_only {
+                    // File transfer only: opened again as such, in its folder.
+                    e.target = crate::workspaces::sftp_address(&t.typed, t.sftp_folder.as_deref());
+                } else if t.typed != t.alias {
                     e.target = t.typed.clone();
                 }
                 if let Some((kind, fp)) = &s.host_key_seen {
