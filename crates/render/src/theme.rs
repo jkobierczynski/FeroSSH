@@ -771,7 +771,10 @@ mod tests {
             );
         }
         assert_eq!(Theme::default().name, "GitHub Dark");
-        assert_eq!(Theme::builtin()[0].name, "GitHub Dark");
+        assert_eq!(
+            Theme::builtin().first().map(|t| t.name),
+            Some("GitHub Dark")
+        );
         assert!(Theme::by_name("Ros\u{e9} Pine").is_some());
     }
 
