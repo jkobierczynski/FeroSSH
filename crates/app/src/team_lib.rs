@@ -347,6 +347,15 @@ fn claim_signer(
         .map(|(_, n)| n)
         .max()
         .unwrap_or(0);
+    // The dates kept on disk for these keys join this run's, so what the
+    // window's thread offers (from this run's dates only) honours them
+    // too, also when this library is refused below.
+    for (fp, n) in disk.iter().filter(|(fp, _)| fps.contains(fp)) {
+        match run.iter_mut().find(|(d, f, _)| d == dir && f == fp) {
+            Some(e) => e.2 = e.2.max(*n),
+            None => run.push((dir.to_owned(), fp.clone(), *n)),
+        }
+    }
     if serial < floor {
         return Err(Unclaimed::Older(floor));
     }
@@ -1086,6 +1095,30 @@ mod tests {
         assert!(newest_accepted(old.to_str(), &keys, &cache, 0).is_none());
         let got = newest_accepted(new.to_str(), &keys, &cache, 0).map(|t| t.serial);
         assert_eq!(got, Some(300));
+        let _ = std::fs::remove_dir_all(&share);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn a_kept_date_from_disk_stops_offering_an_older_library() {
+        let share = temp("offer-disk-floor");
+        let cache = temp("offer-disk-floor-cache");
+        let keys = [admin().public_key().to_openssh().unwrap()];
+        let old = write_dated(&share, "old", 200);
+        // An earlier run took it, so its checked copy is on disk...
+        assert_eq!(load(old.to_str(), &keys, &cache, &|| true).team.serial, 200);
+        // ...and a later run took a newer library by the same key elsewhere.
+        let fp = team::fingerprints(&keys).remove(0);
+        std::fs::write(cache.join(SIGNERS_FILE), format!("{fp} 300\n")).unwrap();
+        // This run starts with nothing in memory.
+        SIGNERS.lock().unwrap().retain(|(d, _, _)| *d != cache);
+        ACCEPTED
+            .lock()
+            .unwrap()
+            .retain(|e| !e.is(old.to_str().unwrap(), &keys));
+        let got = load(old.to_str(), &keys, &cache, &|| true);
+        assert_ne!(got.team.serial, 200);
+        assert!(newest_accepted(old.to_str(), &keys, &cache, 0).is_none());
         let _ = std::fs::remove_dir_all(&share);
         let _ = std::fs::remove_dir_all(&cache);
     }
