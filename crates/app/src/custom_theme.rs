@@ -132,7 +132,9 @@ pub fn clean_name(name: &str) -> Result<String, String> {
 /// line (its file name).
 pub fn parse(text: &str, fallback: &str) -> Result<CustomTheme, String> {
     let mut name = None;
-    let mut base = Theme::default();
+    // Nord, not the default theme: files written before GitHub Dark
+    // became the default keep their colours.
+    let mut base = Theme::nord();
     let mut colours: Vec<(String, Rgb)> = Vec::new();
     let mut font = None;
     let mut size = None;

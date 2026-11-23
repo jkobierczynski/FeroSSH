@@ -1389,7 +1389,7 @@ struct Window {
     /// Which keys run which action (Settings > Key bindings).
     keymap: Keymap,
     settings: Settings,
-    /// The theme panes start with (`--theme`, or Nord).
+    /// The theme panes start with (`--theme`, or GitHub Dark).
     default_theme: Theme,
     /// New panes' font: the default, or `--theme`'s custom theme's font.
     default_font: FontSpec,
@@ -2838,7 +2838,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let mut font = FontSpec::default();
         // Read first, so `--theme` and saved looks can name them.
         let custom_themes = load_custom_themes().map(|(t, _)| t).unwrap_or_default();
-        // An unknown theme name falls back to the default (Nord).
+        // An unknown theme name falls back to the default (GitHub Dark).
         // `--theme`, else Theme manager > Set as default.
         let default_theme = theme
             .or_else(|| settings.default_theme.clone())

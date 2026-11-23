@@ -1003,7 +1003,7 @@ pub struct Settings {
     /// an encrypted per-host history. Off unless turned on.
     pub command_suggestions: bool,
     /// The theme new tabs open with (Theme manager > Set as default);
-    /// Nord when unset or unknown. `--theme` beats it.
+    /// GitHub Dark when unset or unknown. `--theme` beats it.
     pub default_theme: Option<String>,
     /// The font family new tabs open with, when installed.
     pub default_font: Option<String>,

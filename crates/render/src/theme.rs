@@ -47,7 +47,7 @@ impl Theme {
         }
     }
 
-    /// The built-in themes, in menu order. Nord is the default.
+    /// The built-in themes, in menu order. GitHub Dark is the default.
     ///
     /// Dark themes first, then light ones, the warning themes and the
     /// classics (see [`Theme::group`]).
@@ -130,7 +130,13 @@ impl Theme {
         u32::from(b.r) * 299 + u32::from(b.g) * 587 + u32::from(b.b) * 114 > 128 * 1000
     }
 
-    /// The default theme: Nord.
+    /// The default theme: GitHub Dark.
+    pub fn github_dark() -> Self {
+        GITHUB_DARK
+    }
+
+    /// Nord: the old default, the development tag's theme and
+    /// the base of custom theme files that name none.
     pub fn nord() -> Self {
         NORD
     }
@@ -201,7 +207,7 @@ pub enum Group {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::nord()
+        Self::github_dark()
     }
 }
 
@@ -244,9 +250,22 @@ const STAGING: Theme = Theme::new(
     ],
 );
 
+/// GitHub's dark terminal palette: the default theme.
+const GITHUB_DARK: Theme = Theme::new(
+    "GitHub Dark",
+    0xE6EDF3,
+    0x0D1117,
+    0x2F81F7,
+    0x0D1117,
+    [
+        0x484F58, 0xFF7B72, 0x3FB950, 0xD29922, 0x58A6FF, 0xBC8CFF, 0x39C5CF, 0xB1BAC4, //
+        0x6E7681, 0xFFA198, 0x56D364, 0xE3B341, 0x79C0FF, 0xD2A8FF, 0x56D4DD, 0xFFFFFF,
+    ],
+);
+
 static BUILTIN: [Theme; 44] = [
-    // Dark themes, Nord first.
-    NORD,
+    // Dark themes, the default (GitHub Dark) first.
+    GITHUB_DARK,
     Theme::new(
         "Ayu Mirage",
         0xCCCAC2,
@@ -322,17 +341,6 @@ static BUILTIN: [Theme; 44] = [
         [
             0x475258, 0xE67E80, 0xA7C080, 0xDBBC7F, 0x7FBBB3, 0xD699B6, 0x83C092, 0x9DA9A0, //
             0x7A8478, 0xE67E80, 0xA7C080, 0xDBBC7F, 0x7FBBB3, 0xD699B6, 0x83C092, 0xD3C6AA,
-        ],
-    ),
-    Theme::new(
-        "GitHub Dark",
-        0xE6EDF3,
-        0x0D1117,
-        0x2F81F7,
-        0x0D1117,
-        [
-            0x484F58, 0xFF7B72, 0x3FB950, 0xD29922, 0x58A6FF, 0xBC8CFF, 0x39C5CF, 0xB1BAC4, //
-            0x6E7681, 0xFFA198, 0x56D364, 0xE3B341, 0x79C0FF, 0xD2A8FF, 0x56D4DD, 0xFFFFFF,
         ],
     ),
     Theme::new(
@@ -412,6 +420,7 @@ static BUILTIN: [Theme; 44] = [
             0x575860, 0xD16983, 0x8EBAA4, 0xE0C989, 0x86ABDC, 0xBAA1E2, 0x7AD5D6, 0xE4E4E5,
         ],
     ),
+    NORD,
     Theme::new(
         "One Dark",
         0xABB2BF,
@@ -761,7 +770,11 @@ mod tests {
                 Some(t)
             );
         }
-        assert_eq!(Theme::default().name, "Nord");
+        assert_eq!(Theme::default().name, "GitHub Dark");
+        assert_eq!(
+            Theme::builtin().first().map(|t| t.name),
+            Some("GitHub Dark")
+        );
         assert!(Theme::by_name("Ros\u{e9} Pine").is_some());
     }
 
