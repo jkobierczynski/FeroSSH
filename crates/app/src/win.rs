@@ -8944,6 +8944,11 @@ impl Window {
                 }
             }
         }
+        // Before a run's row is judged: the pane is logging in again,
+        // not failed.
+        if alone {
+            self.login_alone(id);
+        }
         if self.run_login.contains(&id) {
             self.check_run_login(id);
         }
@@ -8969,9 +8974,6 @@ impl Window {
         if pump {
             self.pump_run();
         }
-        if alone {
-            self.login_alone(id);
-        }
     }
 
     /// Pane `id`'s shell was refused on the connection it shared: no tab
@@ -8992,8 +8994,22 @@ impl Window {
             }
         }
         self.login_alone.insert(id);
+        // The pane never got its shell: where it was to start, and its log
+        // file, carry over to the new login.
+        let (start_dir, log) = match self.panes.get_mut(&id) {
+            Some(p) => (p.start_dir.take(), p.log.writer.take()),
+            None => (None, None),
+        };
         let env = ssh_env();
         self.connect_to(id, target, &env);
+        if let Some(p) = self.panes.get_mut(&id) {
+            if p.start_dir.is_none() {
+                p.start_dir = start_dir;
+            }
+            if p.log.writer.is_none() {
+                p.log.writer = log;
+            }
+        }
     }
 
     /// What a closed WinRM session's closer asks for: only messages to

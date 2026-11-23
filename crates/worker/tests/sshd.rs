@@ -1850,7 +1850,7 @@ impl Drop for Tiny {
 
 #[cfg(unix)]
 fn tinysshd(name: &str) -> Option<Tiny> {
-    if std::env::var_os("FEROSSH_TINYSSHD_TEST").is_none()
+    if std::env::var("FEROSSH_TINYSSHD_TEST").as_deref() != Ok("1")
         || !Path::new("/usr/sbin/tinysshd").exists()
         || Command::new("tcpserver").arg("-h").output().is_err()
     {
@@ -1872,7 +1872,12 @@ fn tinysshd(name: &str) -> Option<Tiny> {
     let line = std::fs::read_to_string(user.with_extension("pub")).unwrap();
     let ssh = Path::new(&std::env::var_os("HOME").unwrap()).join(".ssh");
     std::fs::create_dir_all(&ssh).unwrap();
-    let mut ak = std::fs::read_to_string(ssh.join("authorized_keys")).unwrap_or_default();
+    // Only a missing file is empty: one that cannot be read is left alone.
+    let mut ak = match std::fs::read_to_string(ssh.join("authorized_keys")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => panic!("cannot read ~/.ssh/authorized_keys: {e}"),
+    };
     if !ak.is_empty() && !ak.ends_with('\n') {
         ak.push('\n');
     }
