@@ -96,6 +96,10 @@ pub struct Entry {
     pub host_key: String,
     /// Why it ended, how long it was up.
     pub details: String,
+    /// What to open to connect again, as typed (`user@host:port` or the
+    /// connection's name); empty when `name` is that. A ninth field,
+    /// written only when set, so older lines read as before.
+    pub target: String,
 }
 
 impl Entry {
@@ -110,13 +114,14 @@ impl Entry {
             via: clean(&self.via),
             host_key: clean(&self.host_key),
             details: clean(&self.details),
+            target: clean(&self.target),
         }
     }
 
     /// The entry's line in the file (no line end).
     pub fn line(&self) -> String {
         let e = self.cleaned();
-        format!(
+        let mut out = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             e.time,
             e.kind.word(),
@@ -126,7 +131,12 @@ impl Entry {
             e.via,
             e.host_key,
             e.details
-        )
+        );
+        if !e.target.is_empty() {
+            out.push('\t');
+            out.push_str(&e.target);
+        }
+        out
     }
 
     fn parse(line: &str) -> Option<Entry> {
@@ -143,6 +153,7 @@ impl Entry {
             via: next(),
             host_key: next(),
             details: next(),
+            target: next(),
         })
     }
 }
@@ -247,6 +258,7 @@ mod tests {
             via: String::new(),
             host_key: "SHA256:abc".into(),
             details: String::new(),
+            target: String::new(),
         }
     }
 
@@ -267,6 +279,23 @@ mod tests {
         let kinds: Vec<Kind> = back.entries().iter().map(|e| e.kind).collect();
         assert_eq!(kinds, [Kind::Connected, Kind::Failed, Kind::Disconnected]);
         assert_eq!(back.entries()[1].via, "bastion > inner");
+    }
+
+    #[test]
+    fn the_target_is_a_ninth_field_only_when_set() {
+        let plain = entry(10, Kind::Connected, "web");
+        assert_eq!(plain.line().split('\t').count(), 8);
+        let typed = Entry {
+            target: "root@10.0.0.5:2222".into(),
+            ..entry(11, Kind::Connected, "10.0.0.5")
+        };
+        assert_eq!(typed.line().split('\t').count(), 9);
+        let mut log = Log::default();
+        log.push(&plain);
+        log.push(&typed);
+        let back = Log::parse(&log.to_text());
+        assert_eq!(back.entries()[0].target, "");
+        assert_eq!(back.entries()[1].target, "root@10.0.0.5:2222");
     }
 
     #[test]

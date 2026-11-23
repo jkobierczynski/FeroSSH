@@ -167,6 +167,7 @@ mod tests {
             via: "bastion".into(),
             host_key: String::new(),
             details: "refused\r\nConnection: forged".into(),
+            target: String::new(),
         };
         let t = text(&e);
         assert!(t.starts_with("FeroSSH connection failed.\r\nConnection: web\r\n"));

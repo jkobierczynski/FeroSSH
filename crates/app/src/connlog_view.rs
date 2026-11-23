@@ -105,16 +105,20 @@ fn words(query: &str) -> Vec<(bool, String)> {
     out
 }
 
-/// The entries the search keeps.
-pub fn filter<'a>(entries: &'a [Entry], query: &str) -> Vec<&'a Entry> {
+/// The entries the search keeps; `when` shows a time as the list does,
+/// so a date typed as shown finds that day's entries.
+pub fn filter<'a>(
+    entries: &'a [Entry],
+    query: &str,
+    when: impl Fn(u64) -> String,
+) -> Vec<&'a Entry> {
     let words = words(query);
     entries
         .iter()
         .filter(|e| {
             let all = Column::ALL
                 .iter()
-                .skip(1)
-                .map(|&c| text(e, c, |_| String::new()).to_lowercase())
+                .map(|&c| text(e, c, &when).to_lowercase())
                 .collect::<Vec<_>>()
                 .join("\t");
             words
@@ -124,8 +128,14 @@ pub fn filter<'a>(entries: &'a [Entry], query: &str) -> Vec<&'a Entry> {
         .collect()
 }
 
-/// Sorts by `column`; ties newest first.
+/// Sorts `rows` (oldest first, as kept) by `column`; ties newest first,
+/// also within one second, except when sorting oldest first by time.
 pub fn sort(rows: &mut [&Entry], column: Column, descending: bool) {
+    // The sort is stable: rows in newest-first order keep that order on
+    // a tie.
+    if !(column == Column::Time && !descending) {
+        rows.reverse();
+    }
     rows.sort_by(|a, b| {
         let o = match column {
             Column::Time => a.time.cmp(&b.time),
@@ -134,7 +144,10 @@ pub fn sort(rows: &mut [&Entry], column: Column, descending: bool) {
                 .cmp(&text(b, column, |_| String::new()).to_lowercase()),
         };
         let o = if descending { o.reverse() } else { o };
-        o.then_with(|| b.time.cmp(&a.time))
+        match column {
+            Column::Time => o,
+            _ => o.then_with(|| b.time.cmp(&a.time)),
+        }
     });
 }
 
@@ -218,6 +231,7 @@ mod tests {
             via: String::new(),
             host_key: "SHA256:abc".into(),
             details: details.into(),
+            target: String::new(),
         }
     }
 
@@ -237,7 +251,12 @@ mod tests {
     #[test]
     fn searches_words_quotes_and_exclusions() {
         let all = sample();
-        let names = |q: &str| -> Vec<u64> { filter(&all, q).iter().map(|e| e.time).collect() };
+        let names = |q: &str| -> Vec<u64> {
+            filter(&all, q, crate::inventory_view::iso_utc)
+                .iter()
+                .map(|e| e.time)
+                .collect()
+        };
         assert_eq!(names("web").len(), 2);
         assert_eq!(names("failed"), [1_763_650_100]);
         assert_eq!(names("web -disconnected"), [1_763_650_000]);
@@ -249,7 +268,7 @@ mod tests {
     #[test]
     fn sorts_newest_first_by_default_and_by_any_column() {
         let all = sample();
-        let mut shown = filter(&all, "");
+        let mut shown = filter(&all, "", crate::inventory_view::iso_utc);
         sort(&mut shown, Column::Time, true);
         assert_eq!(shown[0].kind, Kind::Disconnected);
         sort(&mut shown, Column::Connection, false);
@@ -261,7 +280,7 @@ mod tests {
     #[test]
     fn csv_has_a_header_utc_times_and_no_formulas() {
         let all = sample();
-        let shown = filter(&all, "");
+        let shown = filter(&all, "", crate::inventory_view::iso_utc);
         let text = csv(&shown);
         let lines: Vec<&str> = text.split("\r\n").collect();
         assert_eq!(
@@ -276,6 +295,31 @@ mod tests {
     }
 
     #[test]
+    fn finds_by_the_time_shown() {
+        let all = sample();
+        let found = filter(&all, "2025-11-20T14:46:40", crate::inventory_view::iso_utc);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, Kind::Connected);
+    }
+
+    #[test]
+    fn same_second_newest_first() {
+        let all = vec![
+            entry(5, Kind::Connected, "web", ""),
+            entry(5, Kind::Disconnected, "web", ""),
+        ];
+        let mut shown = filter(&all, "", crate::inventory_view::iso_utc);
+        sort(&mut shown, Column::Time, true);
+        assert_eq!(shown[0].kind, Kind::Disconnected);
+        let mut shown = filter(&all, "", crate::inventory_view::iso_utc);
+        sort(&mut shown, Column::Time, false);
+        assert_eq!(shown[0].kind, Kind::Connected);
+        let mut shown = filter(&all, "", crate::inventory_view::iso_utc);
+        sort(&mut shown, Column::Connection, false);
+        assert_eq!(shown[0].kind, Kind::Disconnected);
+    }
+
+    #[test]
     fn reasons_are_plain() {
         assert_eq!(
             reason("\r\n\x1b[0;90m[Connection refused. Press Enter to reconnect.]\x1b[0m\r\n"),
@@ -287,9 +331,9 @@ mod tests {
     #[test]
     fn summary_counts() {
         let all = sample();
-        let shown = filter(&all, "");
+        let shown = filter(&all, "", crate::inventory_view::iso_utc);
         assert_eq!(summary(&shown, 3, false), "3 entries; 1 failed.");
-        let one = filter(&all, "web -disconnected");
+        let one = filter(&all, "web -disconnected", crate::inventory_view::iso_utc);
         assert_eq!(summary(&one, 3, false), "1 of 3 entries.");
         assert_eq!(
             summary(&[], 0, true),

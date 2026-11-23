@@ -58,11 +58,16 @@ fn key() -> Option<Result<(), String>> {
         return None;
     }
     // 32 random bytes of secret and 16 of salt, in hex.
+    // A key that is there but damaged is never replaced: what it sealed
+    // would be lost.
     let secret = match crate::vault::read(KEY_FILE).map(|t| t.trim().to_owned()) {
         Some(s) if s.len() == 96 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
             zeroize::Zeroizing::new(s)
         }
-        _ => {
+        Some(_) => {
+            return Some(Err("The vault's key for local records is damaged.".into()));
+        }
+        None => {
             let mut raw = zeroize::Zeroizing::new([0u8; 48]);
             if getrandom::fill(raw.as_mut()).is_err() {
                 return Some(Err("Windows gave no random bytes.".into()));
@@ -176,8 +181,12 @@ pub fn write(name: &str, was: &Read, text: &str) -> std::io::Result<()> {
         match with_key(|k| k.seal(text.as_bytes())) {
             Some(Ok(Ok(sealed))) => {
                 crate::inventory_view::write_whole(&sealed_path(&plain), &sealed)?;
+                // The plain part is in the sealed copy now: left behind,
+                // it would be read twice. Emptied when it cannot go.
                 return match std::fs::remove_file(&plain) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        crate::inventory_view::write_whole(&plain, "").map_err(|_| e)
+                    }
                     _ => Ok(()),
                 };
             }
@@ -233,15 +242,35 @@ pub fn unseal_all() -> Vec<String> {
             continue;
         }
         let plain = dir.join(name);
+        let before = match read_text(&plain) {
+            Ok(t) => t,
+            Err(e) => {
+                problems.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
         let done = crate::inventory_view::write_whole(&plain, &r.text).and_then(|()| {
             match std::fs::remove_file(sealed_path(&plain)) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    // The sealed copy stays: the plain file goes back to
+                    // what it held, so nothing is there twice.
+                    let _ = match &before {
+                        Some(t) => crate::inventory_view::write_whole(&plain, t),
+                        None => std::fs::remove_file(&plain),
+                    };
+                    Err(e)
+                }
                 _ => Ok(()),
             }
         });
         if let Err(e) = done {
             problems.push(format!("{name}: {e}"));
         }
+    }
+    if !problems.is_empty() {
+        // The vault stays: the files written plain go back under its
+        // seal, so none is left both plain and sealed or half done.
+        problems.extend(seal_all());
     }
     problems
 }

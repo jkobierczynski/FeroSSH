@@ -404,16 +404,16 @@ pub fn paste(text: &str) {
 }
 
 /// Shows `rows` (read afresh, oldest first); `locked` when a sealed part
-/// could not be read. The picked entry stays picked when it is still
-/// listed.
+/// could not be read. The picked entries stay picked when they are still
+/// listed (all of them, when several are).
 pub fn set_rows(rows: Vec<Entry>, locked: bool, can_delete: bool) {
-    let keep = selected().into_iter().next();
+    let keep = selected();
     with(|s| {
         s.rows = rows;
         s.locked = locked;
         s.can_delete = can_delete;
     });
-    fill(keep.as_ref());
+    fill(&keep);
 }
 
 /// Shows `text` on the line above the buttons (what Save CSV did).
@@ -459,8 +459,13 @@ pub fn set_status(text: String) {
     }
 }
 
-fn set_state(list: HWND, index: usize) {
-    let on = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+/// Picks row `index`; `focus` also gives it the focus and scrolls to it.
+fn set_state(list: HWND, index: usize, focus: bool) {
+    let on = LIST_VIEW_ITEM_STATE_FLAGS(if focus {
+        LVIS_SELECTED.0 | LVIS_FOCUSED.0
+    } else {
+        LVIS_SELECTED.0
+    });
     let item = LVITEMW {
         stateMask: on,
         state: on,
@@ -474,6 +479,9 @@ fn set_state(list: HWND, index: usize) {
             Some(WPARAM(index)),
             Some(LPARAM(&raw const item as isize)),
         );
+        if !focus {
+            return;
+        }
         SendMessageW(
             list,
             LVM_ENSUREVISIBLE,
@@ -484,11 +492,11 @@ fn set_state(list: HWND, index: usize) {
 }
 
 /// The rows the search keeps, in the chosen order, and the summary; the
-/// entry `keep` stays picked, else the first row is.
-fn fill(keep: Option<&Entry>) {
+/// entries in `keep` still shown stay picked, else the first row is.
+fn fill(keep: &[Entry]) {
     let Some((h, cells, entries)) = with(|s| {
         let query = search_text(s.h.search);
-        let mut shown = connlog_view::filter(&s.rows, &query);
+        let mut shown = connlog_view::filter(&s.rows, &query, local);
         connlog_view::sort(&mut shown, s.sort, s.descending);
         s.status = connlog_view::summary(&shown, s.rows.len(), s.locked);
         if !s.can_delete {
@@ -552,11 +560,21 @@ fn fill(keep: Option<&Entry>) {
         }
         let _ = InvalidateRect(Some(h.panel), None, false);
     }
-    let at = keep
-        .and_then(|k| entries.iter().position(|e| e == k))
-        .or((!entries.is_empty()).then_some(0));
-    if let Some(i) = at {
-        set_state(h.list, i);
+    let at: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| keep.contains(e))
+        .map(|(i, _)| i)
+        .collect();
+    if at.is_empty() {
+        if !entries.is_empty() {
+            set_state(h.list, 0, true);
+        }
+    } else {
+        // The first picked row gets the focus and is scrolled to.
+        for (n, &i) in at.iter().enumerate().rev() {
+            set_state(h.list, i, n == 0);
+        }
     }
 }
 
@@ -626,10 +644,16 @@ fn emit(e: Event) {
 }
 
 fn connect() {
-    if let Some(e) = selected().into_iter().next()
-        && !e.name.is_empty()
-    {
-        emit(Event::Connect(e.name));
+    // What was typed to connect, when that was not the name shown.
+    if let Some(e) = selected().into_iter().next() {
+        let to = if e.target.is_empty() {
+            e.name
+        } else {
+            e.target
+        };
+        if !to.is_empty() {
+            emit(Event::Connect(to));
+        }
     }
 }
 
@@ -708,8 +732,8 @@ pub fn pre_translate(msg: &MSG) -> bool {
 fn command(h: Handles, id: usize, code: u32) {
     match (id, code) {
         (ID_SEARCH, EN_CHANGE) => {
-            let keep = selected().into_iter().next();
-            fill(keep.as_ref());
+            let keep = selected();
+            fill(&keep);
         }
         (ID_SEARCH, EN_SETFOCUS) => emit(Event::Focused),
         // Enter in the search box goes to the list, where it connects.
@@ -758,8 +782,8 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                             s.descending = c == Column::Time;
                         }
                     });
-                    let keep = selected().into_iter().next();
-                    fill(keep.as_ref());
+                    let keep = selected();
+                    fill(&keep);
                 }
             }
             _ => {}

@@ -5992,6 +5992,7 @@ impl Window {
             via: String::new(),
             host_key: String::new(),
             details: String::new(),
+            target: String::new(),
         };
         let host_port = |host: &str, port: u16| {
             if host.contains(':') {
@@ -6021,6 +6022,9 @@ impl Window {
                         .map(|j| format!("{}@{}", j.user, host_port(&j.hostname, j.port))),
                 );
                 e.via = via.join(" > ");
+                if t.typed != t.alias {
+                    e.target = t.typed.clone();
+                }
                 if let Some((kind, fp)) = &s.host_key_seen {
                     e.host_key = format!("{kind} {fp}");
                 }
@@ -17509,7 +17513,7 @@ impl Window {
                 return;
             }
             let started = launch_rdp_client(&addr, size, clipboard);
-            connlog_rdp(name, &addr, started.as_ref().err());
+            self.connlog_add(&connlog_rdp(name, &addr, started.as_ref().err()));
             if let Err(e) = started {
                 self.queued.push(Command::Notice(format!(
                     "Remote Desktop Connection (mstsc.exe) did not start: {e}"
@@ -24185,15 +24189,15 @@ fn launch_vnc_viewer(addr: &str, (to_host, from_host): (bool, bool)) -> Option<&
     c.arg(target).spawn().ok().map(|_| name)
 }
 
-/// Opens Remote Desktop Connection on `addr`, at `size` when one is set
-/// (else at its own default). Its own settings share the clipboard; with
-/// `clipboard` false it opens a connection file that turns that off
-/// (mstsc has no switch for it on its command line).
-/// Logs a Remote Desktop Connection started on its own (no SSH
-/// tunnel): opened, or failed with why.
-fn connlog_rdp(name: &str, addr: &str, error: Option<&std::io::Error>) {
+/// The log entry for a Remote Desktop Connection started on its own
+/// (no SSH tunnel): opened, or failed with why.
+fn connlog_rdp(
+    name: &str,
+    addr: &str,
+    error: Option<&std::io::Error>,
+) -> ferossh_config::connlog::Entry {
     use ferossh_config::connlog::{Entry, Kind};
-    let entry = Entry {
+    Entry {
         time: crate::inventory_view::now(),
         kind: if error.is_some() {
             Kind::Failed
@@ -24209,15 +24213,14 @@ fn connlog_rdp(name: &str, addr: &str, error: Option<&std::io::Error>) {
             || "Remote Desktop Connection started.".to_owned(),
             |e| format!("Remote Desktop Connection did not start: {e}"),
         ),
-    };
-    let _ = crate::connlog_store::add(&entry);
-    with_window(|w| {
-        if w.inventory_native() {
-            w.reload_inventory();
-        }
-    });
+        target: String::new(),
+    }
 }
 
+/// Opens Remote Desktop Connection on `addr`, at `size` when one is set
+/// (else at its own default). Its own settings share the clipboard; with
+/// `clipboard` false it opens a connection file that turns that off
+/// (mstsc has no switch for it on its command line).
 fn launch_rdp_client(
     addr: &str,
     size: Option<(u16, u16)>,
@@ -27385,7 +27388,13 @@ fn run_command(hwnd: HWND, command: Command) {
             match dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
                 Some(IDYES) => {
                     let started = launch_rdp_client(&addr, size, clipboard);
-                    connlog_rdp(&name, &addr, started.as_ref().err());
+                    let entry = connlog_rdp(&name, &addr, started.as_ref().err());
+                    let next = with_window(|w| {
+                        w.connlog_add(&entry);
+                        std::mem::take(&mut w.queued)
+                    })
+                    .unwrap_or_default();
+                    run_commands(hwnd, next);
                     if let Err(e) = started {
                         dialog(
                             hwnd,

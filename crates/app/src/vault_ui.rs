@@ -1314,7 +1314,8 @@ pub(super) fn remove(hwnd: HWND) {
     let unsealed = crate::local_store::unseal_all();
     if !unsealed.is_empty() {
         let text = format!(
-            "The connection log could not be decrypted, so the master password stays:\n\n{}",
+            "The connection log could not be written without the vault, so the master \
+             password stays:\n\n{}",
             unsealed.join("\n")
         );
         dialog(hwnd, &text, MB_OK | MB_ICONERROR);
@@ -1450,7 +1451,16 @@ pub(super) fn unlock_at_start() -> bool {
         busy();
         match vault::unlock(&path, &answer.passphrase) {
             Ok(()) => {
-                let _ = crate::local_store::seal_all();
+                let problems = crate::local_store::seal_all();
+                if !problems.is_empty() {
+                    super::message(
+                        &format!(
+                            "Could not encrypt the connection log with the vault:\n\n{}",
+                            problems.join("\n")
+                        ),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
                 return true;
             }
             Err(e) => problem = Some(e.to_string()),
