@@ -37,6 +37,7 @@ pub mod snippet_store;
 pub mod ssh_config;
 pub mod sshfp;
 pub mod team;
+pub mod team_policy;
 pub mod trigger;
 pub mod winscp;
 pub mod workspace;

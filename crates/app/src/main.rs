@@ -166,6 +166,8 @@ mod login_script;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod look;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod machine_policy;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod newkey;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod palette;

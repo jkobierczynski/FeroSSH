@@ -471,6 +471,8 @@ mod tests {
         let first = load(Some(path), &keys, &cache, &|| true);
         assert!(first.note.is_none());
         assert!(first.team.has("web"));
+        // Checked, so a policy that requires a library connects.
+        assert!(first.team.verified);
         // Tampered on the share: refused, the copy used.
         std::fs::write(&lib, b"FeroSSH connections v1\nend\n").unwrap();
         let tampered = load(Some(path), &keys, &cache, &|| true);
@@ -481,6 +483,7 @@ mod tests {
         let offline = load(Some(path), &keys, &cache, &|| true);
         assert!(offline.team.has("web"));
         assert!(offline.note.unwrap().contains("could not be read"));
+        assert!(offline.team.verified, "the checked copy counts");
         // Another key: the copy no longer passes either.
         let other = load(
             Some(path),
@@ -489,6 +492,8 @@ mod tests {
             &|| true,
         );
         assert!(other.team.is_empty());
+        // Nothing good to use: a policy that requires one connects nowhere.
+        assert!(!other.team.verified);
         // Another library, not there: not the first one's copy.
         let elsewhere = share.join("other.ferossh-library");
         let moved = load(Some(elsewhere.to_str().unwrap()), &keys, &cache, &|| true);
