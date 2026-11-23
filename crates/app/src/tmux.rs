@@ -1180,7 +1180,7 @@ impl Tmux {
         // With how many clients the session has, so closing can ask
         // first when others show it too.
         self.send(
-            "display-message -p '#{version} #{session_attached}'",
+            "display-message -p '#{version} #{session_attached_list}'",
             Tag::Version,
             out,
         );
@@ -1355,12 +1355,18 @@ impl Tmux {
                 self.version = ok.then(|| Version::parse(version)).flatten();
                 // Releases are numbers ("3.4", "3.3a").
                 self.dev_build = !version.starts_with(|c: char| c.is_ascii_digit());
-                // A count asked for after a client came or went is newer.
-                // Before 3.3 control clients are left out of it: listed
-                // (after what sharing asks, which waits on this reply).
+                // The session's clients by name, suspended ones too (which
+                // `#{session_attached}` leaves out). A count asked for after
+                // a client came or went is newer. Before 3.3 control clients
+                // can be missing: listed instead (after what sharing asks,
+                // which waits on this reply).
                 let list_clients = if self.version.is_some_and(|v| v >= WINDOW_SIZES_VERSION) {
                     if self.clients.is_none() {
-                        self.clients = words.next().and_then(|c| c.parse().ok());
+                        self.clients = words
+                            .next()
+                            .map(|names| names.split(',').filter(|n| !n.is_empty()).count())
+                            .and_then(|n| u32::try_from(n).ok())
+                            .filter(|n| *n > 0);
                     }
                     false
                 } else {
@@ -3723,7 +3729,7 @@ mod tests {
         let (mut ws, gateway) = Workspace::new();
         let mut t = Tmux::new(gateway, Mode::Ferossh, 100);
         t.feed(&mut ws, START);
-        let mut input = reply(1, &["3.4 1".into()]);
+        let mut input = reply(1, &["3.4 /dev/pts/3".into()]);
         input.extend(reply(2, &[]));
         input.extend(reply(3, &[]));
         input.extend(reply(4, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]));

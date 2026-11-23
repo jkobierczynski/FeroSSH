@@ -23071,18 +23071,25 @@ impl Window {
         })
     }
 
-    /// The user's answer about a shared tmux session: `detach` leaves it
-    /// to the other clients and closes this connection once detached;
-    /// otherwise the panes close in tmux, for every client. The other
-    /// panes asked to close close then.
-    fn close_shared(&mut self, shared: SharedClose, detach: bool) -> Option<Command> {
-        let gateway = shared.gateway;
-        // Queued output can switch or end the session before the answer.
-        if let Some(t) = self
-            .tmux
-            .get_mut(&gateway)
-            .filter(|t| t.active() && t.session_id() == Some(shared.session))
-        {
+    /// The user's answers about shared tmux sessions, all given before
+    /// anything happens: detaching leaves a session to the other clients
+    /// and closes this connection once detached; otherwise its panes close
+    /// in tmux, for every client. Then panes `rest` close.
+    fn close_shared(
+        &mut self,
+        answers: Vec<(SharedClose, bool)>,
+        rest: Vec<PaneId>,
+    ) -> Option<Command> {
+        for (shared, detach) in answers {
+            let gateway = shared.gateway;
+            // Queued output can switch or end the session before the answer.
+            let Some(t) = self
+                .tmux
+                .get_mut(&gateway)
+                .filter(|t| t.active() && t.session_id() == Some(shared.session))
+            else {
+                continue;
+            };
             let actions = if detach {
                 self.close_after_detach.insert(gateway);
                 t.detach()
@@ -23091,8 +23098,7 @@ impl Window {
             };
             self.run_tmux(gateway, actions);
         }
-        let rest: Vec<PaneId> = shared
-            .rest
+        let rest: Vec<PaneId> = rest
             .into_iter()
             .filter(|id| self.panes.contains_key(id))
             .collect();
@@ -26337,6 +26343,53 @@ fn write_library(hwnd: HWND) {
     }
 }
 
+/// Asks about closing panes of a tmux session other clients show too:
+/// `Some(true)` detaches, `Some(false)` closes them for everyone, `None`
+/// keeps everything.
+fn ask_shared_close(hwnd: HWND, shared: &SharedClose) -> Option<bool> {
+    let clients = if shared.others == 0 {
+        // tmux has not said yet after a client came or went.
+        "Another client (another FeroSSH connection or a terminal) may be".to_owned()
+    } else if shared.others == 1 {
+        "Another client (another FeroSSH connection or a terminal) is".to_owned()
+    } else {
+        format!(
+            "{} other clients (other FeroSSH connections or terminals) are",
+            shared.others
+        )
+    };
+    let tabs = if shared.tabs == 1 {
+        "its tab closes".to_owned()
+    } else {
+        format!("its {} tabs close", shared.tabs)
+    };
+    let text = format!(
+        "{clients} attached to tmux session \"{}\" on {} too, and shows the same \
+         panes. Closing them in tmux would close them there as well.\n\n\
+         Yes: detach from the session and close this connection; {tabs} here, and \
+         tmux keeps everything running for the other clients.\n\
+         No: close {} in tmux for everyone (the programs in {} end).\n\
+         Cancel: keep everything open.",
+        crate::ssh::sanitize(&shared.name),
+        crate::ssh::sanitize(&shared.host),
+        if shared.panes.len() == 1 {
+            "this pane"
+        } else {
+            "these panes"
+        },
+        if shared.panes.len() == 1 {
+            "it"
+        } else {
+            "them"
+        },
+    );
+    match dialog(hwnd, &text, MB_YESNOCANCEL | MB_ICONWARNING) {
+        Some(IDYES) => Some(true),
+        Some(IDNO) => Some(false),
+        _ => None,
+    }
+}
+
 fn run_command(hwnd: HWND, command: Command) {
     match command {
         Command::Id(id) => {
@@ -26411,50 +26464,22 @@ fn run_command(hwnd: HWND, command: Command) {
                 w.refresh_visible();
             });
         }
-        Command::CloseShared(shared) => {
-            let clients = if shared.others == 0 {
-                // tmux has not said yet after a client came or went.
-                "Another client (another FeroSSH connection or a terminal) may be".to_owned()
-            } else if shared.others == 1 {
-                "Another client (another FeroSSH connection or a terminal) is".to_owned()
-            } else {
-                format!(
-                    "{} other clients (other FeroSSH connections or terminals) are",
-                    shared.others
-                )
-            };
-            let tabs = if shared.tabs == 1 {
-                "its tab closes".to_owned()
-            } else {
-                format!("its {} tabs close", shared.tabs)
-            };
-            let text = format!(
-                "{clients} attached to tmux session \"{}\" on {} too, and shows the same \
-                 panes. Closing them in tmux would close them there as well.\n\n\
-                 Yes: detach from the session and close this connection; {tabs} here, and \
-                 tmux keeps everything running for the other clients.\n\
-                 No: close {} in tmux for everyone (the programs in {} end).\n\
-                 Cancel: keep everything open.",
-                crate::ssh::sanitize(&shared.name),
-                crate::ssh::sanitize(&shared.host),
-                if shared.panes.len() == 1 {
-                    "this pane"
-                } else {
-                    "these panes"
-                },
-                if shared.panes.len() == 1 {
-                    "it"
-                } else {
-                    "them"
-                },
-            );
-            let answer = dialog(hwnd, &text, MB_YESNOCANCEL | MB_ICONWARNING);
-            let detach = match answer {
-                Some(IDYES) => true,
-                Some(IDNO) => false,
-                _ => return,
-            };
-            if let Some(next) = with_window(|w| w.close_shared(shared, detach)).flatten() {
+        Command::CloseShared(first) => {
+            // Every shared session of the request is asked about before
+            // anything closes or detaches, so Cancel on any keeps it all.
+            let mut answers = Vec::new();
+            let mut next = Some(first);
+            let mut rest = Vec::new();
+            while let Some(shared) = next {
+                let detach = match ask_shared_close(hwnd, &shared) {
+                    Some(d) => d,
+                    None => return,
+                };
+                rest.clone_from(&shared.rest);
+                answers.push((shared, detach));
+                next = with_window(|w| w.shared_close(&rest)).flatten();
+            }
+            if let Some(next) = with_window(|w| w.close_shared(answers, rest)).flatten() {
                 run_command(hwnd, next);
             }
         }
