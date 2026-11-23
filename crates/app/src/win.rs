@@ -16999,6 +16999,12 @@ impl Window {
     }
 
     fn poll_team(&mut self) {
+        // The library and keys reads use: machine policy's when one is set
+        // (cached, so cheap here).
+        let (library, keys) = crate::machine_policy::team_source(
+            self.settings.team_library.as_deref(),
+            &self.settings.team_library_keys,
+        );
         let loaded = match self.team_loaded.lock() {
             Ok(mut s) => s.take(),
             Err(_) => return,
@@ -17009,11 +17015,7 @@ impl Window {
             // A read of another path by the same key that crossed this
             // one may have taken a newer library since: read again (that
             // read refuses this one) rather than put it to use.
-            if crate::team_lib::superseded(
-                &loaded.team,
-                &self.settings.team_library_keys,
-                &app_dir(),
-            ) {
+            if crate::team_lib::superseded(&loaded.team, &keys, &app_dir()) {
                 self.refresh_team();
             } else {
                 self.use_team(loaded);
@@ -17021,11 +17023,9 @@ impl Window {
         }
         // Two reads that crossed can leave an older library in use than
         // one already accepted for this library and key: never go back.
-        if let Some(newer) = crate::team_lib::newest_accepted(
-            self.settings.team_library.as_deref(),
-            &self.settings.team_library_keys,
-            self.settings.team.serial,
-        ) {
+        if let Some(newer) =
+            crate::team_lib::newest_accepted(library.as_deref(), &keys, self.settings.team.serial)
+        {
             let note = self.team_note.clone();
             self.use_team(crate::team_lib::Loaded { team: newer, note });
         }

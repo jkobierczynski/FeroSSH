@@ -525,9 +525,16 @@ pub fn load(
                     // before it is taken as this path's newest.
                     // A newer copy of this path wins without this library's
                     // date being claimed: it is not used.
-                    let path_has_newer = seen_serial(library, keys, cache_dir) > team.serial;
+                    // (Should that copy have gone meanwhile, this library
+                    // is claimed and checked like any other.)
+                    let path_kept = if seen_serial(library, keys, cache_dir) > team.serial {
+                        newest_seen(library, keys, cache_dir).filter(|t| t.serial > team.serial)
+                    } else {
+                        None
+                    };
                     let signer = team::signer(&sig).unwrap_or_default();
-                    let claimed = (!path_has_newer)
+                    let claimed = path_kept
+                        .is_none()
                         .then(|| claim_signer(cache_dir, keys, &signer, team.serial));
                     if let Some(Err(Unclaimed::Unchecked(e))) = &claimed {
                         // The copy checked last, below, as when the share
@@ -537,7 +544,9 @@ pub fn load(
                          date ({e})"
                         );
                     }
-                    let kept = if let Some(Err(Unclaimed::Older(floor))) = claimed {
+                    let kept = if path_kept.is_some() {
+                        path_kept
+                    } else if let Some(Err(Unclaimed::Older(floor))) = claimed {
                         match newest_seen(library, keys, cache_dir).filter(|t| t.serial >= floor) {
                             Some(kept) => Some(kept),
                             None => {
