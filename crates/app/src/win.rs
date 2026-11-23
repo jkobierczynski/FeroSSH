@@ -17048,8 +17048,13 @@ impl Window {
                 self.settings.team.serial,
             )
         {
-            let note = self.team_note.clone();
-            self.use_team(crate::team_lib::Loaded { team: newer, note });
+            // Checked and put to use in one step, as above.
+            if crate::team_lib::publish_unless_superseded(&newer, &keys, &app_dir()) {
+                let note = self.team_note.clone();
+                self.use_team(crate::team_lib::Loaded { team: newer, note });
+            } else {
+                self.refresh_team();
+            }
         }
         if self.team_note_pending.is_some() {
             if DIALOG_OPEN.get() {
