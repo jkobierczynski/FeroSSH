@@ -6,6 +6,7 @@
 //! (session profiles, favourites, theme rules) use ssh_config's syntax.
 
 pub mod bundle;
+pub mod connlog;
 pub mod forward;
 pub mod highlight;
 pub mod host_policy;
@@ -19,6 +20,7 @@ mod json;
 pub mod known_hosts;
 pub mod library;
 pub mod limit_record;
+pub mod log_policy;
 pub mod login;
 pub mod mobaxterm;
 pub mod mremoteng;

@@ -507,18 +507,32 @@ fn system_icons() -> isize {
 
 /// `secs` since 1970 as local date and time, `2026-11-09 08:15`.
 pub(crate) fn when(secs: Option<i64>) -> String {
+    local_time(secs).map_or_else(String::new, |t| {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}",
+            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute
+        )
+    })
+}
+
+/// [`when`] with the seconds, for the connection log.
+pub(crate) fn when_seconds(secs: Option<i64>) -> String {
+    local_time(secs).map_or_else(String::new, |t| {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+        )
+    })
+}
+
+fn local_time(secs: Option<i64>) -> Option<windows::Win32::Foundation::SYSTEMTIME> {
     use windows::Win32::Foundation::SYSTEMTIME;
-    let Some(secs) = secs else {
-        return String::new();
-    };
+    let secs = secs?;
     // A time out of FILETIME's range (a damaged file's) shows nothing.
-    let Some(ticks) = secs
+    let ticks = secs
         .checked_add(11_644_473_600)
         .and_then(|s| u64::try_from(s.max(0)).ok())
-        .and_then(|s| s.checked_mul(10_000_000))
-    else {
-        return String::new();
-    };
+        .and_then(|s| s.checked_mul(10_000_000))?;
     let ft = FILETIME {
         dwLowDateTime: ticks as u32,
         dwHighDateTime: (ticks >> 32) as u32,
@@ -530,13 +544,7 @@ pub(crate) fn when(secs: Option<i64>) -> String {
         FileTimeToSystemTime(&ft, &mut utc).is_ok()
             && SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_ok()
     };
-    if !ok {
-        return String::new();
-    }
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute
-    )
+    ok.then_some(local)
 }
 
 fn add_columns(list: HWND, columns: &[(&str, i32, bool)], dpi: u32) {

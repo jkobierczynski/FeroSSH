@@ -6,6 +6,7 @@
 
 use std::sync::{Mutex, PoisonError};
 
+use ferossh_config::log_policy::LogPolicy;
 use ferossh_config::team_policy::TeamPolicy;
 
 /// The policy as read last; `None` inside until first read.
@@ -22,7 +23,34 @@ pub fn team() -> Option<TeamPolicy> {
 pub fn reload() -> Option<TeamPolicy> {
     let fresh = read();
     *POLICY.lock().unwrap_or_else(PoisonError::into_inner) = Some(fresh.clone());
+    *LOG.lock().unwrap_or_else(PoisonError::into_inner) = Some(read_log());
     fresh
+}
+
+/// The connection log policy as read last.
+static LOG: Mutex<Option<LogPolicy>> = Mutex::new(None);
+
+/// What machine policy says about the connection log, read once and then
+/// kept until [`reload`].
+pub fn log() -> LogPolicy {
+    *LOG.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(read_log)
+}
+
+#[cfg(not(windows))]
+fn read_log() -> LogPolicy {
+    LogPolicy::default()
+}
+
+#[cfg(windows)]
+fn read_log() -> LogPolicy {
+    use ferossh_config::log_policy::{DELETE, EVENT_LOG};
+    use ferossh_config::team_policy::KEY;
+    let Some(key) = reg::Key::open_hklm(KEY) else {
+        return LogPolicy::default();
+    };
+    LogPolicy::from_values(key.dword(DELETE), key.dword(EVENT_LOG))
 }
 
 /// The team library to read and the keys to check it with: the policy's

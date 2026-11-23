@@ -984,10 +984,6 @@ pub struct Settings {
     /// fonts that have them, such as Cascadia Code, Fira Code and
     /// JetBrains Mono (Settings > Font ligatures). Off unless turned on.
     pub font_ligatures: bool,
-    /// Tools > Connection log offers Delete..., which forgets what it
-    /// holds about one connection (Settings > Allow deleting connection
-    /// log entries). Off unless turned on.
-    pub connection_log_delete: bool,
     /// The team's shared connection library: a file on a share or in a
     /// synced folder (see [`crate::team`]).
     pub team_library: Option<String>,
@@ -1120,7 +1116,6 @@ impl Default for Settings {
             run_parallel: None,
             tmux_keys: false,
             font_ligatures: false,
-            connection_log_delete: false,
             team_library: None,
             team_library_keys: Vec::new(),
             team: crate::team::Team::default(),
@@ -1685,10 +1680,9 @@ impl Settings {
                     block = Block::Top;
                     s.font_ligatures = yes(&args).unwrap_or(false);
                 }
-                "connectionlogdelete" => {
-                    block = Block::Top;
-                    s.connection_log_delete = yes(&args).unwrap_or(false);
-                }
+                // Was Settings > Allow deleting connection log entries:
+                // machine policy decides that now. Read and dropped.
+                "connectionlogdelete" => block = Block::Top,
                 "teamlibrary" => {
                     block = Block::Top;
                     s.team_library = Some(joined).filter(|f| !f.is_empty());
@@ -2234,9 +2228,6 @@ impl Settings {
         let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
         if self.font_ligatures {
             let _ = writeln!(out, "FontLigatures yes");
-        }
-        if self.connection_log_delete {
-            let _ = writeln!(out, "ConnectionLogDelete yes");
         }
         if let Some(t) = &self.team_library {
             let _ = writeln!(out, "TeamLibrary {}", arg(t));
@@ -3527,15 +3518,10 @@ DesktopShareSelection yes
     }
 
     #[test]
-    fn connection_log_delete_is_off_unless_turned_on() {
-        assert!(!Settings::default().connection_log_delete);
-        assert!(Settings::parse("ConnectionLogDelete yes\n").connection_log_delete);
-        let s = Settings {
-            connection_log_delete: true,
-            ..Settings::default()
-        };
-        assert!(Settings::parse(&s.to_text()).connection_log_delete);
-        assert!(!Settings::parse(&Settings::default().to_text()).connection_log_delete);
+    fn the_old_connection_log_delete_setting_is_dropped() {
+        let s = Settings::parse("ConnectionLogDelete yes\n");
+        assert!(!s.to_text().contains("ConnectionLogDelete"));
+        assert_eq!(s, Settings::default());
     }
 
     #[test]

@@ -25,7 +25,6 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `AgentCommand claude --model opus` | claude, codex, aider | One coding agent command for Session > Coding agents, typed at the server's shell exactly as written (the rest of the line, quotes and `#` included). Repeat the line for more, up to 16, in menu order; any non-empty line replaces the built-in three; empty lines and lines with control characters are ignored. |
 | `TeamLibrary PATH` | | The team's signed connection library, on a share or in a synced folder (see [Team library](#team-library)). Settings > Team library. |
 | `TeamLibraryKey KEY` | | The public key the library must be signed with, as one line of a `.pub` file. Repeat the line for more than one key. |
-| `ConnectionLogDelete yes` | no | Tools > Connection log offers Delete..., which forgets what the log holds about one connection. Settings > Allow deleting connection log entries. |
 | `DefaultTheme NAME` | GitHub Dark | The theme new tabs open with (Theme manager > Set as default). `--theme` and theme rules come before it. |
 | `DefaultFont FAMILY` | Cascadia Mono | The font new tabs open with, when it is installed (Theme manager > Set as default on a font). |
 | `DefaultFontSize POINTS` | | The font size new tabs open with, 4 to 96 points. |
@@ -123,7 +122,7 @@ Profile web1
 | `FontSize N` | Text size in points. |
 | `Theme NAME` | Colour theme, for example `Nord`, `Dracula` or `Production`. |
 | `Tags TAG...` | The connection's own tags (Tags in the connection form), separated by spaces: shown and searched in the connection manager and matched by theme rules, on top of ssh_config's `Tag`. Up to 16, each up to 32 letters, digits, `-`, `_`, `.`, `/` and `:`; others are left out. |
-| `SystemInfo yes` | After each SSH login, reads the server's OS and kernel for the [connection log](everyday-use.md#connection-log) (Log OS in the connection form's Extras). |
+| `SystemInfo yes` | After each SSH login, reads the server's OS and kernel for [Tools > Hosts](everyday-use.md#hosts) (Read OS in the connection form's Extras). |
 | `Credential NAME` | The named credential the connection uses (see [Credentials](#credentials)): its user, key file and password source win over the connection's own. |
 | `Scrollback N` | Lines of scrollback for this host's panes. |
 | `Tmux SESSION` | Attaches to this tmux session after every login. `off`, `no` or `none` (or leaving it out) means no tmux; `on`, `yes` or `true` attaches to `main`. |

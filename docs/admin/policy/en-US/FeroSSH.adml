@@ -9,6 +9,7 @@
     <stringTable>
       <string id="FeroSSH">FeroSSH</string>
       <string id="SUPPORTED_FeroSSH_TeamPolicy">FeroSSH with team library policy support</string>
+      <string id="SUPPORTED_FeroSSH_LogPolicy">FeroSSH with connection log policy support</string>
 
       <string id="TeamLibrary">Use this team library</string>
       <string id="TeamLibrary_Explain">Sets the team library every user of this PC uses: a .ferossh-library file exported from FeroSSH and signed with ssh-keygen -Y sign -n ferossh-library, with its .sig file beside it.
@@ -36,6 +37,26 @@ Disabled: without a good library FeroSSH connects as if there were none, with th
 Enabled: FeroSSH opens only the team library's connections, each exactly as the library defines it. Addresses typed at Connect to..., the user's own saved and imported connections, and their ~/.ssh/config are not used, and every jump host on the way must be a team connection too. Each user's own named credential (user, key and password) still applies to a team connection that names it. Without a good library FeroSSH connects nowhere.
 
 Disabled or not configured: users can also open their own connections, under the team's security rules.</string>
+
+      <string id="ConnectionLogDelete">Allow deleting connection log entries</string>
+      <string id="ConnectionLogDelete_Explain">FeroSSH keeps a connection log on each PC: every connection made (SSH, SFTP, Telnet, WinRM, Remote Desktop), with when, to which address, through which jump hosts, with which host key, and how it ended (disconnected, lost, failed). Users see it in Tools > Connection log.
+
+Disabled: nobody can delete entries from the connection log in FeroSSH. The Delete button is gone, and the page says the organisation keeps every entry.
+
+Enabled: users can delete entries (after a question).
+
+Not configured: deleting is up to the user, as when enabled.
+
+This setting binds FeroSSH, not the file: a user can still delete the log file itself (%LOCALAPPDATA%\FeroSSH\connections.log, or connections.log.sealed while a master password vault is open). For a record users cannot remove, also enable "Copy the connection log to the Windows event log".</string>
+
+      <string id="ConnectionLogEventLog">Copy the connection log to the Windows event log</string>
+      <string id="ConnectionLogEventLog_Explain">Enabled: FeroSSH also writes every connection log entry to the Windows Application event log, source FeroSSH, with the user's account. Users who are not administrators cannot clear or change that log, and Windows Event Forwarding or a SIEM agent can collect it. A deletion from the connection log in FeroSSH is reported there too.
+
+Event IDs: 1001 connected, 1002 disconnected, 1003 lost (reconnecting), 1004 failed, 1005 opened (Remote Desktop), 1010 entries deleted.
+
+Register the event source once per PC, as an administrator, so Event Viewer shows the text without a warning: New-EventLog -LogName Application -Source FeroSSH
+
+Disabled or not configured: the log is kept only in FeroSSH's own file.</string>
     </stringTable>
     <presentationTable>
       <presentation id="TeamLibrary">

@@ -15,8 +15,8 @@ use windows::Win32::UI::Controls::Dialogs::{
     OPENFILENAMEW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    HCURSOR, IDC_WAIT, IDYES, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONWARNING, MB_OK, MB_YESNO, SetCursor,
+    HCURSOR, IDC_WAIT, IDRETRY, IDYES, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_RETRYCANCEL, MB_YESNO, SetCursor,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -312,6 +312,42 @@ fn save_file(hwnd: HWND, title: PCWSTR, start: &Path, filter: PCWSTR) -> Option<
     Some(PathBuf::from(String::from_utf16_lossy(
         buf.get(..len).unwrap_or_default(),
     )))
+}
+
+/// Tools > Connection log > Save CSV: asks where (the download folder
+/// first), and while a vault is open, first warns that the file is not
+/// encrypted.
+pub(super) fn save_connection_log_csv(hwnd: HWND, text: &str) {
+    if vault::is_open()
+        && dialog(
+            hwnd,
+            "The connection log is kept encrypted with your master password, but a CSV file \
+             is plain text: anyone who can read it sees where you connected and when.\n\n\
+             Save it anyway?",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        ) != Some(IDYES)
+    {
+        return;
+    }
+    let dir = with_window(|w| w.download_dir()).unwrap_or_else(home);
+    let stamp = crate::inventory_view::iso_utc(crate::inventory_view::now())
+        .replace(['-', ':'], "")
+        .replace('T', "-")
+        .replace('Z', "");
+    let start = dir.join(format!("ferossh-connection-log-{stamp}.csv"));
+    let Some(path) = save_file(
+        hwnd,
+        w!("Save the connection log as CSV"),
+        &start,
+        w!("CSV files (*.csv)\0*.csv\0All files\0*.*\0"),
+    ) else {
+        return;
+    };
+    let note = match write_new(&path, text) {
+        Ok(()) => format!("Saved the list as {}.", path.display()),
+        Err(e) => format!("Could not save {}: {e}", path.display()),
+    };
+    crate::connlog_panel::set_note(note);
 }
 
 const EXPORT_FILTER: PCWSTR =
@@ -1273,10 +1309,31 @@ pub(super) fn remove(hwnd: HWND) {
     if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
         return;
     }
+    // Records sealed with the vault are written plain first: nothing is
+    // left that only the removed vault could open.
+    let unsealed = crate::local_store::unseal_all();
+    if !unsealed.is_empty() {
+        let text = format!(
+            "The connection log could not be written without the vault, so the master \
+             password stays:\n\n{}",
+            unsealed.join("\n")
+        );
+        dialog(hwnd, &text, MB_OK | MB_ICONERROR);
+        return;
+    }
     let removed = match vault::remove() {
         Ok(r) => r,
         Err(e) => {
-            dialog(hwnd, &e, MB_OK | MB_ICONERROR);
+            // The vault stays: so do the seals on the local records.
+            let mut text = e;
+            let problems = crate::local_store::seal_all();
+            if !problems.is_empty() {
+                text.push_str(&format!(
+                    "\n\nCould not encrypt the connection log with the vault again:\n\n{}",
+                    problems.join("\n")
+                ));
+            }
+            dialog(hwnd, &text, MB_OK | MB_ICONERROR);
             return;
         }
     };
@@ -1346,6 +1403,18 @@ pub(super) fn remove(hwnd: HWND) {
 }
 
 fn after_change() {
+    // The connection log and the inventory follow the vault: sealed while
+    // one is open.
+    let problems = crate::local_store::seal_all();
+    if !problems.is_empty() {
+        super::message(
+            &format!(
+                "Could not encrypt the connection log with the vault:\n\n{}",
+                problems.join("\n")
+            ),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
     with_window(|w| {
         w.update_menu_checks();
         w.refresh_chrome();
@@ -1390,7 +1459,25 @@ pub(super) fn unlock_at_start() -> bool {
         };
         busy();
         match vault::unlock(&path, &answer.passphrase) {
-            Ok(()) => return true,
+            Ok(()) => {
+                // Records left plain are said, with a retry (a file
+                // another program holds open, say).
+                loop {
+                    let problems = crate::local_store::seal_all();
+                    if problems.is_empty() {
+                        break;
+                    }
+                    let text = format!(
+                        "Could not encrypt the connection log with the vault; these stay \
+                         unencrypted for now:\n\n{}\n\nRetry, or Cancel to start anyway.",
+                        problems.join("\n")
+                    );
+                    if super::message(&text, MB_RETRYCANCEL | MB_ICONWARNING) != Some(IDRETRY) {
+                        break;
+                    }
+                }
+                return true;
+            }
             Err(e) => problem = Some(e.to_string()),
         }
     }

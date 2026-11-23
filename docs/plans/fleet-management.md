@@ -87,7 +87,7 @@ Fields that need the whole form (host, port, forwards, login script) stay one co
 
 **What FeroSSH had.** The status bar shows live CPU, memory and disk for the focused pane; script runs give a CSV report.
 
-**What was built.** **Tools > Inventory**, since renamed **Tools > Connection log** (Ctrl+Shift+I or a rail icon), shows a list of every connection in the tools pane:
+**What was built.** **Tools > Inventory** (Ctrl+Shift+I or a rail icon) showed a list of every connection in the tools pane. It was later renamed Connection log, and then replaced: Tools > Connection log is now a log of every connection event, and what the inventory knows shows in Tools > Hosts, one row per machine. The first version:
 
 - **Columns:** name, address, type, folder, tags, last connected, host key type, SHA-256 fingerprint, OS and kernel. A click on a heading sorts by it.
 - **Search:** the connection manager's search words, starting from its current search; plain words also match the OS, kernel and fingerprint.

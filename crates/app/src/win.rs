@@ -120,6 +120,7 @@ use crate::batch::{self, PickHost, Picker, Report, ReportRow, RowState, Run};
 use crate::broadcast;
 use crate::clipboard;
 use crate::conn_view;
+use crate::connlog_panel;
 use crate::conpty::{self, Output, Shell};
 use crate::copy_id;
 use crate::credential_panel;
@@ -141,7 +142,6 @@ use crate::hosts_panel;
 use crate::import_panel;
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
-use crate::inventory_panel;
 use crate::keymap::{self, KeyDefault, Keymap};
 use crate::known_hosts_panel;
 use crate::known_hosts_view::{self, KnownHostsView};
@@ -547,8 +547,8 @@ mod cmd {
     pub const INVENTORY: u32 = 222;
     /// Tools > Hosts.
     pub const HOSTS: u32 = 690;
-    /// Settings > Allow deleting connection log entries.
-    pub const CONNECTION_LOG_DELETE: u32 = 691;
+    // 691 was Settings > Allow deleting connection log entries: machine
+    // policy decides that now (`ConnectionLogDelete`).
     /// File > Import and export > Export team library.
     pub const TEAM_EXPORT: u32 = 692;
     /// Settings > Team library.
@@ -1513,6 +1513,16 @@ struct Window {
     /// Renames and deletes the inventory file could not take yet: done
     /// first at its next change, so it follows the connections in the end.
     inventory_pending: Vec<InventoryFix>,
+    /// Connection log: the panes whose login is up, with since when, the
+    /// login's channel and the entry's fields.
+    connlog_up: HashMap<PaneId, ConnUp>,
+    /// Connection log: the channel of each pane's login whose end was
+    /// logged, so a second end of it (a tab closed after the connection
+    /// ended) is not logged again.
+    connlog_ended: HashMap<PaneId, ChannelId>,
+    /// Connection log: `end_host` is closing the pane's session (the
+    /// user closed it, or the window is closing).
+    connlog_closing: bool,
     /// The connection form's next save was asked about the security
     /// limits it takes away, and the answer was Yes.
     form_losses_ok: Option<LossAsk>,
@@ -1828,6 +1838,13 @@ struct StatsFeed {
     latest: Option<ServerStats>,
     /// The worker stopped sampling: the server cannot run the command.
     ended: bool,
+}
+
+/// A login the connection log saw come up (see `Window::connlog_up`).
+struct ConnUp {
+    since: u64,
+    channel: ChannelId,
+    entry: ferossh_config::connlog::Entry,
 }
 
 /// Session > Copy public key to this server: [`copy_id::command`] on an
@@ -3017,6 +3034,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 system_reads: HashMap::new(),
                 inventory_renames: HashMap::new(),
                 inventory_pending: Vec::new(),
+                connlog_up: HashMap::new(),
+                connlog_ended: HashMap::new(),
+                connlog_closing: false,
                 form_losses_ok: None,
                 diffs: HashMap::new(),
                 stats: HashMap::new(),
@@ -3111,7 +3131,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         // The known hosts manager's, likewise.
         let _ = known_hosts_panel::create(hwnd, known_hosts_event, dpi);
         // The inventory's, likewise.
-        let _ = inventory_panel::create(hwnd, inventory_event, dpi);
+        let _ = connlog_panel::create(hwnd, inventory_event, dpi);
         // The hosts', likewise.
         let _ = hosts_panel::create(hwnd, hosts_event, dpi);
         // The credential manager's, likewise.
@@ -3226,7 +3246,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || files_panel::pre_translate(&msg)
                 || fwd_panel::pre_translate(&msg)
                 || known_hosts_panel::pre_translate(&msg)
-                || inventory_panel::pre_translate(&msg)
+                || connlog_panel::pre_translate(&msg)
                 || hosts_panel::pre_translate(&msg)
                 || credential_panel::pre_translate(&msg)
                 || rules_panel::pre_translate(&msg)
@@ -3681,11 +3701,6 @@ fn build_menu() -> Result<HMENU> {
         item(view, cmd::FULL_SCREEN, "F&ull screen\tF11")?;
         item(view, cmd::FULL_SCREEN_KEY, "F11 switches full scree&n")?;
         separator(view)?;
-        item(
-            view,
-            cmd::CONNECTION_LOG_DELETE,
-            "Allow deleting connection log entries",
-        )?;
         item(view, cmd::TEAM_LIBRARY, "&Team library...")?;
         separator(view)?;
         item(view, cmd::KEY_BINDINGS, "Key bin&dings...")?;
@@ -4929,7 +4944,11 @@ impl Window {
             Some(Host::Winrm(session)) => session.close(),
             _ => Vec::new(),
         };
+        self.connlog_closing = true;
         self.apply(id, effects);
+        self.connlog_closing = false;
+        self.connlog_up.remove(&id);
+        self.connlog_ended.remove(&id);
         self.stop_log(id);
         if let Some(p) = self.panes.get_mut(&id) {
             p.host = Host::Ask(String::new());
@@ -5957,6 +5976,188 @@ impl Window {
         if shown {
             self.refresh_status();
         }
+    }
+
+    /// The connection log's fields for pane `id`'s login (time and kind
+    /// to be set), and the login's channel; `None` for a pane with no
+    /// login of its own (a local shell, a tmux pane).
+    fn connlog_base(&self, id: PaneId) -> Option<(ChannelId, ferossh_config::connlog::Entry)> {
+        use ferossh_config::connlog::{Entry, Kind};
+        let entry = |protocol: &str, name: &str, address: String| Entry {
+            time: 0,
+            kind: Kind::Connected,
+            protocol: protocol.to_owned(),
+            name: name.to_owned(),
+            address,
+            via: String::new(),
+            host_key: String::new(),
+            details: String::new(),
+            target: String::new(),
+        };
+        let host_port = |host: &str, port: u16| {
+            if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            }
+        };
+        match self.panes.get(&id).map(|p| &p.host)? {
+            Host::Ssh(s) => {
+                let t = &s.target;
+                let mut e = entry(
+                    "ssh",
+                    &t.alias,
+                    format!("{}@{}", t.user, host_port(&t.hostname, t.port)),
+                );
+                let mut via: Vec<String> = Vec::new();
+                if let Some(p) = &t.proxy_server {
+                    via.push(format!("proxy {}", host_port(&p.host, p.port)));
+                }
+                if t.proxy_command.is_some() {
+                    via.push("ProxyCommand".to_owned());
+                }
+                via.extend(
+                    t.jumps
+                        .iter()
+                        .map(|j| format!("{}@{}", j.user, host_port(&j.hostname, j.port))),
+                );
+                e.via = via.join(" > ");
+                if t.sftp_only {
+                    // File transfer only: opened again as such, in its folder.
+                    e.target = crate::workspaces::sftp_address(&t.typed, t.sftp_folder.as_deref());
+                } else if t.typed != t.alias {
+                    e.target = t.typed.clone();
+                }
+                if let Some((kind, fp)) = &s.host_key_seen {
+                    e.host_key = format!("{kind} {fp}");
+                }
+                Some((s.channel, e))
+            }
+            Host::Telnet(s) => {
+                let t = &s.target;
+                Some((
+                    s.connection(),
+                    entry("telnet", &t.alias, host_port(&t.hostname, t.port)),
+                ))
+            }
+            Host::Winrm(s) => {
+                let t = &s.target;
+                let at = host_port(&t.hostname, t.port);
+                let address = match &t.user {
+                    Some(u) => format!("{u}@{at}"),
+                    None => at,
+                };
+                Some((
+                    s.connection(),
+                    entry(
+                        if t.https { "winrm-https" } else { "winrm" },
+                        &t.alias,
+                        address,
+                    ),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Writes `entry` to the connection log; a log that cannot be
+    /// written says so once per run (the event log copy, when policy asks
+    /// for one, is made anyway).
+    fn connlog_add(&mut self, entry: &ferossh_config::connlog::Entry) {
+        static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if let Err(e) = crate::connlog_store::add(entry)
+            && !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.queued.push(Command::Notice(format!(
+                "Could not write the connection log: {e}"
+            )));
+        }
+        if self.inventory_native() {
+            self.reload_inventory();
+        }
+    }
+
+    /// Pane `id` logged in: the connection log says so.
+    fn connlog_connected(&mut self, id: PaneId) {
+        let Some((channel, mut entry)) = self.connlog_base(id) else {
+            return;
+        };
+        if self
+            .connlog_up
+            .get(&id)
+            .is_some_and(|u| u.channel == channel)
+        {
+            return;
+        }
+        let now = crate::inventory_view::now();
+        entry.time = now;
+        self.connlog_add(&entry);
+        self.connlog_ended.remove(&id);
+        self.connlog_up.insert(
+            id,
+            ConnUp {
+                since: now,
+                channel,
+                entry,
+            },
+        );
+    }
+
+    /// Pane `id`'s login ended (`shown`: what the batch said about it;
+    /// `reconnects`: it tries again): the connection log says how.
+    fn connlog_ended(&mut self, id: PaneId, shown: Option<&str>, reconnects: bool) {
+        use ferossh_config::connlog::{Kind, duration};
+        let Some((channel, base)) = self.connlog_base(id) else {
+            return;
+        };
+        if self.connlog_ended.get(&id) == Some(&channel) {
+            return;
+        }
+        let now = crate::inventory_view::now();
+        let blocked = matches!(
+            self.panes.get(&id).map(|p| &p.host),
+            Some(Host::Ssh(s)) if s.state() == State::Blocked
+        );
+        let mut why = shown.map(crate::connlog_view::reason).unwrap_or_default();
+        if why.is_empty() {
+            why = if blocked {
+                "The host key changed.".to_owned()
+            } else if self.connlog_closing {
+                if self.connlog_up.contains_key(&id) {
+                    "Closed in FeroSSH.".to_owned()
+                } else {
+                    "Closed in FeroSSH before the login finished.".to_owned()
+                }
+            } else {
+                String::new()
+            };
+        }
+        let entry = match self.connlog_up.remove(&id) {
+            Some(up) if up.channel == channel => {
+                let mut e = up.entry;
+                e.kind = if reconnects {
+                    Kind::Lost
+                } else {
+                    Kind::Disconnected
+                };
+                let up_for = format!("Up {}.", duration(now.saturating_sub(up.since)));
+                e.details = if why.is_empty() {
+                    up_for
+                } else {
+                    format!("{up_for} {why}")
+                };
+                e
+            }
+            _ => {
+                let mut e = base;
+                e.kind = Kind::Failed;
+                e.details = why;
+                e
+            }
+        };
+        let entry = ferossh_config::connlog::Entry { time: now, ..entry };
+        self.connlog_ended.insert(id, channel);
+        self.connlog_add(&entry);
     }
 
     /// Pane `id` logged in: the inventory keeps when, and the host key;
@@ -8751,11 +8952,21 @@ impl Window {
         // A run's row that ended: the next host may start.
         let mut pump = false;
         let mut alone = false;
+        // For the connection log: what the batch last showed (why it
+        // ended), and whether it reconnects.
+        let mut shown: Option<String> = None;
+        let reconnects = effects.iter().any(|e| matches!(e, Effect::Reconnect));
         for effect in effects {
             if matches!(effect, Effect::Connected)
                 && let Some(p) = self.panes.get_mut(&id)
             {
                 p.escapes.reset();
+            }
+            match &effect {
+                Effect::Connected => self.connlog_connected(id),
+                Effect::Show(text) => shown = Some(text.clone()),
+                Effect::Ended => self.connlog_ended(id, shown.as_deref(), reconnects),
+                _ => {}
             }
             match effect {
                 Effect::Send(msg) => {
@@ -12918,24 +13129,22 @@ impl Window {
         self.side.visible && self.side.view == SideView::KnownHosts
     }
 
-    /// Reads the inventory and the connections again for Tools >
-    /// Inventory, and shows them.
+    /// Reads the connection log again for Tools > Connection log, and
+    /// shows it.
     fn reload_inventory(&mut self) {
         // A file that cannot be read leaves what the list showed, and
-        // says why: a reload never blanks the login history.
-        let inventory = match crate::inventory_view::read() {
-            Ok(inventory) => inventory,
+        // says why: a reload never blanks the history.
+        let (log, locked) = match crate::connlog_store::read() {
+            Ok(read) => read,
             Err(e) => {
-                inventory_panel::set_status(format!("Could not read the connection log: {e}"));
+                connlog_panel::set_status(format!("Could not read the connection log: {e}"));
                 return;
             }
         };
-        let items = host_items(&ssh_env(), &self.settings);
-        let rows = crate::inventory_view::rows(&items, &inventory, &self.settings);
-        inventory_panel::set_rows(
-            rows,
-            self.download_dir(),
-            self.settings.connection_log_delete,
+        connlog_panel::set_rows(
+            log.entries().to_vec(),
+            locked,
+            crate::machine_policy::log().may_delete(),
         );
     }
 
@@ -12947,11 +13156,11 @@ impl Window {
     /// Reads the inventory and the connections again for Tools > Hosts,
     /// and shows them taken together by machine.
     fn reload_hosts(&mut self) {
-        // As for Inventory: a file that cannot be read leaves the list.
+        // A file that cannot be read leaves the list.
         let inventory = match crate::inventory_view::read() {
             Ok(inventory) => inventory,
             Err(e) => {
-                hosts_panel::set_status(format!("Could not read the connection log: {e}"));
+                hosts_panel::set_status(format!("Could not read the inventory: {e}"));
                 return;
             }
         };
@@ -13122,7 +13331,7 @@ impl Window {
         } else if self.known_hosts_native() {
             known_hosts_panel::has_focus()
         } else if self.inventory_native() {
-            inventory_panel::has_focus()
+            connlog_panel::has_focus()
         } else if self.hosts_native() {
             hosts_panel::has_focus()
         } else if self.credentials_native() {
@@ -13209,9 +13418,9 @@ impl Window {
             known_hosts_panel::place(None, 0, self.dpi);
         }
         if self.inventory_native() {
-            inventory_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+            connlog_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
-            inventory_panel::place(None, 0, self.dpi);
+            connlog_panel::place(None, 0, self.dpi);
         }
         if self.hosts_native() {
             hosts_panel::place(self.areas.side, self.areas.side_width, self.dpi);
@@ -17306,7 +17515,9 @@ impl Window {
                 unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
                 return;
             }
-            if let Err(e) = launch_rdp_client(&addr, size, clipboard) {
+            let started = launch_rdp_client(&addr, size, clipboard);
+            self.connlog_add(&connlog_rdp(name, &addr, started.as_ref().err()));
+            if let Err(e) = started {
                 self.queued.push(Command::Notice(format!(
                     "Remote Desktop Connection (mstsc.exe) did not start: {e}"
                 )));
@@ -20002,16 +20213,6 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
-            cmd::CONNECTION_LOG_DELETE => {
-                self.settings.connection_log_delete = !self.settings.connection_log_delete;
-                self.save_settings();
-                self.update_menu_checks();
-                if self.inventory_native() {
-                    // Delete... shows or goes.
-                    self.reload_inventory();
-                    self.refresh_chrome();
-                }
-            }
             cmd::FONT_LIGATURES => {
                 self.settings.font_ligatures = !self.settings.font_ligatures;
                 self.save_settings();
@@ -21539,7 +21740,6 @@ impl Window {
                 (cmd::FULL_SCREEN, self.full_screen.is_some()),
                 (cmd::FULL_SCREEN_KEY, s.full_screen_key),
                 (cmd::FONT_LIGATURES, s.font_ligatures),
-                (cmd::CONNECTION_LOG_DELETE, s.connection_log_delete),
                 (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),
                 (
@@ -23992,6 +24192,34 @@ fn launch_vnc_viewer(addr: &str, (to_host, from_host): (bool, bool)) -> Option<&
     c.arg(target).spawn().ok().map(|_| name)
 }
 
+/// The log entry for a Remote Desktop Connection started on its own
+/// (no SSH tunnel): opened, or failed with why.
+fn connlog_rdp(
+    name: &str,
+    addr: &str,
+    error: Option<&std::io::Error>,
+) -> ferossh_config::connlog::Entry {
+    use ferossh_config::connlog::{Entry, Kind};
+    Entry {
+        time: crate::inventory_view::now(),
+        kind: if error.is_some() {
+            Kind::Failed
+        } else {
+            Kind::Opened
+        },
+        protocol: "rdp".into(),
+        name: name.to_owned(),
+        address: addr.to_owned(),
+        via: String::new(),
+        host_key: String::new(),
+        details: error.map_or_else(
+            || "Remote Desktop Connection started.".to_owned(),
+            |e| format!("Remote Desktop Connection did not start: {e}"),
+        ),
+        target: String::new(),
+    }
+}
+
 /// Opens Remote Desktop Connection on `addr`, at `size` when one is set
 /// (else at its own default). Its own settings share the clipboard; with
 /// `clipboard` false it opens a connection file that turns that off
@@ -24541,7 +24769,7 @@ fn tools_have_focus() -> bool {
         || script_hosts::has_focus()
         || script_report::has_focus()
         || known_hosts_panel::has_focus()
-        || inventory_panel::has_focus()
+        || connlog_panel::has_focus()
         || hosts_panel::has_focus()
         || credential_panel::has_focus()
         || rules_panel::has_focus()
@@ -25142,9 +25370,9 @@ impl InventoryFix {
     }
 }
 
-/// Carries out what the user did in the inventory.
-fn inventory_event(hwnd: HWND, event: inventory_panel::Event) {
-    use inventory_panel::Event;
+/// Carries out what the user did in the connection log.
+fn inventory_event(hwnd: HWND, event: connlog_panel::Event) {
+    use connlog_panel::Event;
     match event {
         Event::Connect(host) => {
             if let Some(Some(command)) =
@@ -25159,30 +25387,34 @@ fn inventory_event(hwnd: HWND, event: inventory_panel::Event) {
                 w.refresh_chrome();
             });
         }
-        Event::Delete(name) => {
-            if with_window(|w| w.settings.connection_log_delete) != Some(true) {
+        Event::Delete(entries) => {
+            if !crate::machine_policy::log().may_delete() {
                 return;
             }
-            let question = format!(
-                "Forget what the connection log holds about {}: when you last connected, the \
-                 host key it showed, and its OS and kernel? The connection itself stays; the \
-                 next login logs it again.",
-                crate::ssh::sanitize_line(&name)
-            );
+            let question = match entries.as_slice() {
+                [one] => format!(
+                    "Delete this entry from the connection log?\n\n{} {} {}",
+                    crate::connlog_view::text(one, crate::connlog_view::Column::Time, |t| {
+                        crate::files_panel::when_seconds(i64::try_from(t).ok())
+                    }),
+                    one.kind.title(),
+                    crate::ssh::sanitize_line(&one.name)
+                ),
+                many => format!(
+                    "Delete these {} entries from the connection log?",
+                    many.len()
+                ),
+            };
             if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
                 return;
             }
-            let next = with_window(|w| {
-                // A read still under way would write its OS back.
-                w.system_reads
-                    .retain(|_, r| !r.alias.eq_ignore_ascii_case(&name));
-                w.update_inventory(Some(InventoryFix::Remove(vec![name])), |_| {});
-                w.reload_inventory();
-                std::mem::take(&mut w.queued)
-            })
-            .unwrap_or_default();
-            run_commands(hwnd, next);
+            if let Err(e) = crate::connlog_store::remove(&entries) {
+                connlog_panel::set_status(format!("Could not delete: {e}"));
+                return;
+            }
+            with_window(Window::reload_inventory);
         }
+        Event::SaveCsv(text) => vault_ui::save_connection_log_csv(hwnd, &text),
         Event::Focused => tools_focused(),
         Event::Leave => {
             with_window(Window::focus_terminal);
@@ -26774,7 +27006,7 @@ fn run_command(hwnd: HWND, command: Command) {
                     known_hosts_panel::paste(&text);
                 }
                 if with_window(|w| w.inventory_paste()) == Some(true) {
-                    inventory_panel::paste(&text);
+                    connlog_panel::paste(&text);
                 }
                 if with_window(|w| w.hosts_paste()) == Some(true) {
                     hosts_panel::paste(&text);
@@ -27158,7 +27390,15 @@ fn run_command(hwnd: HWND, command: Command) {
             );
             match dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
                 Some(IDYES) => {
-                    if let Err(e) = launch_rdp_client(&addr, size, clipboard) {
+                    let started = launch_rdp_client(&addr, size, clipboard);
+                    let entry = connlog_rdp(&name, &addr, started.as_ref().err());
+                    let next = with_window(|w| {
+                        w.connlog_add(&entry);
+                        std::mem::take(&mut w.queued)
+                    })
+                    .unwrap_or_default();
+                    run_commands(hwnd, next);
+                    if let Err(e) = started {
                         dialog(
                             hwnd,
                             &format!("Remote Desktop Connection (mstsc.exe) did not start: {e}"),
@@ -29655,7 +29895,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         known_hosts_panel::focus_search();
                     }
                     1 if want && with_window(|w| w.inventory_native()) == Some(true) => {
-                        inventory_panel::focus_search();
+                        connlog_panel::focus_search();
                     }
                     1 if want && with_window(|w| w.hosts_native()) == Some(true) => {
                         hosts_panel::focus_search();

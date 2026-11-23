@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- FeroSSH machine policy: the team library every user of the PC must use.
+<!-- FeroSSH machine policy: the team library every user of the PC must use,
+     and what users may do with the connection log.
      Copy FeroSSH.admx to C:\Windows\PolicyDefinitions (or the domain's
      Central Store) and en-US\FeroSSH.adml to its en-US folder, or import
      both into Intune (Devices > Configuration > Import ADMX).
-     See docs/admin/team-library-policy.md. -->
+     See docs/admin/team-library-policy.md and
+     docs/admin/connection-log-policy.md. -->
 <policyDefinitions xmlns:xsd="http://www.w3.org/2001/XMLSchema"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                    revision="1.0" schemaVersion="1.0"
@@ -16,6 +18,7 @@
   <supportedOn>
     <definitions>
       <definition name="SUPPORTED_FeroSSH_TeamPolicy" displayName="$(string.SUPPORTED_FeroSSH_TeamPolicy)" />
+      <definition name="SUPPORTED_FeroSSH_LogPolicy" displayName="$(string.SUPPORTED_FeroSSH_LogPolicy)" />
     </definitions>
   </supportedOn>
   <categories>
@@ -49,6 +52,24 @@
             key="Software\Policies\FeroSSH" valueName="OnlyTeamConnections">
       <parentCategory ref="FeroSSH" />
       <supportedOn ref="SUPPORTED_FeroSSH_TeamPolicy" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="ConnectionLogDelete" class="Machine"
+            displayName="$(string.ConnectionLogDelete)"
+            explainText="$(string.ConnectionLogDelete_Explain)"
+            key="Software\Policies\FeroSSH" valueName="ConnectionLogDelete">
+      <parentCategory ref="FeroSSH" />
+      <supportedOn ref="SUPPORTED_FeroSSH_LogPolicy" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="ConnectionLogEventLog" class="Machine"
+            displayName="$(string.ConnectionLogEventLog)"
+            explainText="$(string.ConnectionLogEventLog_Explain)"
+            key="Software\Policies\FeroSSH" valueName="ConnectionLogEventLog">
+      <parentCategory ref="FeroSSH" />
+      <supportedOn ref="SUPPORTED_FeroSSH_LogPolicy" />
       <enabledValue><decimal value="1" /></enabledValue>
       <disabledValue><decimal value="0" /></disabledValue>
     </policy>
