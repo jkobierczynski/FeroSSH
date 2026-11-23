@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                           revision="1.0" schemaVersion="1.0"
+                           xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <displayName>FeroSSH</displayName>
+  <description>Machine policy for the FeroSSH SSH client.</description>
+  <resources>
+    <stringTable>
+      <string id="FeroSSH">FeroSSH</string>
+      <string id="SUPPORTED_FeroSSH_TeamPolicy">FeroSSH with team library policy support</string>
+
+      <string id="TeamLibrary">Use this team library</string>
+      <string id="TeamLibrary_Explain">Sets the team library every user of this PC uses: a .ferossh-library file exported from FeroSSH and signed with ssh-keygen -Y sign -n ferossh-library, with its .sig file beside it.
+
+While this policy is enabled, the Team library path and signing key in each user's own FeroSSH settings are ignored, also for a portable FeroSSH (FeroSSH-data folder) and whatever settings file is used. Users see the library in Settings > Team library but cannot change or turn it off. The library's connections cannot be changed or replaced by a connection of the same name, and its security rules cannot be loosened.
+
+Library file: the full path, for example \\server\share\team.ferossh-library. Environment variables are not expanded.
+
+Signing keys: one OpenSSH public key line per entry (ssh-ed25519 AAAA... admin), as in the administrator's .pub file. The library must be signed by one of them.
+
+Enabling this also makes FeroSSH connect nowhere while it cannot read a good library or its checked copy, unless "Require the team library to connect" is disabled.
+
+This only binds users who are not administrators of the PC: an administrator can remove the policy. Use application control (AppLocker or WDAC) to stop users running another SSH client or an older FeroSSH.</string>
+
+      <string id="RequireTeamLibrary">Require the team library to connect</string>
+      <string id="RequireTeamLibrary_Explain">Applies while "Use this team library" is enabled.
+
+Enabled or not configured: FeroSSH connects nowhere (SSH, SFTP, Telnet, WinRM, Remote Desktop) while it cannot read a team library with a good signature, and has no checked copy of one from an earlier read. Local shells and serial ports still open.
+
+Disabled: without a good library FeroSSH connects as if there were none, with the user's own connections and rules.</string>
+
+      <string id="OnlyTeamConnections">Allow only the team library's connections</string>
+      <string id="OnlyTeamConnections_Explain">Applies while "Use this team library" is enabled.
+
+Enabled: FeroSSH opens only the team library's connections, each exactly as the library defines it. Addresses typed at Connect to..., the user's own saved and imported connections, and their ~/.ssh/config are not used, and every jump host on the way must be a team connection too. Each user's own named credential (user, key and password) still applies to a team connection that names it. Without a good library FeroSSH connects nowhere.
+
+Disabled or not configured: users can also open their own connections, under the team's security rules.</string>
+    </stringTable>
+    <presentationTable>
+      <presentation id="TeamLibrary">
+        <textBox refId="TeamLibraryPath">
+          <label>Library file:</label>
+        </textBox>
+        <listBox refId="TrustedKeys">Signing keys (one public key per entry):</listBox>
+      </presentation>
+    </presentationTable>
+  </resources>
+</policyDefinitionResources>

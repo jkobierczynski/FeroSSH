@@ -2077,6 +2077,20 @@ fn ssh_env() -> Env {
         // applies to every host.
         config.push_str("\nHost *\n");
     }
+    // Team connections only, by machine policy: each exactly as the
+    // library defines it (with the user's own credential), nothing of the
+    // user's ssh_config, saved or imported connections.
+    let only_team = crate::machine_policy::team().is_some_and(|p| p.only_team_connections);
+    if only_team {
+        return Env {
+            local_user: std::env::var("USERNAME").unwrap_or_default(),
+            home,
+            config,
+            vars: std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect(),
+        };
+    }
     config.push_str(&std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default());
     if let Ok(made) = app_read(&sessions_path()) {
         // A Host line first: the user's last block must not swallow it.
@@ -2826,11 +2840,20 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let mut settings = load_settings();
         // The team library's checked copy at once (connections may start
         // before the share answers); the share is read in the background.
-        settings.team = crate::team_lib::cached(
+        // The machine policy's library while one is set, else the user's.
+        let (library, keys) = crate::machine_policy::team_source(
             settings.team_library.as_deref(),
             &settings.team_library_keys,
-            &app_dir(),
         );
+        settings.team = crate::team_lib::cached(library.as_deref(), &keys, &app_dir());
+        // A policy that requires the library connects nowhere without it:
+        // with no checked copy yet (the first start on this PC), the share
+        // is read now, so a connection given on the command line is not
+        // refused only because the background read had not finished.
+        if crate::machine_policy::team().is_some() && !settings.team.verified && library.is_some() {
+            settings.team =
+                crate::team_lib::load(library.as_deref(), &keys, &app_dir(), &|| true).team;
+        }
         crate::team_lib::set_current(settings.team.clone());
         load_snippets(&mut settings);
         KEY_OPTIONS.set(key_options(&settings));
@@ -7423,6 +7446,55 @@ impl Window {
         self.connect_to(id, target, &env);
     }
 
+    /// What the machine policy for the team library says about connecting
+    /// to `names` (the connection, then its jump hosts) now.
+    fn team_policy_check(
+        &self,
+        names: &[&str],
+    ) -> std::result::Result<(), ferossh_config::team_policy::Blocked> {
+        ferossh_config::team_policy::check(
+            crate::machine_policy::team().as_ref(),
+            &self.settings.team,
+            names,
+        )
+    }
+
+    /// Whether the machine policy stops pane `id` connecting to `names`;
+    /// when it does, the pane says why and asks for another destination.
+    fn team_policy_blocks(&mut self, id: PaneId, names: &[&str]) -> bool {
+        let Err(why) = self.team_policy_check(names) else {
+            return false;
+        };
+        self.show(
+            id,
+            &format!(
+                "\x1b[0;31m{}\x1b[0m\r\n",
+                crate::ssh::sanitize_line(&why.to_string())
+            ),
+        );
+        self.ask_destination(id);
+        self.refresh(id);
+        true
+    }
+
+    /// The name the policy checks for a Telnet or WinRM session: the saved
+    /// connection's, when `alias` is one of type `kind`; else the typed
+    /// address (`scheme` and `hostname`), which no team connection is
+    /// called, so a typed `telnet://web` is not the team's `web`.
+    fn saved_kind_name(
+        &self,
+        alias: &str,
+        kind: SessionKind,
+        scheme: &str,
+        hostname: &str,
+    ) -> String {
+        if self.settings.profile(alias).is_some_and(|p| p.kind == kind) {
+            alias.to_owned()
+        } else {
+            format!("{scheme}{hostname}")
+        }
+    }
+
     /// What the security rules forbid for connection `alias` (reaching
     /// `hostname`, with ssh_config's `Tag` `tag`).
     fn policy_of(&self, alias: &str, hostname: Option<&str>, tag: Option<&str>) -> Policy {
@@ -8043,6 +8115,11 @@ impl Window {
     /// connection: no second login.
     fn connect_to(&mut self, id: PaneId, mut target: Target, env: &Env) {
         self.end_host(id);
+        let mut names: Vec<&str> = vec![&target.alias];
+        names.extend(target.jumps.iter().map(|j| j.alias.as_str()));
+        if self.team_policy_blocks(id, &names) {
+            return;
+        }
         // The profile decides, every time: a reconnect or a split passes
         // the old target back, which may predate a change of type.
         target.mosh = self
@@ -8253,6 +8330,15 @@ impl Window {
     /// own: Telnet is parsed in the sandbox too.
     fn connect_telnet(&mut self, id: PaneId, target: TelnetTarget) {
         self.end_host(id);
+        let name = self.saved_kind_name(
+            &target.alias,
+            SessionKind::Telnet,
+            "telnet://",
+            &target.hostname,
+        );
+        if self.team_policy_blocks(id, &[&name]) {
+            return;
+        }
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
         }
@@ -8292,6 +8378,15 @@ impl Window {
     /// connection's password source (it just failed) and asks.
     fn connect_winrm_with(&mut self, id: PaneId, mut target: WinrmTarget, ask: bool) {
         self.end_host(id);
+        let name = self.saved_kind_name(
+            &target.alias,
+            SessionKind::WinRm,
+            "winrm://",
+            &target.hostname,
+        );
+        if self.team_policy_blocks(id, &[&name]) {
+            return;
+        }
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
         }
@@ -16856,8 +16951,28 @@ impl Window {
     /// that does not answer must not hold up the window);
     /// [`Self::poll_team`] puts it to use.
     fn refresh_team(&mut self) {
-        let library = self.settings.team_library.clone();
-        let keys = self.settings.team_library_keys.clone();
+        // The machine policy read again (Group Policy may have changed it):
+        // its library while one is set, whatever the settings say.
+        let policy = crate::machine_policy::reload();
+        let (library, keys) = crate::machine_policy::team_source(
+            self.settings.team_library.as_deref(),
+            &self.settings.team_library_keys,
+        );
+        if policy
+            .as_ref()
+            .is_some_and(|p| p.library.is_none() || p.keys.is_empty())
+        {
+            self.use_team(crate::team_lib::Loaded {
+                team: ferossh_config::team::Team::default(),
+                note: Some(
+                    "Your administrator's policy for the team library names no library file \
+                     or no signing key, so FeroSSH cannot read it. Ask your administrator to \
+                     complete the FeroSSH policy."
+                        .to_owned(),
+                ),
+            });
+            return;
+        }
         // Whatever an earlier read finds is no longer wanted.
         self.team_read += 1;
         crate::team_lib::newest(&self.team_latest, self.team_read);
@@ -17160,6 +17275,10 @@ impl Window {
                     "A VNC or virtual desktop goes through an SSH connection. Choose one under \
                      Via SSH in the connection form (F2 on {name})."
                 )));
+                return;
+            }
+            if let Err(why) = self.team_policy_check(&[name]) {
+                self.queued.push(Command::Notice(why.to_string()));
                 return;
             }
             let host = cfg.hostname.unwrap_or_else(|| name.to_owned());
@@ -25213,6 +25332,34 @@ fn rules_event(hwnd: HWND, event: rules_panel::Event) {
 /// must be signed with. Saved, then read again at once.
 fn team_library_settings(hwnd: HWND) {
     if DIALOG_OPEN.get() {
+        return;
+    }
+    // Set by the machine policy: shown, not changed here.
+    if let Some(p) = crate::machine_policy::team() {
+        let keys = if p.keys.is_empty() {
+            "none".to_owned()
+        } else {
+            p.keys
+                .iter()
+                .map(|k| crate::ssh::sanitize_line(k))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut text = format!(
+            "Your administrator sets the team library on this PC, so it cannot be changed \
+             or turned off here.\n\nLibrary file: {}\n\nSigning keys:\n{keys}",
+            p.library
+                .as_deref()
+                .map_or_else(|| "none".to_owned(), crate::ssh::sanitize_line)
+        );
+        if p.only_team_connections {
+            text.push_str("\n\nOnly the team library's connections can be opened.");
+        } else if p.require_library {
+            text.push_str("\n\nFeroSSH connects nowhere while it cannot read the library.");
+        }
+        DIALOG_OPEN.set(true);
+        dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        DIALOG_OPEN.set(false);
         return;
     }
     let Some((library, key)) = with_window(|w| {
