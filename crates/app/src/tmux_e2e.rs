@@ -582,7 +582,8 @@ fn real_tmux_counts_the_other_clients_of_the_session() {
     };
     let mut a = Harness::attach(&server, Mode::Tmux);
     a.until("the first client's pane", |h| !h.panes.is_empty());
-    a.until("the first count", |h| h.tmux.others_attached() == 0);
+    a.until("the first count", |h| !h.tmux.maybe_shared());
+    assert_eq!(a.tmux.others_attached(), 0);
 
     // A second connection to the same session: both know of the other,
     // the first from tmux's notification.
@@ -592,6 +593,7 @@ fn real_tmux_counts_the_other_clients_of_the_session() {
         h.tmux.others_attached() == 1
     });
     a.until("the first client told", |h| h.tmux.others_attached() == 1);
+    assert!(a.tmux.maybe_shared() && b.tmux.maybe_shared());
 
     // The second one leaves by detaching: the session and its window stay
     // for the first, which counts itself alone again (tmux 3.2 and later
@@ -600,7 +602,7 @@ fn real_tmux_counts_the_other_clients_of_the_session() {
     b.apply(actions);
     b.until("the detach", |h| !h.tmux.active());
     if version() >= (Version { major: 3, minor: 2 }) {
-        a.until("the first client alone", |h| h.tmux.others_attached() == 0);
+        a.until("the first client alone", |h| !h.tmux.maybe_shared());
     }
     assert!(a.tmux.active());
     assert_eq!(a.shown(), 1);

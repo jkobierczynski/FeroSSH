@@ -23016,6 +23016,12 @@ impl Window {
 
     fn close_tab(&mut self, i: usize) -> Option<Command> {
         let ids = self.ws.tabs.get(i).map(|t| t.root.panes())?;
+        self.close_panes(ids)
+    }
+
+    /// Closes panes `ids`. A tmux session other clients show too asks
+    /// first; the rest close after the answer.
+    fn close_panes(&mut self, ids: Vec<PaneId>) -> Option<Command> {
         if let Some(shared) = self.shared_close(&ids) {
             return Some(Command::CloseShared(shared));
         }
@@ -23036,13 +23042,12 @@ impl Window {
         let (gateway, t) = ids.iter().find_map(|id| {
             let gateway = self.panes.get(id).and_then(Pane::gateway)?;
             let t = self.tmux.get(&gateway).filter(|t| t.active())?;
-            (t.others_attached() > 0).then_some((gateway, t))
+            t.maybe_shared().then_some((gateway, t))
         })?;
-        let panes = ids
+        let (panes, rest) = ids
             .iter()
             .copied()
-            .filter(|id| self.panes.get(id).and_then(Pane::gateway) == Some(gateway))
-            .collect();
+            .partition(|id| self.panes.get(id).and_then(Pane::gateway) == Some(gateway));
         let tabs = self
             .ws
             .tabs
@@ -23062,28 +23067,36 @@ impl Window {
             host: self.key_host(gateway).unwrap_or_default(),
             others: t.others_attached(),
             tabs,
+            rest,
         })
     }
 
     /// The user's answer about a shared tmux session: `detach` leaves it
     /// to the other clients and closes this connection once detached;
-    /// otherwise the panes close in tmux, for every client.
-    fn close_shared(&mut self, shared: &SharedClose, detach: bool) {
+    /// otherwise the panes close in tmux, for every client. The other
+    /// panes asked to close close then.
+    fn close_shared(&mut self, shared: SharedClose, detach: bool) -> Option<Command> {
         let gateway = shared.gateway;
-        let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active()) else {
-            return;
-        };
         // Queued output can switch or end the session before the answer.
-        if t.session_id() != Some(shared.session) {
-            return;
+        if let Some(t) = self
+            .tmux
+            .get_mut(&gateway)
+            .filter(|t| t.active() && t.session_id() == Some(shared.session))
+        {
+            let actions = if detach {
+                self.close_after_detach.insert(gateway);
+                t.detach()
+            } else {
+                shared.panes.iter().flat_map(|p| t.close(*p)).collect()
+            };
+            self.run_tmux(gateway, actions);
         }
-        let actions = if detach {
-            self.close_after_detach.insert(gateway);
-            t.detach()
-        } else {
-            shared.panes.iter().flat_map(|p| t.close(*p)).collect()
-        };
-        self.run_tmux(gateway, actions);
+        let rest: Vec<PaneId> = shared
+            .rest
+            .into_iter()
+            .filter(|id| self.panes.contains_key(id))
+            .collect();
+        self.close_panes(rest)
     }
 }
 
@@ -23100,6 +23113,8 @@ struct SharedClose {
     others: u32,
     /// Tabs this window shows the session in.
     tabs: usize,
+    /// The other panes asked to close, closed after the answer.
+    rest: Vec<PaneId>,
 }
 
 /// What a menu item's text becomes: its shortcut after a tab (none:
@@ -26397,7 +26412,10 @@ fn run_command(hwnd: HWND, command: Command) {
             });
         }
         Command::CloseShared(shared) => {
-            let clients = if shared.others == 1 {
+            let clients = if shared.others == 0 {
+                // tmux has not said yet after a client came or went.
+                "Another client (another FeroSSH connection or a terminal) may be".to_owned()
+            } else if shared.others == 1 {
                 "Another client (another FeroSSH connection or a terminal) is".to_owned()
             } else {
                 format!(
@@ -26436,7 +26454,9 @@ fn run_command(hwnd: HWND, command: Command) {
                 Some(IDNO) => false,
                 _ => return,
             };
-            with_window(|w| w.close_shared(&shared, detach));
+            if let Some(next) = with_window(|w| w.close_shared(shared, detach)).flatten() {
+                run_command(hwnd, next);
+            }
         }
         Command::CloseTabNow(i) => {
             if let Some(next) = with_window(|w| w.close_tab(i)).flatten() {
