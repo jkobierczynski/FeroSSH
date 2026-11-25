@@ -459,10 +459,10 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::FOCUS + 1, Split, &["Alt+Right"]),
         d(cmd::FOCUS + 2, Split, &["Alt+Up"]),
         d(cmd::FOCUS + 3, Split, &["Alt+Down"]),
-        // Next to Ctrl+Shift+C: copy, Ctrl+Shift+X back to the pane you
-        // came from and paste. (Ctrl+Shift+F is Find in scrollback.)
-        d(cmd::LAST_PANE, Always, &["Ctrl+Shift+Z"]),
-        d(cmd::LAST_PANE_PASTE, Always, &["Ctrl+Shift+X"]),
+        // O for the other pane; V pastes, as in Ctrl+Shift+V. (Ctrl+Shift+X
+        // and Z read as cut and undo; Ctrl+Shift+F is Find in scrollback.)
+        d(cmd::LAST_PANE, Always, &["Ctrl+Shift+O"]),
+        d(cmd::LAST_PANE_PASTE, Always, &["Alt+Shift+V"]),
         d(cmd::RESIZE, Split, &["Alt+Shift+Left"]),
         d(cmd::RESIZE + 1, Split, &["Alt+Shift+Right"]),
         d(cmd::RESIZE + 2, Split, &["Alt+Shift+Up"]),
@@ -3776,12 +3776,12 @@ fn build_menu() -> Result<HMENU> {
         item(
             window,
             cmd::LAST_PANE,
-            "Back to the las&t pane\tCtrl+Shift+Z",
+            "Back to the las&t pane\tCtrl+Shift+O",
         )?;
         item(
             window,
             cmd::LAST_PANE_PASTE,
-            "Back to the last pane and pa&ste\tCtrl+Shift+X",
+            "Back to the last pane and pa&ste\tAlt+Shift+V",
         )?;
         separator(window)?;
         for (i, (name, key)) in names.iter().zip(keys).enumerate() {
