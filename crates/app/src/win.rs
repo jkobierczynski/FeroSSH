@@ -459,6 +459,10 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::FOCUS + 1, Split, &["Alt+Right"]),
         d(cmd::FOCUS + 2, Split, &["Alt+Up"]),
         d(cmd::FOCUS + 3, Split, &["Alt+Down"]),
+        // Next to Ctrl+Shift+C: copy, Ctrl+Shift+X back to the pane you
+        // came from and paste. (Ctrl+Shift+F is Find in scrollback.)
+        d(cmd::LAST_PANE, Always, &["Ctrl+Shift+Z"]),
+        d(cmd::LAST_PANE_PASTE, Always, &["Ctrl+Shift+X"]),
         d(cmd::RESIZE, Split, &["Alt+Shift+Left"]),
         d(cmd::RESIZE + 1, Split, &["Alt+Shift+Right"]),
         d(cmd::RESIZE + 2, Split, &["Alt+Shift+Up"]),
@@ -709,6 +713,10 @@ mod cmd {
     pub const SHOW_HIDDEN: u32 = 709;
     /// Plus 0-3: left, right, up, down.
     pub const FOCUS: u32 = 710;
+    /// Window > Back to the last pane, and Back to the last pane and
+    /// paste: the pane focused before this one, in any tab.
+    pub const LAST_PANE: u32 = 714;
+    pub const LAST_PANE_PASTE: u32 = 715;
     /// Plus 0-3: left, right, up, down.
     pub const RESIZE: u32 = 720;
     pub const BROADCAST_TAB: u32 = 730;
@@ -1379,6 +1387,9 @@ struct Window {
     /// tmux's `l` and `;`.
     last_tab_pane: Option<PaneId>,
     last_pane: Option<PaneId>,
+    /// The focused pane and the one before it, in any tab, for Window >
+    /// Back to the last pane.
+    focus_trail: layout::FocusTrail,
     mouse: Mouse,
     drag: Option<Drag>,
     /// The last left click on a tab: when, and which, for double-clicks.
@@ -2974,6 +2985,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 tmux_repeat: None,
                 last_tab_pane: None,
                 last_pane: None,
+                focus_trail: layout::FocusTrail::default(),
                 mouse: Mouse::default(),
                 drag: None,
                 tab_click: None,
@@ -3761,6 +3773,16 @@ fn build_menu() -> Result<HMENU> {
                 &format!("Focus pane {name}\tAlt+{key}"),
             )?;
         }
+        item(
+            window,
+            cmd::LAST_PANE,
+            "Back to the las&t pane\tCtrl+Shift+Z",
+        )?;
+        item(
+            window,
+            cmd::LAST_PANE_PASTE,
+            "Back to the last pane and pa&ste\tCtrl+Shift+X",
+        )?;
         separator(window)?;
         for (i, (name, key)) in names.iter().zip(keys).enumerate() {
             item(
@@ -19112,6 +19134,7 @@ impl Window {
 
     /// After tabs or panes changed: lay out, redraw, retitle.
     fn after_structure_change(&mut self) {
+        self.track_focus();
         let looking = self.focused;
         if let Some(p) = self.panes.get_mut(&self.ws.focused()) {
             p.bell = false;
@@ -19231,6 +19254,7 @@ impl Window {
         if !self.ws.focus(id) {
             return;
         }
+        self.track_focus();
         if before != id {
             if tab_before == self.ws.active {
                 self.last_pane = Some(before);
@@ -19269,6 +19293,21 @@ impl Window {
             // The focus frame moves.
             self.request_full_redraw();
         }
+    }
+
+    /// Notes the focused pane in [`Self::focus_trail`]; called wherever
+    /// the focus can move (focusing a pane, a tab, a split, a pane closing).
+    fn track_focus(&mut self) {
+        let now = self.ws.focused();
+        let ws = &self.ws;
+        self.focus_trail.seen(now, |p| ws.tab_of(p).is_some());
+    }
+
+    /// The pane Window > Back to the last pane goes to, if it is open.
+    fn back_pane(&self) -> Option<PaneId> {
+        let ws = &self.ws;
+        self.focus_trail
+            .back(ws.focused(), |p| ws.tab_of(p).is_some())
     }
 
     fn select_tab(&mut self, i: usize) {
@@ -20386,6 +20425,21 @@ impl Window {
                 }
             }
             cmd::HIDE_PANE => return self.hide_pane(pane),
+            cmd::LAST_PANE | cmd::LAST_PANE_PASTE => {
+                // Nothing to go back to: no paste either, so that it does
+                // not land in the pane it was copied from.
+                let back = self.back_pane()?;
+                let from_tools = self.side.focused;
+                self.focus_pane(back);
+                if from_tools {
+                    // Pressed in a tool pane's control: the keyboard goes
+                    // back to the window (see `WM_TOOLS_FOCUS`).
+                    self.layout();
+                }
+                if id == cmd::LAST_PANE_PASTE {
+                    return Some(Command::Paste);
+                }
+            }
             cmd::SHOW_HIDDEN => {
                 if let Some(&last) = self.ws.hidden().last() {
                     self.show_hidden(last);
@@ -21919,6 +21973,8 @@ impl Window {
                 self.ws.all_panes().len() > 1 && !self.locked(pane),
             ),
             (cmd::SHOW_HIDDEN, !self.ws.hidden().is_empty()),
+            (cmd::LAST_PANE, self.back_pane().is_some()),
+            (cmd::LAST_PANE_PASTE, self.back_pane().is_some()),
             (cmd::NOTIFY_BELL, self.settings.notifications),
             (
                 cmd::NOTIFY_QUIET,

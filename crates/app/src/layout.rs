@@ -518,6 +518,35 @@ enum Back {
     Tab(usize),
 }
 
+/// The focused pane and the one focused before it, in any tab, for
+/// Window > Back to the last pane (and to paste there).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FocusTrail {
+    current: Option<PaneId>,
+    previous: Option<PaneId>,
+}
+
+impl FocusTrail {
+    /// Notes that pane `now` has the focus. The pane that had it is
+    /// remembered while it is still `open` (in a tab): a pane that closed
+    /// or was hidden is not, so the one before it stays.
+    pub fn seen(&mut self, now: PaneId, open: impl Fn(PaneId) -> bool) {
+        if self.current == Some(now) {
+            return;
+        }
+        if let Some(old) = self.current.filter(|p| open(*p)) {
+            self.previous = Some(old);
+        }
+        self.current = Some(now);
+    }
+
+    /// The pane to go back to from `now`: the one focused before, while
+    /// it is still open.
+    pub fn back(&self, now: PaneId, open: impl Fn(PaneId) -> bool) -> Option<PaneId> {
+        self.previous.filter(|p| *p != now && open(*p))
+    }
+}
+
 /// A pane taken out of the tabs that keeps running.
 #[derive(Clone, Debug, PartialEq)]
 struct Hidden {
@@ -963,6 +992,44 @@ mod tests {
     use super::*;
 
     const AREA: Rect = Rect::new(0, 0, 1001, 601);
+
+    #[test]
+    fn focus_trail_goes_back_and_forth_and_skips_closed_panes() {
+        let mut open = vec![1, 2, 3];
+        let mut t = FocusTrail::default();
+        let is_open = |o: &Vec<PaneId>| {
+            let o = o.clone();
+            move |p: PaneId| o.contains(&p)
+        };
+        t.seen(1, is_open(&open));
+        assert_eq!(
+            t.back(1, is_open(&open)),
+            None,
+            "nothing before the first pane"
+        );
+        t.seen(2, is_open(&open));
+        t.seen(2, is_open(&open));
+        assert_eq!(t.back(2, is_open(&open)), Some(1));
+        // Going back and back again toggles between the two.
+        t.seen(1, is_open(&open));
+        assert_eq!(t.back(1, is_open(&open)), Some(2));
+        t.seen(2, is_open(&open));
+        assert_eq!(t.back(2, is_open(&open)), Some(1));
+        // A new pane (a split): back is the pane it came from.
+        open.push(4);
+        t.seen(4, is_open(&open));
+        assert_eq!(t.back(4, is_open(&open)), Some(2));
+        // The focused pane closes and the focus moves to 2: the pane
+        // before is still 2, which is where we are, so no back.
+        open.retain(|p| *p != 4);
+        t.seen(2, is_open(&open));
+        assert_eq!(t.back(2, is_open(&open)), None);
+        // A remembered pane that closes (or hides) is not offered.
+        t.seen(3, is_open(&open));
+        assert_eq!(t.back(3, is_open(&open)), Some(2));
+        open.retain(|p| *p != 2);
+        assert_eq!(t.back(3, is_open(&open)), None);
+    }
 
     #[test]
     fn places_panes_from_outside() {
