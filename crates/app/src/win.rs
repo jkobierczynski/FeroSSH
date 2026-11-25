@@ -459,11 +459,11 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::FOCUS + 1, Split, &["Alt+Right"]),
         d(cmd::FOCUS + 2, Split, &["Alt+Up"]),
         d(cmd::FOCUS + 3, Split, &["Alt+Down"]),
-        // Alt+Z: bash, zsh and readline leave it unbound, and no menu has
-        // Z underlined. (Alt+Backspace deletes a word in shells, so it
-        // stays theirs.)
-        d(cmd::LAST_PANE, Always, &["Alt+Z"]),
-        d(cmd::LAST_PANE_PASTE, Always, &["Ctrl+Shift+Backspace"]),
+        // No keys by default: shells use most free ones (Alt+Backspace
+        // deletes a word). Settings > Key bindings can give them one;
+        // scripts go back with `@pane last`.
+        d(cmd::LAST_PANE, Always, &[]),
+        d(cmd::LAST_PANE_PASTE, Always, &[]),
         d(cmd::RESIZE, Split, &["Alt+Shift+Left"]),
         d(cmd::RESIZE + 1, Split, &["Alt+Shift+Right"]),
         d(cmd::RESIZE + 2, Split, &["Alt+Shift+Up"]),
@@ -3774,11 +3774,11 @@ fn build_menu() -> Result<HMENU> {
                 &format!("Focus pane {name}\tAlt+{key}"),
             )?;
         }
-        item(window, cmd::LAST_PANE, "Back to the las&t pane\tAlt+Z")?;
+        item(window, cmd::LAST_PANE, "Back to the las&t pane")?;
         item(
             window,
             cmd::LAST_PANE_PASTE,
-            "Back to the last pane and pa&ste\tCtrl+Shift+Backspace",
+            "Back to the last pane and pa&ste",
         )?;
         separator(window)?;
         for (i, (name, key)) in names.iter().zip(keys).enumerate() {
@@ -15220,6 +15220,11 @@ impl Window {
             return;
         };
         let (to, missing) = match &step {
+            Step::Pane(d) if d == "last" => {
+                let ws = &self.ws;
+                let to = self.focus_trail.back(from, |p| ws.tab_of(p).is_some());
+                (to, "there is no last pane to go back to".to_owned())
+            }
             Step::Pane(d) => {
                 let dir = match d.as_str() {
                     "left" => Dir::Left,

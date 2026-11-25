@@ -170,7 +170,6 @@ For Claude Code, Codex, aider and other coding agents that run on a server. Ever
 | Ctrl+Shift+T / Ctrl+Shift+W | New tab, close the pane |
 | Alt+Shift+= / Alt+Shift+- | Split right, split down |
 | Alt+arrows / Alt+Shift+arrows | Focus the pane in that direction, grow the pane |
-| Alt+Z / Ctrl+Shift+Backspace | Back to the last pane; back to it and paste (after Ctrl+Shift+C) |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next tab, previous tab (Ctrl+Shift+PgUp/PgDn moves it) |
 | Ctrl+Shift+J | Join this tab into the tab before it, as a pane |
 | Ctrl+Shift+H | Hide the pane; it keeps running (Session manager shows it again) |
