@@ -459,10 +459,10 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::FOCUS + 1, Split, &["Alt+Right"]),
         d(cmd::FOCUS + 2, Split, &["Alt+Up"]),
         d(cmd::FOCUS + 3, Split, &["Alt+Down"]),
-        // Backspace: back. Not Alt+Backspace alone, which shells use to
-        // delete a word (back to the last `/`); with Shift it reaches them
-        // as the same key, so they keep it.
-        d(cmd::LAST_PANE, Always, &["Alt+Shift+Backspace"]),
+        // Alt+Z: bash, zsh and readline leave it unbound, and no menu has
+        // Z underlined. (Alt+Backspace deletes a word in shells, so it
+        // stays theirs.)
+        d(cmd::LAST_PANE, Always, &["Alt+Z"]),
         d(cmd::LAST_PANE_PASTE, Always, &["Ctrl+Shift+Backspace"]),
         d(cmd::RESIZE, Split, &["Alt+Shift+Left"]),
         d(cmd::RESIZE + 1, Split, &["Alt+Shift+Right"]),
@@ -3774,11 +3774,7 @@ fn build_menu() -> Result<HMENU> {
                 &format!("Focus pane {name}\tAlt+{key}"),
             )?;
         }
-        item(
-            window,
-            cmd::LAST_PANE,
-            "Back to the las&t pane\tAlt+Shift+Backspace",
-        )?;
+        item(window, cmd::LAST_PANE, "Back to the las&t pane\tAlt+Z")?;
         item(
             window,
             cmd::LAST_PANE_PASTE,
