@@ -711,6 +711,8 @@ When you are done, merge or push the branch as usual. Then Session > Coding agen
 
 git runs over the pane's own SSH connection, with `sh`, so the server needs both. The folder and the branch go to git on its input, never in the command. Branch names are only letters, digits, `.`, `_` and `-`, made from the agent's name.
 
+**In WSL and on Windows.** The same works from a WSL pane or a local Windows shell (see [Coding agents in WSL and on this PC](#coding-agents-in-wsl-and-on-this-pc)). In WSL, the same script runs in the distro (`wsl.exe -e sh -c`), and the agent starts in tmux there. From a cmd or PowerShell tab, FeroSSH runs this PC's `git.exe` (Git for Windows) itself in the folder the prompt shows, with each argument passed whole and no shell. The agent then gets a PowerShell tab in the new worktree. Windows cannot delete a folder a program is working in, so Remove this agent's worktree stops the agent's tab first and then removes the worktree. If git keeps the worktree because of changes, the agent stays stopped, and Enter in its tab starts a plain PowerShell there.
+
 ### Coding agents in WSL and on this PC
 
 Agents don't need a server. Two other places work too:

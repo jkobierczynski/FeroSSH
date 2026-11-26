@@ -159,6 +159,34 @@ impl Drop for PipeChild {
     }
 }
 
+/// Runs `program` with `args` to the end, `input` on its standard input:
+/// its standard output and standard error. Blocks: call it off the UI
+/// thread.
+pub fn run_once(
+    program: &Path,
+    args: &[String],
+    input: &[u8],
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // A script that reads less than it gets closes its end: fine.
+        let _ = stdin.write_all(input);
+    }
+    let out = child.wait_with_output()?;
+    Ok((out.stdout, out.stderr))
+}
+
 fn spawn_reader(
     mut pipe: impl Read + Send + 'static,
     tx: SyncSender<Output>,
@@ -236,6 +264,18 @@ mod tests {
         .unwrap();
         let (out, _) = read_all(&c);
         assert_eq!(out, b"a b|it's \"q\"|");
+    }
+
+    #[test]
+    fn runs_once_with_input() {
+        let (out, err) = run_once(
+            Path::new("/bin/sh"),
+            &["-c".into(), "read a; echo \"[$a]\"; echo e >&2".into()],
+            b"x y\n",
+        )
+        .unwrap();
+        assert_eq!(out, b"[x y]\n");
+        assert_eq!(err, b"e\n");
     }
 
     #[test]

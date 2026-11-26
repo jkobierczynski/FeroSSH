@@ -103,6 +103,22 @@ pub fn gateway_args(
     args
 }
 
+/// The arguments for `wsl.exe` that run `command` (a line for a login
+/// shell, such as [`crate::worktree::add_command`]) under `sh` in
+/// `distro`, in the home folder.
+pub fn script_args(distro: &str, command: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    if valid_name(distro) {
+        args.extend(["-d".to_owned(), distro.to_owned()]);
+    }
+    args.extend(
+        ["--cd", "~", "-e", "sh", "-c", command]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    args
+}
+
 /// The script a gateway runs (see [`gateway_args`]).
 pub fn gateway_script(before: Option<&str>, session: &str) -> String {
     let check = "command -v tmux >/dev/null 2>&1 || { echo 'tmux is not installed in this \
@@ -264,6 +280,24 @@ mod tests {
     }
 
     #[test]
+    fn script_arguments() {
+        assert_eq!(
+            script_args("Ubuntu", "exec sh -c 'x'"),
+            [
+                "-d",
+                "Ubuntu",
+                "--cd",
+                "~",
+                "-e",
+                "sh",
+                "-c",
+                "exec sh -c 'x'"
+            ]
+        );
+        assert_eq!(script_args("", "y")[..2], ["--cd", "~"]);
+    }
+
+    #[test]
     fn gateway_arguments() {
         let a = gateway_args("Ubuntu", Some("/home/me/app"), None, "agents");
         assert_eq!(
@@ -379,6 +413,40 @@ mod e2e {
             .arg("kill-server")
             .status();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_worktree_script_runs_as_wsl_would_run_it() {
+        let ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !ok {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("ferossh-wslwt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        let st = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("git init -q -b main . && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m one")
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let command = String::from_utf8(crate::worktree::add_command()).unwrap();
+        // `wsl.exe <args>` runs `sh -c <command>`: the same here, minus
+        // the distro and folder options.
+        let args = script_args("", &command);
+        let input =
+            crate::worktree::add_input(repo.to_str().unwrap().as_bytes(), "claude").unwrap();
+        let (out, err) = crate::pipes::run_once(Path::new("/bin/sh"), &args[4..], &input).unwrap();
+        match crate::worktree::parse_add(&out, &err) {
+            crate::worktree::Added::Made(w) => assert_eq!(w.branch, "claude"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1,0 +1,325 @@
+//! Git worktrees for coding agents on this PC (Session > Coding agents >
+//! Start <agent> in a new git worktree, from a Windows shell): the same
+//! rules as [`crate::worktree`] on a server, carried out with this PC's
+//! own `git.exe` instead of a script, each argument passed whole.
+//!
+//! The worktree goes next to the repository's main worktree as
+//! `<repo>-<agent>` on branch `<agent>` (`-2` … `-99` when taken), from
+//! the commit the folder has checked out. Removing runs `git worktree
+//! remove` without `--force` (git keeps a worktree with changes) and then
+//! `git branch -d` (git keeps a branch that is not merged), and never
+//! touches the main worktree.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use crate::worktree::{Added, Removal, Worktree, valid_branch};
+
+/// Branches tried at most, as on a server.
+const TRIES: u32 = 99;
+
+/// What git printed last on standard error, made safe to show.
+fn said(err: &[u8]) -> String {
+    let text = String::from_utf8_lossy(err);
+    let line = text.lines().map(str::trim).rfind(|l| !l.is_empty());
+    crate::ssh::sanitize_line(line.unwrap_or(""))
+        .chars()
+        .take(300)
+        .collect()
+}
+
+struct Git<'a> {
+    program: &'a Path,
+}
+
+struct Ran {
+    ok: bool,
+    out: String,
+    err: Vec<u8>,
+}
+
+impl Git<'_> {
+    fn run(&self, dir: &Path, args: &[&str]) -> Option<Ran> {
+        let mut command = Command::new(self.program);
+        command
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdin(Stdio::null())
+            .env("GIT_TERMINAL_PROMPT", "0");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW: no console flashes up.
+            command.creation_flags(0x0800_0000);
+        }
+        let output = command.output().ok()?;
+        Some(Ran {
+            ok: output.status.success(),
+            out: String::from_utf8_lossy(&output.stdout).into_owned(),
+            err: output.stderr,
+        })
+    }
+
+    /// The main worktree of the repository `dir` is in, from `git
+    /// worktree list` (its first entry), else `toplevel`.
+    fn main_worktree(&self, dir: &Path, toplevel: &Path) -> PathBuf {
+        self.run(dir, &["worktree", "list", "--porcelain"])
+            .filter(|r| r.ok)
+            .and_then(|r| {
+                r.out
+                    .lines()
+                    .next()
+                    .and_then(|l| l.strip_prefix("worktree "))
+                    .map(native)
+            })
+            .filter(|m| m.is_dir())
+            .unwrap_or_else(|| toplevel.to_path_buf())
+    }
+
+    fn toplevel(&self, dir: &Path) -> Option<PathBuf> {
+        self.run(dir, &["rev-parse", "--show-toplevel"])
+            .filter(|r| r.ok)
+            .map(|r| r.out.trim_end_matches(['\r', '\n']).to_owned())
+            .filter(|t| !t.is_empty())
+            .map(|t| native(&t))
+    }
+}
+
+/// A path as git prints it (`C:/Users/me/app` on Windows) in this PC's
+/// own form.
+fn native(path: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(path.replace('/', "\\"))
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+fn same(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Makes a worktree for an agent whose branches start with `base`, of the
+/// repository folder `dir` is in, with git `program`.
+pub fn add(program: &Path, dir: &Path, base: &str) -> Added {
+    if !valid_branch(base) {
+        return Added::Failed("not a branch name FeroSSH makes".into());
+    }
+    let git = Git { program };
+    if git.run(Path::new("."), &["--version"]).is_none() {
+        return Added::NoGit;
+    }
+    if !dir.is_dir() {
+        return Added::NoDir;
+    }
+    let Some(top) = git.toplevel(dir) else {
+        return Added::NoRepo;
+    };
+    let main = git.main_worktree(dir, &top);
+    let (Some(parent), Some(repo)) = (main.parent(), main.file_name()) else {
+        return Added::BadPath;
+    };
+    let repo = repo.to_string_lossy().into_owned();
+    let mut n = 1;
+    let (branch, path) = loop {
+        let branch = if n == 1 {
+            base.to_owned()
+        } else {
+            format!("{base}-{n}")
+        };
+        let path = parent.join(format!("{repo}-{branch}"));
+        let taken = git
+            .run(
+                dir,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ],
+            )
+            .is_some_and(|r| r.ok)
+            || path.exists();
+        if !taken {
+            break (branch, path);
+        }
+        n += 1;
+        if n > TRIES {
+            return Added::Full;
+        }
+    };
+    let text = path.to_string_lossy().into_owned();
+    if text.chars().any(char::is_control) || text.len() > 4096 {
+        return Added::BadPath;
+    }
+    match git.run(dir, &["worktree", "add", "-b", &branch, "--", &text]) {
+        Some(r) if r.ok => Added::Made(Worktree { branch, path: text }),
+        Some(r) => Added::Failed(said(&r.err)),
+        None => Added::NoGit,
+    }
+}
+
+/// Removes agent worktree `w` with git `program`, as [`crate::worktree::
+/// remove_command`] does on a server.
+pub fn remove(program: &Path, w: &Worktree) -> Removal {
+    if !valid_branch(&w.branch) {
+        return Removal::Other;
+    }
+    let git = Git { program };
+    if git.run(Path::new("."), &["--version"]).is_none() {
+        return Removal::NoGit;
+    }
+    let dir = Path::new(&w.path);
+    if !dir.is_dir() {
+        return Removal::NoDir;
+    }
+    let Some(top) = git.toplevel(dir) else {
+        return Removal::NoRepo;
+    };
+    let main = git.main_worktree(dir, &top);
+    if same(&top, &main) {
+        return Removal::Main;
+    }
+    // Only the worktree that has this branch checked out.
+    let list = git
+        .run(dir, &["worktree", "list", "--porcelain"])
+        .map(|r| r.out)
+        .unwrap_or_default();
+    let mut at: Option<PathBuf> = None;
+    let mut holder = None;
+    let wanted = format!("branch refs/heads/{}", w.branch);
+    for line in list.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            at = Some(native(p));
+        } else if line == wanted {
+            holder = at.clone();
+            break;
+        }
+    }
+    if !holder.is_some_and(|h| same(&h, &top)) {
+        return Removal::Other;
+    }
+    let top_text = top.to_string_lossy().into_owned();
+    match git.run(&main, &["worktree", "remove", "--", &top_text]) {
+        Some(r) if r.ok => {}
+        Some(r) => return Removal::Kept(said(&r.err)),
+        None => return Removal::Failed(String::new()),
+    }
+    let deleted = git
+        .run(&main, &["branch", "-d", &w.branch])
+        .is_some_and(|r| r.ok);
+    Removal::Removed {
+        branch_deleted: deleted,
+    }
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn git_path() -> Option<PathBuf> {
+        let ok = Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        ok.then(|| PathBuf::from("git"))
+    }
+
+    fn sh(dir: &Path, script: &str) {
+        let s = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(s.success(), "{script}");
+    }
+
+    #[test]
+    fn makes_and_removes_worktrees_like_the_server_does() {
+        let Some(git) = git_path() else {
+            eprintln!("git is not installed: skipped");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("ferossh-lwt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("my app");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        sh(
+            &repo,
+            "git init -q -b main . && echo a > f && git add f && git commit -qm one",
+        );
+        // From a subfolder: next to the main worktree.
+        let Added::Made(w1) = add(&git, &repo.join("src"), "claude") else {
+            panic!("not made");
+        };
+        assert_eq!(w1.branch, "claude");
+        assert_eq!(Path::new(&w1.path), root.join("my app-claude"));
+        // From inside that worktree: still next to the main one, -2.
+        let Added::Made(w2) = add(&git, Path::new(&w1.path), "claude") else {
+            panic!("not made");
+        };
+        assert_eq!(w2.branch, "claude-2");
+        assert_eq!(Path::new(&w2.path), root.join("my app-claude-2"));
+        assert_eq!(add(&git, &root.join("none"), "claude"), Added::NoDir);
+        assert_eq!(add(&git, &root, "claude"), Added::NoRepo);
+        // Untracked work is kept.
+        std::fs::write(Path::new(&w1.path).join("new"), "x").unwrap();
+        assert!(matches!(remove(&git, &w1), Removal::Kept(_)));
+        assert!(Path::new(&w1.path).is_dir());
+        // An unmerged branch stays; a merged one goes.
+        std::fs::remove_file(Path::new(&w1.path).join("new")).unwrap();
+        sh(
+            Path::new(&w1.path),
+            "echo b > g && git add g && git commit -qm two",
+        );
+        assert_eq!(
+            remove(&git, &w1),
+            Removal::Removed {
+                branch_deleted: false
+            }
+        );
+        assert!(!Path::new(&w1.path).exists());
+        assert_eq!(
+            remove(&git, &w2),
+            Removal::Removed {
+                branch_deleted: true
+            }
+        );
+        // Never the main worktree, nor a folder holding another branch.
+        let main = Worktree {
+            branch: "main".into(),
+            path: repo.to_string_lossy().into_owned(),
+        };
+        assert_eq!(remove(&git, &main), Removal::Main);
+        let Added::Made(w3) = add(&git, &repo, "codex") else {
+            panic!("not made");
+        };
+        let wrong = Worktree {
+            branch: "other".into(),
+            path: w3.path.clone(),
+        };
+        assert_eq!(remove(&git, &wrong), Removal::Other);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_git() {
+        let missing = Path::new("/nonexistent/git");
+        assert_eq!(add(missing, Path::new("/"), "claude"), Added::NoGit);
+        let w = Worktree {
+            branch: "claude".into(),
+            path: "/tmp".into(),
+        };
+        assert_eq!(remove(missing, &w), Removal::NoGit);
+    }
+}
