@@ -79,6 +79,13 @@ fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// `script` run in folder `rel` of the home folder (a path a prompt
+/// showed as `~/rel`), for a gateway that starts in the home folder; in
+/// the home folder itself when `rel` is gone.
+pub fn in_home_folder(rel: &str, script: &str) -> String {
+    format!("cd -- {} 2>/dev/null; {script}", sh_quote(rel))
+}
+
 /// The arguments for `wsl.exe` that start a gateway in `distro` (the
 /// default when empty): in folder `dir` (a Linux path; the home folder
 /// when `None`), it runs `before` (a script, such as
@@ -242,6 +249,14 @@ mod tests {
             name: name.into(),
             default,
         }
+    }
+
+    #[test]
+    fn home_relative_folders() {
+        assert_eq!(
+            in_home_folder("my app", "run"),
+            "cd -- 'my app' 2>/dev/null; run"
+        );
     }
 
     #[test]

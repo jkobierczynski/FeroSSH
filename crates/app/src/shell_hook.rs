@@ -11,20 +11,21 @@
 //! cmd has no hook for the end of a command, so it gets none here.
 
 /// The hook: the user guide's PowerShell snippet, guarded so that it goes
-/// in once, and working without PSReadLine too (then a command's end is
-/// read from the history, and its output start is not marked).
+/// in once. A command's end and exit code are marked only with PSReadLine
+/// (which PowerShell 5.1 and 7 load in a console): it says when a command
+/// starts. Without it, only the prompt is marked. The profile's prompt sees
+/// the finished command's `$?` and `$LASTEXITCODE`, not the hook's.
 pub const HOOK: &str = r#"if (-not (Test-Path variable:global:__fsPrompt)) {
 $global:__fsE = [char]27; $global:__fsA = [char]7; $global:__fsRan = $false
 $global:__fsPrompt = $function:prompt
-$global:__fsLast = (Get-History -Count 1).Id
 function global:prompt {
     $ok = $?; $code = $global:LASTEXITCODE; $out = ''
-    $id = (Get-History -Count 1).Id
-    if ($global:__fsRan -or ($id -and $id -ne $global:__fsLast)) {
+    if ($global:__fsRan) {
         $c = if ($ok) { 0 } elseif ($code) { $code } else { 1 }
         $out += "$__fsE]133;D;$c$__fsA"; $global:__fsRan = $false
     }
-    $global:__fsLast = $id
+    $global:LASTEXITCODE = $code
+    if (-not $ok) { Write-Error 'failed' -ErrorAction Ignore }
     $p = if ($global:__fsPrompt) { & $global:__fsPrompt } else { "PS $($executionContext.SessionState.Path.CurrentLocation)> " }
     $out + "$__fsE]133;A$__fsA" + $p + "$__fsE]133;B$__fsA"
 }

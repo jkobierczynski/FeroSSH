@@ -179,7 +179,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | tmux > Join a shared session... | Watches a tmux session of your own account, or one another account shares: read-only unless you tick Type into it too, and never resizing, closing or rearranging its windows. |
 | tmux > Stop sharing | Takes other accounts off the shared tmux server, makes its socket private again, and detaches read-only watchers of this session. |
 | tmux > One window per pane (own fonts) | ✓ on: each native pane is its own tmux window, so each can have its own font. Off: tmux's own splits are the panes. |
-| tmux > Use tmux keybindings for tabs and panes | ✓ on: in a pane of a tmux session, your tmux prefix then `c`, `%`, `"`, `n`, `p`, an arrow and the other window and pane keys work the tabs and panes; the prefix then `?` lists them (see [tmux](everyday-use.md#tmux)). Off by default. |
+| tmux > Use tmux keybindings for tabs and panes | ✓ on: in a pane of a tmux session, and in cmd, PowerShell and WSL shell panes on this PC, your tmux prefix then `c`, `%`, `"`, `n`, `p`, an arrow and the other window and pane keys work the tabs and panes; the prefix then `?` lists them (see [tmux](everyday-use.md#tmux)). Off by default. |
 | Remote desktop > Open remote desktop | Ctrl+Shift+D. Tunnels the host's RDP port through SSH and opens Windows' Remote Desktop Connection on it (see [Remote desktops](everyday-use.md#remote-desktops)). |
 | Remote desktop > Open remote desktop in a tab (RDP) | Only in `ferossh-desktop.exe`: the desktop in a FeroSSH tab. |
 | Remote desktop > Open remote desktop in a tab (VNC) | Only in `ferossh-desktop.exe`: a VNC desktop in a FeroSSH tab. |

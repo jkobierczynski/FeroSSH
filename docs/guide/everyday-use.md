@@ -670,7 +670,7 @@ tmux is never started unless you ask. To attach on every login to a host, set `T
 
 To have a host's shells start in one server directory, `cd` there and use Session > Start new tabs and panes in this directory (or fill in Start dir in the connection form's Extras). FeroSSH types the `cd` after every login and uses it for the first window of a new tmux session. New tabs and panes opened from a pane follow that pane's directory instead, and use the start directory only when that one is not known. Clear Start dir in the form to go back to the home folder.
 
-If your fingers know tmux's keys, tick Session > tmux > Use tmux keybindings for tabs and panes. In a pane of a tmux session, your tmux prefix (Ctrl+B unless your tmux config sets another; FeroSSH asks tmux) followed by `c`, `%`, `"`, `n`, `p`, `0`-`9`, `o`, an arrow, `x`, `&`, `!`, `d` or `s` works the native tabs and panes, which are tmux windows and panes. Arrows, Ctrl or Alt+arrows (resize), `[`, PageUp and PageDown repeat as in tmux: after the first one, press them again without the prefix within tmux's `repeat-time` (half a second unless your tmux config sets another), or hold the key down. Press the prefix twice to send it to the program, and the prefix then `?` for the full list. It is off unless you turn it on.
+If your fingers know tmux's keys, tick Session > tmux > Use tmux keybindings for tabs and panes. In a pane of a tmux session, your tmux prefix (Ctrl+B unless your tmux config sets another; FeroSSH asks tmux) followed by `c`, `%`, `"`, `n`, `p`, `0`-`9`, `o`, an arrow, `x`, `&`, `!`, `d` or `s` works the native tabs and panes, which are tmux windows and panes. Arrows, Ctrl or Alt+arrows (resize), `[`, PageUp and PageDown repeat as in tmux: after the first one, press them again without the prefix within tmux's `repeat-time` (half a second unless your tmux config sets another), or hold the key down. Press the prefix twice to send it to the program, and the prefix then `?` for the full list. The same keys work in panes with a shell on this PC (cmd, PowerShell, a WSL shell), so you can move between those and the tmux panes and tabs the same way; there they use the prefix of an open tmux session, or Ctrl+B, and `d` and `s` do nothing. They do not work in a plain SSH pane, which may run a tmux of its own. It is off unless you turn it on.
 
 ### Shared sessions
 
@@ -1000,6 +1000,8 @@ function global:prompt {
         $c = if ($ok) { 0 } elseif ($code) { $code } else { 1 }
         $out += "$__fsE]133;D;$c$__fsA"; $global:__fsRan = $false
     }
+    $global:LASTEXITCODE = $code
+    if (-not $ok) { Write-Error 'failed' -ErrorAction Ignore }
     $out + "$__fsE]133;A$__fsA" + (& $global:__fsPrompt) + "$__fsE]133;B$__fsA"
 }
 $global:__fsReadLine = $function:PSConsoleHostReadLine
