@@ -56,6 +56,14 @@ pub fn commands(configured: &[String]) -> Vec<String> {
 /// command there. Starts with a space, so shells that keep such lines out
 /// of their history do; ends in `; ` for the attach.
 pub fn start_line(command: &str) -> String {
+    format!(" sh -c {}; ", sh_quote(&start_script(command)))
+}
+
+/// The `sh` script of [`start_line`]: run in the directory the agent
+/// starts in, it opens and marks the agent's window in session
+/// [`SESSION`] and types the command there. A WSL gateway runs it before
+/// it attaches ([`crate::wsl`]).
+pub fn start_script(command: &str) -> String {
     let name = sh_quote(&agent_name(command));
     let session = sh_quote(SESSION);
     let target = sh_quote(&format!("={SESSION}:"));
@@ -69,15 +77,14 @@ pub fn start_line(command: &str) -> String {
     // When another client made the session meanwhile, new-session fails
     // and the window goes into that one. The new pane is named by its id,
     // so the keys reach it whichever pane another client selects.
-    let script = format!(
+    format!(
         "d=$(printf %s_ \"$PWD\" | sed \"s/#/##/g\"); d=${{d%_}}; p=; \
          tmux has-session -t {exact} 2>/dev/null || \
          p=$(tmux new-session -d -s {session} -c \"$d\" -n {name} -P -F '#{{pane_id}}' 2>/dev/null); \
          [ -n \"$p\" ] || p=$(tmux new-window -d -t {target} -c \"$d\" -n {name} -P -F '#{{pane_id}}'); \
          [ -n \"$p\" ] && tmux set-option -w -t \"$p\" {AGENT_OPTION} {name} \
          && tmux send-keys -t \"$p\" -H{keys}"
-    );
-    format!(" sh -c {}; ", sh_quote(&script))
+    )
 }
 
 /// `bytes` as ` 63 6c …`, for `send-keys -H`.

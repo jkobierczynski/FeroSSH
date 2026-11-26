@@ -190,6 +190,8 @@ mod pattern;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod peer_owner;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod pipes;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod portable;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod preview;
@@ -271,6 +273,8 @@ mod win;
 mod winrm;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod workspaces;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod wsl;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod zmodem;
 

@@ -84,6 +84,27 @@ pub fn with_hook(command: &str) -> String {
     )
 }
 
+/// The command line of a local coding agent's tab: PowerShell `shell`
+/// runs `agent` (a command line in PowerShell's syntax, from the agent
+/// list), then stays at its prompt. With `hook`, the shell integration
+/// goes in first and the agent's run is marked as a command, so its end
+/// and exit code reach the dashboard.
+pub fn agent_command(shell: &str, agent: &str, hook: bool) -> String {
+    let agent = agent.trim();
+    let script = if hook && is_plain_powershell(shell) {
+        format!(
+            "{HOOK}\nif (Test-Path variable:global:__fsE) {{ [Console]::Write(\"$__fsE]133;C$__fsA\"); $global:__fsRan = $true }}\n{agent}"
+        )
+    } else {
+        agent.to_owned()
+    };
+    format!(
+        "{} -NoExit -EncodedCommand {}",
+        shell.trim_end(),
+        encoded(&script)
+    )
+}
+
 /// `script` as `-EncodedCommand` takes it: Base64 of its UTF-16LE.
 pub fn encoded(script: &str) -> String {
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -123,6 +144,7 @@ pub fn powershell_command(pwsh_installed: bool) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -177,6 +199,42 @@ mod tests {
         let open = HOOK.matches('{').count();
         let close = HOOK.matches('}').count();
         assert_eq!(open, close);
+    }
+
+    fn decode(b64: &str) -> String {
+        const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut bits = 0u32;
+        let mut n = 0;
+        let mut bytes = Vec::new();
+        for c in b64.bytes().filter(|&c| c != b'=') {
+            let v = ABC.iter().position(|&a| a == c).unwrap() as u32;
+            bits = bits << 6 | v;
+            n += 6;
+            if n >= 8 {
+                n -= 8;
+                bytes.push((bits >> n) as u8);
+            }
+        }
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
+            .collect();
+        String::from_utf16(&units).unwrap()
+    }
+
+    #[test]
+    fn an_agent_runs_after_the_hook_as_a_marked_command() {
+        let c = agent_command("pwsh.exe -NoLogo", " claude --model opus ", true);
+        let (head, b64) = c.rsplit_once(' ').unwrap();
+        assert_eq!(head, "pwsh.exe -NoLogo -NoExit -EncodedCommand");
+        let script = decode(b64);
+        assert!(script.starts_with(HOOK));
+        assert!(
+            script.ends_with("$global:__fsRan = $true }\nclaude --model opus"),
+            "{script}"
+        );
+        let plain = agent_command("powershell.exe -NoLogo", "codex", false);
+        assert_eq!(decode(plain.rsplit_once(' ').unwrap().1), "codex");
     }
 
     #[test]
