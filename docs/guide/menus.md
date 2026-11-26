@@ -38,6 +38,10 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 | Stop following at a match... | | Opens a bar for a regular expression: Enter sets it, and when new output matches, the view holds still on that line until you go back to the bottom. An empty pattern stops watching (see [Highlighting and following output](everyday-use.md#highlighting-and-following-output)). |
 | Follow new output | Ctrl+Shift+End (or Shift+End while scrolled back or stopped) | Goes back to the bottom and follows the output again. End or any key typed does too. |
 | Clear scrollback | | Forgets the pane's scrollback. The screen stays. |
+| Previous command | Ctrl+Shift+Up | Scrolls the prompt of the command before the one at the top of the view to the top. Needs a shell that marks its prompts (OSC 133, see [Shell integration](everyday-use.md#shell-integration-prompt-marks)); without marks it says what to set up. |
+| Next command | Ctrl+Shift+Down | The same, forward; past the last prompt, back to the live output. |
+| Select command output | | Selects the output of the command at the top of the view, or of the last finished command at the live bottom. Same marks. |
+| Copy last command's output | | Copies the output of the last command that finished. Same marks. |
 | Save selection as script... | | Opens the script editor with the selected text as the script's lines. |
 | Copy on select | ✓ off | Copies a selection as soon as you make it, as PuTTY does. `CopyOnSelect`. |
 | Right-click pastes | ✓ off | A right click pastes, as in PuTTY. `RightClickPaste`. |
@@ -57,6 +61,7 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 | Server status bar | ✓ off | A row under the panes with the CPU, memory, root disk and network use of the server the focused pane is logged in to, sampled every 2 seconds on a channel of its own. `StatusBar`. |
 | Desktop notifications | ✓ off | A tab badge and a Windows notification when a pane wants you: a notification the host sends (OSC 9, 777 or 99), the bell, or quiet after work. See [Notifications](everyday-use.md#notifications-coding-agents-and-long-jobs). `Notifications`. |
 | Notify on the bell too | ✓ on | The bell counts as asking for attention. Greyed out while notifications are off. `NotifyBell`. |
+| Notify when a long command finishes | off | A command that ran 10 seconds or more raises a notification when it finishes, from the shell's OSC 133 marks (see [Shell integration](everyday-use.md#shell-integration-prompt-marks)). Greyed out while notifications are off. `NotifyCommands`. |
 | Larger text | Ctrl+= (or Ctrl+wheel up) | Makes the focused pane's text bigger. |
 | Smaller text | Ctrl+- (or Ctrl+wheel down) | Makes it smaller. |
 | Reset text size | Ctrl+0 | Back to the pane's normal size. |

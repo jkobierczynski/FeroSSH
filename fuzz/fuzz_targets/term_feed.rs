@@ -65,6 +65,12 @@ fuzz_target!(|data: &[u8]| {
                         assert!(text.chars().count() <= ferossh_term::MAX_NOTIFICATION);
                     }
                 }
+                Action::CommandFinished(end) => {
+                    if let Some(c) = &end.command {
+                        assert!(!c.chars().any(char::is_control));
+                        assert!(c.chars().count() <= 1024);
+                    }
+                }
             }
         }
         // Vary the size and view now and then, driven by the input.
@@ -81,6 +87,16 @@ fuzz_target!(|data: &[u8]| {
             }
             4 => t.flush_sync(),
             5 | 6 => user(&mut t, chunk),
+            7 => {
+                // Shell integration: jump between commands, select one's
+                // output and read the failed rows.
+                let _ = t.jump_to_command(chunk[0] & 1 == 0);
+                if t.select_command_output(chunk[0] & 2 == 0) {
+                    let _ = t.selection_text();
+                }
+                let _ = t.failed_rows();
+                let _ = t.last_command();
+            }
             _ => {}
         }
         let _ = t.draw_into(&mut grid, i % 2 == 0);

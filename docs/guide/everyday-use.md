@@ -907,8 +907,91 @@ Each picture is decoded by FeroSSH's own small decoders, in safe Rust and fuzz-t
 | Jump to the top / bottom | Ctrl+Shift+Home / Ctrl+Shift+End |
 | Find in scrollback | Ctrl+Shift+F, then Enter for older, Shift+Enter for newer |
 | Stop following at a match | Edit > Stop following at a match... (see [Highlighting and following output](#highlighting-and-following-output)) |
+| Jump to the previous / next command | Ctrl+Shift+Up / Ctrl+Shift+Down (needs [shell integration](#shell-integration-prompt-marks)) |
+| Select or copy a command's output | Edit > Select command output, Edit > Copy last command's output (same) |
 
 While you are scrolled back, a thin bar at the right edge shows where you are. Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits. Scrollback is 10,000 lines unless you change it (`Scrollback`); Edit > Clear scrollback forgets it.
+
+## Shell integration (prompt marks)
+
+A shell can mark each prompt, the command typed at it and the output that follows, with OSC 133 escape sequences (FinalTerm's, which kitty, WezTerm, iTerm2, VS Code and Windows Terminal read too). The marks are invisible. When the shell sends them, FeroSSH knows where every command starts and ends and how it ended:
+
+- **Edit > Previous command** (Ctrl+Shift+Up) and **Next command** (Ctrl+Shift+Down) scroll the prompt of the command before or after the one at the top of the view to the top. Past the last prompt, Next command goes back to the live output.
+- **Edit > Select command output** selects what the command at the top of the view printed (at the live bottom: the last command that finished), ready to copy with Ctrl+Shift+C. **Copy last command's output** puts the last finished command's output on the clipboard at once, for pasting to a colleague or a coding agent. A command that printed nothing has nothing to select.
+- A command that **failed** (its exit code is not 0) gets a thin red bar left of its line, which scrolls with it.
+- The **Session manager** says *last command failed (exit 2)* beside a session whose last command failed, and the agent dashboard shows a coding agent as *exited* or *failed* once the shell says the agent's command ended.
+- **Settings > Notify when a long command finishes** (off unless you turn it on; it needs Settings > Desktop notifications) raises a notification when a command that ran 10 seconds or more finishes while you are not looking at its pane: *Command finished* or *Command failed (exit 1)*, with the command line.
+
+The marks stay with the text they belong to: they scroll into the scrollback, follow a resize, and go when the scrollback forgets those lines or a program writes over them. Full-screen programs (vim, less, an agent's own screen) are left alone. Without marks nothing changes, and Previous command says what to set up. With FeroSSH's tmux integration the marks arrive from every tmux pane; inside tmux run by hand, tmux keeps them to itself.
+
+**Shells that send them by themselves:** fish 4 and later, and oh-my-posh with its shell integration turned on. For the others, add the lines below on the server (for a local shell, on this PC). Put them at the end of the file, after anything that sets the prompt.
+
+bash 4.4 or later, in `~/.bashrc`:
+
+```bash
+# FeroSSH shell integration (OSC 133)
+__ferossh_done() { printf '\e]133;D;%s\a' "$?"; }
+PROMPT_COMMAND="__ferossh_done${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+PS0='\e]133;C\a'
+PS1='\[\e]133;A\a\]'"$PS1"'\[\e]133;B\a\]'
+```
+
+zsh, in `~/.zshrc` (with powerlevel10k, set `POWERLEVEL9K_TERM_SHELL_INTEGRATION=true` instead, which sends the same marks):
+
+```zsh
+# FeroSSH shell integration (OSC 133)
+_ferossh_done() { printf '\e]133;D;%s\a' $?; }
+_ferossh_run() { printf '\e]133;C\a'; }
+precmd_functions=(_ferossh_done $precmd_functions)
+preexec_functions+=(_ferossh_run)
+PS1=$'%{\e]133;A\a%}'$PS1$'%{\e]133;B\a%}'
+```
+
+fish 3, in `~/.config/fish/config.fish` (without a mark where typing starts, so commands are not named in notifications):
+
+```fish
+# FeroSSH shell integration (OSC 133)
+function __ferossh_prompt --on-event fish_prompt
+    printf '\e]133;A\a'
+end
+function __ferossh_run --on-event fish_preexec
+    printf '\e]133;C\a'
+end
+function __ferossh_done --on-event fish_postexec
+    printf '\e]133;D;%s\a' $status
+end
+```
+
+PowerShell 5.1 or 7, in your profile (`notepad $PROFILE`):
+
+```powershell
+# FeroSSH shell integration (OSC 133)
+$global:__fsE = [char]27; $global:__fsA = [char]7; $global:__fsRan = $false
+$global:__fsPrompt = $function:prompt
+function global:prompt {
+    $ok = $?; $code = $global:LASTEXITCODE; $out = ''
+    if ($global:__fsRan) {
+        $c = if ($ok) { 0 } elseif ($code) { $code } else { 1 }
+        $out += "$__fsE]133;D;$c$__fsA"; $global:__fsRan = $false
+    }
+    $out + "$__fsE]133;A$__fsA" + (& $global:__fsPrompt) + "$__fsE]133;B$__fsA"
+}
+$global:__fsReadLine = $function:PSConsoleHostReadLine
+function global:PSConsoleHostReadLine {
+    $line = & $global:__fsReadLine
+    $global:__fsRan = $true
+    [Console]::Write("$__fsE]133;C$__fsA")
+    $line
+}
+```
+
+cmd can mark its prompts but not its commands, so only Previous command and Next command work there. Run this once in a command prompt (it takes effect in new ones):
+
+```bat
+setx PROMPT "$e]133;A$e\$P$G$e]133;B$e\"
+```
+
+PowerShell and cmd on Windows (a local shell, or an SSH server on Windows) run on Windows' console layer (ConPTY), which on older Windows versions drops these marks; there the features stay off, as without marks.
 
 ## Command suggestions
 

@@ -140,6 +140,9 @@ pub struct LiveSession {
     pub state: LiveState,
     /// Short notes for the detail line: tmux, forwards, logging and so on.
     pub notes: Vec<&'static str>,
+    /// What the shell's marks (OSC 133) say of its last command, when it
+    /// failed: `last command failed (exit 2)`.
+    pub command: Option<String>,
     /// The window's focused pane.
     pub focused: bool,
 }
@@ -190,6 +193,7 @@ impl LiveSession {
             parts.push(self.target.clone());
         }
         parts.extend(self.notes.iter().map(|n| (*n).to_owned()));
+        parts.extend(self.command.clone());
         if let Some(t) = self.title.as_deref().filter(|t| *t != self.target) {
             parts.push(t.to_owned());
         }
@@ -623,7 +627,7 @@ impl LiveView {
                                 .since
                                 .as_deref()
                                 .filter(|_| s.state == LiveState::Connected);
-                            [host, since, a.last.as_deref()]
+                            [host, since, s.command.as_deref(), a.last.as_deref()]
                                 .into_iter()
                                 .flatten()
                                 .filter(|t| !t.is_empty())
@@ -646,6 +650,7 @@ impl LiveView {
                     details.push(s.target.clone());
                 }
                 details.extend(s.notes.iter().map(|n| (*n).to_owned()));
+                details.extend(s.command.clone());
                 if let Some(t) = s.title.as_deref().filter(|t| *t != s.target) {
                     details.push(t.to_owned());
                 }
@@ -689,6 +694,7 @@ mod tests {
             title: None,
             state,
             notes: Vec::new(),
+            command: None,
             focused: false,
         }
     }
@@ -738,6 +744,38 @@ mod tests {
         let rows = v.rows(&all);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pane, 3);
+    }
+
+    #[test]
+    fn a_failed_last_command_is_told() {
+        let mut all = sample();
+        all[1].command = Some("last command failed (exit 2)".into());
+        let v = LiveView::default();
+        let rows = v.rows(&all);
+        let row = rows.iter().find(|r| r.pane == all[1].pane).unwrap();
+        assert!(
+            row.details.contains("last command failed (exit 2)"),
+            "{}",
+            row.details
+        );
+        assert!(all[1].detail().contains("last command failed (exit 2)"));
+        // In the dashboard too, before the agent's last line.
+        all[1].agent = Some(Agent {
+            name: "claude".into(),
+            state: "failed",
+            since: Some("1 min".into()),
+            waited: None,
+            last: Some("Bye".into()),
+        });
+        all[1].state = LiveState::Connected;
+        let mut v = LiveView::default();
+        v.set_query(AGENTS_ONLY);
+        let rows = v.rows(&all);
+        assert_eq!(rows[0].state, "failed");
+        assert_eq!(
+            rows[0].details,
+            "1 min \u{b7} last command failed (exit 2) \u{b7} Bye"
+        );
     }
 
     #[test]

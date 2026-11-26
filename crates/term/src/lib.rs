@@ -17,7 +17,10 @@
 //!
 //! OSC 7 working-directory reports come out as
 //! [`Action::WorkingDirectory`], for the file view to follow, and the
-//! desktop notifications of OSC 9, 777 and 99 as [`Action::Notify`].
+//! desktop notifications of OSC 9, 777 and 99 as [`Action::Notify`]. The
+//! OSC 133 marks of shell integration are kept in the grid, for jumping
+//! between commands and selecting one's output, and a finished command
+//! comes out as [`Action::CommandFinished`].
 //!
 //! [`LogWriter`] writes a tab's session log, as plain text or raw bytes;
 //! [`cast`] records a pane's output with its timing and plays it back.
@@ -45,5 +48,6 @@ pub use sanitize::{
     Paste, check_link, clipboard_preview, prepare_paste, sanitize_title, text_link,
 };
 pub use terminal::{
-    Action, InputLine, InputMark, MAX_COLS, MAX_ROWS, SelectionKind, Settings, Terminal,
+    Action, CommandEnd, CommandStatus, InputLine, InputMark, MAX_COLS, MAX_ROWS, SelectionKind,
+    Settings, Terminal,
 };

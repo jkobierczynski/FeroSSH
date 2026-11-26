@@ -26,7 +26,10 @@ use crate::input::{self, Key, KeyOptions, Mods, MouseButton, MouseEvent};
 use crate::notify::Notification;
 use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 
+mod commands;
 mod place;
+
+pub use commands::{CommandEnd, CommandStatus};
 
 /// Per-session terminal settings, from the window's settings file and the
 /// host's session profile.
@@ -80,6 +83,8 @@ pub enum Action {
     /// The host asked for a desktop notification (OSC 9, 777 or 99), with
     /// its text sanitised.
     Notify(Notification),
+    /// The shell said a command finished (OSC 133 `D`).
+    CommandFinished(CommandEnd),
 }
 
 /// How a mouse selection grows.
@@ -297,6 +302,8 @@ pub struct Terminal {
     fed: u64,
     /// Inline images, while they are on.
     images: Option<place::Images>,
+    /// The shell's prompt and command marks (OSC 133).
+    commands: commands::Commands,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -340,6 +347,7 @@ impl Terminal {
             alt_title: None,
             fed: 0,
             images: settings.images.then(place::Images::default),
+            commands: commands::Commands::default(),
         }
     }
 
@@ -501,6 +509,7 @@ impl Terminal {
     /// Processes output that is not a picture.
     fn feed_text(&mut self, bytes: &[u8]) {
         let mut last = None;
+        let mut marks = Vec::new();
         for found in self.cwd.scan(bytes) {
             match found {
                 Found::Dir(dir) => last = Some(dir),
@@ -508,6 +517,7 @@ impl Terminal {
                     self.notifications.push(n);
                 }
                 Found::Notify(_) => {}
+                Found::Mark(mark, end) => marks.push((end, mark)),
             }
         }
         // Only the last report of a burst matters.
@@ -516,17 +526,32 @@ impl Terminal {
             self.reported.push(last);
         }
         // Each push onto the kitty keyboard stack is fed on its own once
-        // the stacks could be getting deep, see [`PushGuard`].
+        // the stacks could be getting deep, see [`PushGuard`]; each OSC 133
+        // mark is acted on with the bytes before it on the screen.
+        let mut stops: Vec<(usize, Option<crate::cwd::Mark>)> = self
+            .pushes
+            .scan(bytes)
+            .into_iter()
+            .map(|at| (at, None))
+            .collect();
+        if !marks.is_empty() {
+            stops.extend(marks.into_iter().map(|(at, m)| (at, Some(m))));
+            stops.sort_by_key(|(at, _)| *at);
+        }
         let mut from = 0;
-        for at in self.pushes.scan(bytes) {
+        for (at, mark) in stops {
             if let Some(piece) = bytes.get(from..at) {
                 self.feed_screen(piece);
+            }
+            from = at;
+            if let Some(mark) = mark {
+                self.command_mark(mark);
+                continue;
             }
             if self.pushes.depth >= PushGuard::LIMIT {
                 self.shorten_keyboard_stacks();
             }
             self.pushes.depth += 1;
-            from = at;
         }
         if let Some(rest) = bytes.get(from..) {
             self.feed_screen(rest);
@@ -891,6 +916,12 @@ impl Terminal {
         actions.extend(replies.map(|(_, reply)| Action::ImageReply(reply)));
         actions.extend(self.reported.drain(..).map(Action::WorkingDirectory));
         actions.extend(self.notifications.drain(..).map(Action::Notify));
+        actions.extend(
+            self.commands
+                .finished
+                .drain(..)
+                .map(Action::CommandFinished),
+        );
         actions
     }
 
@@ -1528,7 +1559,7 @@ impl Terminal {
         let point = self.grid_point(col, row);
         self.term.grid()[point]
             .hyperlink()
-            .filter(|h| h.id() != crate::images::MARKER_ID)
+            .filter(|h| h.id() != crate::images::MARKER_ID && h.id() != commands::MARK_ID)
             .map(|h| h.uri().to_owned())
     }
 
