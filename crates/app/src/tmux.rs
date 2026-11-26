@@ -31,6 +31,7 @@ use ferossh_tmuxcc::{
 use crate::layout::{Axis, Dir, Node, PaneId as Native, Workspace};
 use crate::same_dir;
 use crate::tmux_keys;
+use crate::worktree::Worktree;
 
 /// Output kept for a pane until its screen is restored.
 const MAX_BUFFER: usize = 4 << 20;
@@ -46,7 +47,7 @@ const PANE_FORMAT: &str = "#{pane_id} #{window_id} #{pane_width} #{pane_height} 
     #{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} #{keypad_cursor_flag} \
     #{keypad_flag} #{mouse_standard_flag} #{mouse_button_flag} #{mouse_all_flag} \
     #{mouse_sgr_flag} #{mouse_utf8_flag} #{origin_flag} #{insert_flag} #{wrap_flag} #{scroll_region_upper} \
-    #{scroll_region_lower} #{window_layout} #{@ferossh-agent}";
+    #{scroll_region_lower} #{window_layout} #{@ferossh-agent} #{@ferossh-worktree}";
 
 /// The window option that marks a coding agent's window, holding the
 /// agent's name ([`agent_name`]); it is read back on every attach, from
@@ -158,6 +159,9 @@ pub enum Action {
     /// The directory native pane `native` is in, asked for by
     /// [`Tmux::ask_diff_dir`]: show what changed in its git repository.
     DiffDir { native: Native, dir: String },
+    /// Native pane `native`'s directory, as asked by
+    /// [`Tmux::ask_worktree_dir`]: make a worktree of its repository.
+    WorktreeDir { native: Native, dir: String },
 }
 
 /// Where a window made from a native action goes.
@@ -200,6 +204,8 @@ enum Tag {
     StartDirHere,
     /// A pane's directory, to show what changed there.
     DiffDirHere(Native),
+    /// A pane's directory, to make an agent's worktree from.
+    WorktreeDirHere(Native),
     Sessions,
     NewSession,
     /// The prefix keys and base index, for tmux keybindings.
@@ -314,21 +320,33 @@ struct PaneLine {
     layout: String,
     /// The window's [`AGENT_OPTION`], when it has one.
     agent: Option<String>,
+    /// The window's [`crate::worktree::OPTION`], when it has one.
+    worktree: Option<Worktree>,
 }
 
 fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
-    // The agent option comes last, whole even if someone set it to a
-    // value with spaces or bytes that are not UTF-8 (then it is not ours
-    // and is ignored, and the pane still counts); the tests' lines may
-    // leave it out.
-    let mut parts: Vec<&[u8]> = line.splitn(22, |&b| b == b' ').collect();
+    // The agent option comes next to last and the worktree option last,
+    // whole even if someone set it to a value with spaces or bytes that
+    // are not UTF-8 (then it is not ours and is ignored, and the pane
+    // still counts); the tests' lines may leave them out.
+    let mut parts: Vec<&[u8]> = line.splitn(23, |&b| b == b' ').collect();
+    let text = |m: &[u8]| std::str::from_utf8(m).ok().map(str::to_owned);
+    let worktree = match parts.len() {
+        23 => parts
+            .pop()
+            .and_then(text)
+            .and_then(|v| crate::worktree::parse_option(&v)),
+        _ => None,
+    };
     let agent = match parts.len() {
         22 => parts
             .pop()
-            .and_then(|m| std::str::from_utf8(m).ok())
-            .and_then(agent_name_of_option),
+            .and_then(text)
+            .and_then(|v| agent_name_of_option(&v)),
         _ => None,
     };
+    // A worktree counts only for an agent's window.
+    let worktree = worktree.filter(|_| agent.is_some());
     let f: Vec<&str> = parts
         .into_iter()
         .map(|p| std::str::from_utf8(p).ok())
@@ -365,6 +383,7 @@ fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
         pane: pane.strip_prefix('%')?.parse().ok()?,
         window: window.strip_prefix('@')?.parse().ok()?,
         agent,
+        worktree,
         state: PaneState {
             width: n(width).max(1),
             height: n(height).max(1),
@@ -513,12 +532,15 @@ pub struct Tmux {
     /// pane's directory: the host's start directory, from its profile.
     pub start_dir: Option<String>,
     /// Coding agents asked for, until tmux answers with their windows:
-    /// name and command line, by request number.
-    agents_waiting: BTreeMap<u32, (String, String)>,
+    /// name, command line and worktree, by request number.
+    agents_waiting: BTreeMap<u32, (String, String, Option<Worktree>)>,
     /// The number of the last coding agent asked for.
     agent_seq: u32,
     /// The windows that run a coding agent, by [`AGENT_OPTION`].
     agents: BTreeMap<WindowId, String>,
+    /// The agent windows started in a worktree of their own, by
+    /// [`crate::worktree::OPTION`].
+    worktrees: BTreeMap<WindowId, Worktree>,
     /// Set while this client watches (`false`) or joins to type
     /// (`true`) someone's session: FeroSSH then changes nothing of
     /// theirs (layout, sizes, windows, options) and closing leaves.
@@ -668,6 +690,7 @@ impl Tmux {
             start_dir: None,
             agents_waiting: BTreeMap::new(),
             agent_seq: 0,
+            worktrees: BTreeMap::new(),
             agents: BTreeMap::new(),
             joined: None,
             join_pending: None,
@@ -1169,6 +1192,7 @@ impl Tmux {
         self.orphans.clear();
         self.discovering.clear();
         self.agents.clear();
+        self.worktrees.clear();
         self.placements.clear();
         self.sent_sizes.clear();
         self.sent_client_size = None;
@@ -1519,7 +1543,7 @@ impl Tmux {
                 }
             }
             Tag::AgentWindow(placement, n) => {
-                let Some((name, line)) = self.agents_waiting.remove(&n) else {
+                let Some((name, line, worktree)) = self.agents_waiting.remove(&n) else {
                     return;
                 };
                 let text = first();
@@ -1541,6 +1565,18 @@ impl Tmux {
                     Tag::Ignore,
                     out,
                 );
+                if let Some(wt) = worktree {
+                    self.send(
+                        &format!(
+                            "set-option -w -t @{w} {} {}",
+                            crate::worktree::OPTION,
+                            command::quote(&crate::worktree::option_value(&wt))
+                        ),
+                        Tag::Ignore,
+                        out,
+                    );
+                    self.worktrees.insert(w, wt);
+                }
                 let mut keys = line.into_bytes();
                 keys.push(b'\r');
                 for c in command::send_keys(p, &keys) {
@@ -1571,7 +1607,8 @@ impl Tmux {
                     out.push(Action::StartDir(dir.to_owned()));
                 }
             }
-            Tag::DiffDirHere(native) => {
+            Tag::DiffDirHere(native) | Tag::WorktreeDirHere(native) => {
+                let worktree = matches!(tag, Tag::WorktreeDirHere(_));
                 // Spaces are part of a folder's name: only the line end
                 // goes.
                 let dir = lines
@@ -1580,9 +1617,11 @@ impl Tmux {
                     .unwrap_or_default();
                 let dir = dir.trim_end_matches(['\r', '\n']);
                 if ok && !dir.is_empty() {
-                    out.push(Action::DiffDir {
-                        native,
-                        dir: dir.to_owned(),
+                    let dir = dir.to_owned();
+                    out.push(if worktree {
+                        Action::WorktreeDir { native, dir }
+                    } else {
+                        Action::DiffDir { native, dir }
                     });
                 } else {
                     out.push(Action::Notice(
@@ -1717,6 +1756,9 @@ impl Tmux {
         for line in lines.iter().filter_map(|l| parse_pane_line(l)) {
             if let Some(a) = &line.agent {
                 self.agents.insert(line.window, a.clone());
+            }
+            if let Some(wt) = &line.worktree {
+                self.worktrees.insert(line.window, wt.clone());
             }
             if !infos.contains_key(&line.window) {
                 if order.len() >= MAX_WINDOWS {
@@ -1971,6 +2013,9 @@ impl Tmux {
         if let Some(a) = lines.iter().find_map(|l| l.agent.clone()) {
             self.mark_agent(w, a, out);
         }
+        if let Some(wt) = lines.iter().find_map(|l| l.worktree.clone()) {
+            self.worktrees.insert(w, wt);
+        }
         let known = self.windows.contains_key(&w);
         if !known && self.windows.len() >= MAX_WINDOWS {
             return;
@@ -2092,6 +2137,7 @@ impl Tmux {
     fn remove_window(&mut self, ws: &mut Workspace, w: WindowId, out: &mut Vec<Action>) {
         self.windows.remove(&w);
         self.agents.remove(&w);
+        self.worktrees.remove(&w);
         self.sent_sizes.remove(&w);
         self.sent_layouts.remove(&w);
         let gone: Vec<PaneId> = self
@@ -2144,6 +2190,7 @@ impl Tmux {
         self.orphans.clear();
         self.discovering.clear();
         self.agents.clear();
+        self.worktrees.clear();
         self.placements.clear();
         self.session = None;
         self.clients = None;
@@ -2263,6 +2310,40 @@ impl Tmux {
         out
     }
 
+    /// Asks tmux for native pane `native`'s directory, to make a coding
+    /// agent's worktree from; the answer comes back as
+    /// [`Action::WorktreeDir`].
+    pub fn ask_worktree_dir(&mut self, native: Native) -> Vec<Action> {
+        let mut out = Vec::new();
+        if let Some(p) = self.pane_of(native) {
+            self.send(
+                &format!("display-message -p -t %{p} '#{{pane_current_path}}'"),
+                Tag::WorktreeDirHere(native),
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// Closes the whole tmux window of coding agent pane `native` (the
+    /// agent and any panes split off it), as Remove worktree does once its
+    /// folder is gone. Nothing for another pane, or in a session joined.
+    pub fn close_agent_window(&mut self, native: Native) -> Vec<Action> {
+        let mut out = Vec::new();
+        if self.agent_of(native).is_none() || self.refuse_joined(&mut out) {
+            return out;
+        }
+        let Some(w) = self
+            .pane_of(native)
+            .and_then(|p| self.panes.get(&p))
+            .map(|x| x.window)
+        else {
+            return out;
+        };
+        self.send(&format!("kill-window -t @{w}"), Tag::Ignore, &mut out);
+        out
+    }
+
     /// Asks tmux which directory native pane `native` is in, to show what
     /// changed there; the answer comes back as [`Action::DiffDir`].
     pub fn ask_diff_dir(&mut self, native: Native) -> Vec<Action> {
@@ -2289,7 +2370,7 @@ impl Tmux {
                 let name = self
                     .agents_waiting
                     .get(&n)
-                    .map(|(name, _)| name.clone())
+                    .map(|(name, _, _)| name.clone())
                     .unwrap_or_default();
                 self.send(
                     &format!(
@@ -2315,7 +2396,16 @@ impl Tmux {
     /// happens to the connection.
     /// `dir`, when given, is the directory to start in instead of
     /// `native`'s (an SSH shell outside tmux that asked for the agent).
-    pub fn start_agent(&mut self, native: Native, command: &str, dir: Option<&str>) -> Vec<Action> {
+    /// With `worktree`, the agent starts in that worktree's folder (and
+    /// not in `dir`), and its window is marked with it.
+    pub fn start_agent(
+        &mut self,
+        native: Native,
+        command: &str,
+        dir: Option<&str>,
+        worktree: Option<&Worktree>,
+    ) -> Vec<Action> {
+        let dir = worktree.map(|w| w.path.as_str()).or(dir);
         let mut out = Vec::new();
         if !self.active() || command.trim().is_empty() || self.refuse_joined(&mut out) {
             return out;
@@ -2330,8 +2420,14 @@ impl Tmux {
         }
         self.agent_seq = self.agent_seq.wrapping_add(1);
         let n = self.agent_seq;
-        self.agents_waiting
-            .insert(n, (agent_name(command), command.trim().to_owned()));
+        self.agents_waiting.insert(
+            n,
+            (
+                agent_name(command),
+                command.trim().to_owned(),
+                worktree.cloned(),
+            ),
+        );
         let split = Split::Agent(Placement::Tab { after: native }, n);
         match dir {
             // The asking shell's directory, or tmux's default when it cannot
@@ -2372,6 +2468,15 @@ impl Tmux {
         let p = self.pane_of(native)?;
         let w = self.panes.get(&p)?.window;
         self.agents.get(&w).map(String::as_str)
+    }
+
+    /// The worktree coding agent pane `native` was started in, if it was
+    /// started in one of its own.
+    pub fn worktree_of(&self, native: Native) -> Option<&Worktree> {
+        let p = self.pane_of(native)?;
+        let w = self.panes.get(&p)?.window;
+        self.agents.get(&w)?;
+        self.worktrees.get(&w)
     }
 
     /// A new tmux window as a tab after `native`'s, in its directory.
@@ -2788,7 +2893,7 @@ mod tests {
             t.set_mode(Mode::Tmux),
             t.detach_others(None),
             t.switch_session(None),
-            t.start_agent(n, "claude", None),
+            t.start_agent(n, "claude", None, None),
         ] {
             assert!(writes(&a).is_empty(), "{a:?}");
         }
@@ -3569,7 +3674,7 @@ mod tests {
         assert_eq!(t.agent_of(a0), None);
         // Its pane's directory first, as for a new tab.
         assert_eq!(
-            writes(&t.start_agent(a0, "  claude --resume ", None)),
+            writes(&t.start_agent(a0, "  claude --resume ", None, None)),
             ["display-message -p -t %0 '#{pane_current_path}'"]
         );
         // Replies 5 and 6 were the captures.
@@ -3639,8 +3744,93 @@ mod tests {
         let (mut t, _ws, _) = attached(Some("ferossh"), None, &panes);
         let a0 = t.native_of(0).unwrap();
         assert_eq!(
-            writes(&t.start_agent(a0, "codex", Some("/srv/api #1"))),
+            writes(&t.start_agent(a0, "codex", Some("/srv/api #1"), None)),
             ["new-window -d -c '/srv/api ##1' -n 'codex' -P -F '#{window_id} #{pane_id}'"]
+        );
+    }
+
+    #[test]
+    fn an_agent_in_a_worktree_starts_there_and_its_window_keeps_it() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (mut t, mut ws, _) = attached(Some("ferossh"), None, &panes);
+        let a0 = t.native_of(0).unwrap();
+        let wt = Worktree {
+            branch: "claude-2".into(),
+            path: "/srv/my app-claude-2".into(),
+        };
+        // The worktree's folder, not the pane's or the one given.
+        assert_eq!(
+            writes(&t.start_agent(a0, "claude", Some("/srv/other"), Some(&wt))),
+            ["new-window -d -c '/srv/my app-claude-2' -n 'claude' -P -F '#{window_id} #{pane_id}'"]
+        );
+        // Replies 5 and 6 were the captures.
+        let mut input = reply(5, &[]);
+        input.extend(reply(6, &[]));
+        input.extend(reply(7, &["@4 %9".into()]));
+        let a = t.feed(&mut ws, &input);
+        let w = writes(&a);
+        assert_eq!(w[0], "set-option -w -t @4 @ferossh-agent 'claude'");
+        assert_eq!(
+            w[1],
+            "set-option -w -t @4 @ferossh-worktree 'claude-2 /srv/my app-claude-2'"
+        );
+        // Read back on the next attach, from any PC.
+        let mut line = pane_line(9, 4, 80, 24, "b25f,80x24,0,0,9");
+        line.push_str(" claude claude-2 /srv/my app-claude-2");
+        let parsed = parse_pane_line(line.as_bytes()).unwrap();
+        assert_eq!(parsed.agent.as_deref(), Some("claude"));
+        assert_eq!(parsed.worktree.as_ref(), Some(&wt));
+        // Only with an agent, and only as written.
+        let mut line = pane_line(9, 4, 80, 24, "b25f,80x24,0,0,9");
+        line.push_str("  claude-2 /srv/x");
+        assert_eq!(parse_pane_line(line.as_bytes()).unwrap().worktree, None);
+        let mut line = pane_line(9, 4, 80, 24, "b25f,80x24,0,0,9");
+        line.push_str(" claude ../x /srv/x");
+        assert_eq!(parse_pane_line(line.as_bytes()).unwrap().worktree, None);
+        // 8 to 10 were the two options and the keys.
+        let mut input = reply(8, &[]);
+        input.extend(reply(9, &[]));
+        input.extend(reply(10, &[]));
+        let mut line = pane_line(9, 4, 80, 24, "b25f,80x24,0,0,9");
+        line.push_str(" claude claude-2 /srv/my app-claude-2");
+        input.extend(reply(11, &[line]));
+        let a = t.feed(&mut ws, &input);
+        let native = a
+            .iter()
+            .find_map(|a| match a {
+                Action::Create {
+                    native, pane: 9, ..
+                } => Some(*native),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(t.worktree_of(native), Some(&wt));
+        assert_eq!(t.worktree_of(a0), None);
+        // The new pane's captures come first.
+        let captures = writes(&a).len();
+        // Remove worktree closes the agent's whole window, and only an
+        // agent's.
+        assert_eq!(writes(&t.close_agent_window(native)), ["kill-window -t @4"]);
+        assert!(t.close_agent_window(a0).is_empty());
+        // Start in a new worktree asks tmux for the pane's folder first.
+        assert_eq!(
+            writes(&t.ask_worktree_dir(a0)),
+            ["display-message -p -t %0 '#{pane_current_path}'"]
+        );
+        let mut input = Vec::new();
+        for n in 12..12 + captures {
+            input.extend(reply(n as u32, &[]));
+        }
+        let next = (12 + captures) as u32;
+        input.extend(reply(next, &[]));
+        input.extend(reply(next + 1, &["/srv/my app ".into()]));
+        let a = t.feed(&mut ws, &input);
+        assert!(
+            a.contains(&Action::WorktreeDir {
+                native: a0,
+                dir: "/srv/my app ".into()
+            }),
+            "{a:?}"
         );
     }
 

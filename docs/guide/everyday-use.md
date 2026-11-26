@@ -697,6 +697,20 @@ Session > Coding agents starts a coding agent (Claude Code, Codex, aider, or you
 
 The menu offers `claude`, `codex` and `aider` until you list your own: one `AgentCommand` line each in `ferossh.conf`, such as `AgentCommand claude --model opus` (see [Settings](settings.md)). The line is typed at the server's shell exactly as written.
 
+#### An agent in a worktree of its own
+
+Two agents in one folder edit the same files. Session > Coding agents > Start claude in a new git worktree (and the same for each of your agent commands) gives each agent a git worktree and branch of its own, so several can work on one repository at once without getting in each other's way:
+
+1. FeroSSH finds the git repository the focused pane is in (for a tmux pane it asks tmux, for any other SSH pane it uses the folder the shell is in).
+2. It runs `git worktree add -b claude ../<repo>-claude` next to the repository's main folder, from the commit the pane has checked out. When the branch or the folder is taken it uses `claude-2`, `claude-3` and so on. Uncommitted changes in your own folder do not go along.
+3. The agent starts there in its own tmux window, as Start ... in tmux does, and the window remembers its branch and folder (the tmux window option `@ferossh-worktree`), from any PC.
+
+The Agent dashboard shows *branch claude-2* in front of the agent's details, and you can search for the branch after `is:agent`. Show what changed here, from the agent's pane, shows the worktree's changes with *On branch claude-2* in the heading.
+
+When you are done, merge or push the branch as usual. Then Session > Coding agents > Remove this agent's worktree, from the agent's pane, asks and runs `git worktree remove`. git keeps a worktree that has uncommitted or untracked changes, and FeroSSH then tells you and changes nothing. Once the folder is gone, the agent's tmux window closes (the agent stops), and the branch is deleted only if it is merged (`git branch -d`). An unmerged branch stays with the agent's commits, for you to merge or delete with `git branch -D`. FeroSSH never removes the repository's main folder.
+
+git runs over the pane's own SSH connection, with `sh`, so the server needs both. The folder and the branch go to git on its input, never in the command. Branch names are only letters, digits, `.`, `_` and `-`, made from the agent's name.
+
 ### Pasting screenshots and files for an agent
 
 Agents on a server take images and files by path, and cannot read the clipboard of your PC. Tick Session > Coding agents > Paste and drop files: upload and type the path, and then:

@@ -491,6 +491,7 @@ fn bindable(id: u32) -> bool {
     let lists = [
         cmd::WINDOW_COLOURS..cmd::FONT,
         cmd::AGENT_START..cmd::AGENT_END,
+        cmd::WORKTREE_START..cmd::WORKTREE_END,
         cmd::FONT..cmd::COPY,
         cmd::REMOTE_APP_CLIP..cmd::REMOTE_APP_CLIP_LAST + 1,
         cmd::DESKTOP_CLIP..cmd::DESKTOP_CLIP_LAST + 1,
@@ -708,6 +709,13 @@ mod cmd {
     /// when the menu opened, up to [`AGENT_END`].
     pub const AGENT_START: u32 = 660;
     pub const AGENT_END: u32 = 676;
+    /// Session > Coding agents > Start <agent> in a new worktree: plus the
+    /// index into the commands listed when the menu opened, up to
+    /// [`WORKTREE_END`].
+    pub const WORKTREE_START: u32 = 960;
+    pub const WORKTREE_END: u32 = 976;
+    /// Session > Coding agents > Remove this agent's worktree.
+    pub const WORKTREE_REMOVE: u32 = 647;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New connection".
     pub const TMUX_SESSION: u32 = 800;
@@ -1547,6 +1555,12 @@ struct Window {
     vdesks: HashMap<ChannelId, VirtualDesk>,
     /// Session > Copy public key to this server, by its exec channel.
     key_copies: HashMap<ChannelId, KeyCopy>,
+    /// git worktree scripts of Session > Coding agents running, by their
+    /// exec channel.
+    worktree_jobs: HashMap<ChannelId, WorktreeJob>,
+    /// Agents to start in a new worktree, by the tmux pane whose folder
+    /// tmux was asked for.
+    worktree_asks: HashMap<PaneId, String>,
     /// The inventory's OS and kernel being read, by channel.
     system_reads: HashMap<ChannelId, SystemRead>,
     /// Panes opened under a connection's old name before it was renamed:
@@ -1902,6 +1916,23 @@ struct SystemRead {
     /// The connection's name.
     alias: String,
     out: Vec<u8>,
+}
+
+/// A git worktree script of Session > Coding agents running on a server.
+struct WorktreeJob {
+    connection: ChannelId,
+    /// The pane it is for.
+    pane: PaneId,
+    kind: WorktreeKind,
+    out: Vec<u8>,
+    err: Vec<u8>,
+}
+
+enum WorktreeKind {
+    /// Making one, to start agent `command` in.
+    Add { command: String },
+    /// Removing this one.
+    Remove(crate::worktree::Worktree),
 }
 
 struct KeyCopy {
@@ -3077,6 +3108,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 preview_waiting: Vec::new(),
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
+                worktree_jobs: HashMap::new(),
+                worktree_asks: HashMap::new(),
                 system_reads: HashMap::new(),
                 inventory_renames: HashMap::new(),
                 inventory_pending: Vec::new(),
@@ -3441,6 +3474,11 @@ fn build_menu() -> Result<HMENU> {
             agents,
             cmd::AGENT_DIFF,
             "Show what &changed here (side-by-side git diff)",
+        )?;
+        item(
+            agents,
+            cmd::WORKTREE_REMOVE,
+            "&Remove this agent's worktree...",
         )?;
         item(
             agents,
@@ -4486,6 +4524,13 @@ impl Window {
                         self.queued.push(command);
                     }
                 }
+                tmux::Action::WorktreeDir { native, dir } => {
+                    if let Some(command) = self.worktree_asks.remove(&native)
+                        && let Some(next) = self.make_worktree(native, dir.into_bytes(), command)
+                    {
+                        self.queued.push(next);
+                    }
+                }
             }
         }
         if structure {
@@ -5271,6 +5316,7 @@ impl Window {
                     since: since.map(crate::attention::spoken),
                     waited: asked.map(|_| since.unwrap_or_default()),
                     last: crate::agents::last_line(&p.term.screen_text()),
+                    branch: self.worktree_of(id).map(|w| w.branch.clone()),
                 }
             });
             out.push(LiveSession {
@@ -5595,6 +5641,8 @@ impl Window {
             .retain(|_, f| workers.contains_key(&f.connection));
         self.system_reads
             .retain(|_, r| workers.contains_key(&r.connection));
+        self.worktree_jobs
+            .retain(|_, j| workers.contains_key(&j.connection));
         // SAFETY: our window and timer.
         unsafe {
             SetTimer(
@@ -11832,6 +11880,14 @@ impl Window {
                     return false;
                 }
                 if self
+                    .worktree_jobs
+                    .get(&c)
+                    .is_some_and(|j| j.connection == connection)
+                {
+                    self.on_worktree(c, msg);
+                    return false;
+                }
+                if self
                     .system_reads
                     .get(&c)
                     .is_some_and(|r| r.connection == connection)
@@ -11925,6 +11981,21 @@ impl Window {
                     .collect();
                 for c in lost {
                     self.on_key_copy(
+                        c,
+                        Message::Disconnected {
+                            channel: c,
+                            reason: why.clone(),
+                        },
+                    );
+                }
+                let lost: Vec<ChannelId> = self
+                    .worktree_jobs
+                    .iter()
+                    .filter(|(_, j)| j.connection == connection)
+                    .map(|(&c, _)| c)
+                    .collect();
+                for c in lost {
+                    self.on_worktree(
                         c,
                         Message::Disconnected {
                             channel: c,
@@ -12510,15 +12581,20 @@ impl Window {
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
-        // allowed. Everything after Agent dashboard, Show what changed and
-        // the six options is replaced.
+        // allowed. Everything after Agent dashboard, Show what changed,
+        // Remove this agent's worktree and the six options is replaced.
         unsafe {
-            while GetMenuItemCount(Some(menu)) > 8 {
-                let _ = DeleteMenu(menu, 8, MF_BYPOSITION);
+            while GetMenuItemCount(Some(menu)) > 9 {
+                let _ = DeleteMenu(menu, 9, MF_BYPOSITION);
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
                 let label = format!("Start {} in tmux", c.replace('&', "&&"));
+                let _ = AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(label));
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            for (id, c) in (cmd::WORKTREE_START..cmd::WORKTREE_END).zip(&commands) {
+                let label = format!("Start {} in a new git worktree", c.replace('&', "&&"));
                 let _ = AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(label));
             }
         }
@@ -12527,9 +12603,11 @@ impl Window {
     /// Starts coding agent `command` from pane `id`, in tmux on its server
     /// (see [`crate::agents`]): in a new window of the tmux session that
     /// shows on that host, or else in session `agents`, attached here.
+    /// With `worktree`, in a new git worktree of its own first
+    /// ([`Self::start_agent_worktree`]).
     /// A pane with the Production theme asks first, while Session >
     /// Scripts > Confirm scripts and agents on Production hosts is on.
-    fn start_agent(&mut self, id: PaneId, command: &str) -> Option<Command> {
+    fn start_agent(&mut self, id: PaneId, command: &str, worktree: bool) -> Option<Command> {
         if self.settings.confirm_production
             && let Some(p) = self.panes.get(&id)
             && p.theme.name == "Production"
@@ -12538,24 +12616,29 @@ impl Window {
                 pane: id,
                 command: command.to_owned(),
                 host: p.host_label(),
+                worktree,
             });
         }
-        self.start_agent_now(id, command)
+        if worktree {
+            self.start_agent_worktree(id, command)
+        } else {
+            self.start_agent_now(id, command)
+        }
     }
 
     /// [`Self::start_agent`], asked already where it asks.
     fn start_agent_now(&mut self, id: PaneId, command: &str) -> Option<Command> {
+        self.start_agent_at(id, command, None)
+    }
+
+    /// Why a coding agent cannot start from pane `id`, if it cannot: what
+    /// to tell the user.
+    fn agent_refused(&self, id: PaneId) -> Option<Command> {
         const HOW: &str = "A coding agent starts in tmux on a server: use it from a pane \
             that is logged in to one over SSH.";
-        // A tmux pane: a new window in its own session.
         if let Some(g) = self.panes.get(&id).and_then(Pane::gateway) {
-            let actions = self
-                .tmux
-                .get_mut(&g)
-                .filter(|t| t.active())
-                .map(|t| t.start_agent(id, command, None))?;
-            self.run_tmux(g, actions);
-            return None;
+            return (!self.tmux.get(&g).is_some_and(tmux::Tmux::active))
+                .then(|| Command::Notice(HOW.into()));
         }
         let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
             return Some(Command::Notice(HOW.into()));
@@ -12579,6 +12662,33 @@ impl Window {
                     .into(),
             ));
         }
+        None
+    }
+
+    /// [`Self::start_agent_now`], in `worktree`'s folder when given (and
+    /// its window marked with it), else in pane `id`'s.
+    fn start_agent_at(
+        &mut self,
+        id: PaneId,
+        command: &str,
+        worktree: Option<&crate::worktree::Worktree>,
+    ) -> Option<Command> {
+        if let Some(refused) = self.agent_refused(id) {
+            return Some(refused);
+        }
+        // A tmux pane: a new window in its own session.
+        if let Some(g) = self.panes.get(&id).and_then(Pane::gateway) {
+            let actions = self
+                .tmux
+                .get_mut(&g)
+                .filter(|t| t.active())
+                .map(|t| t.start_agent(id, command, None, worktree))?;
+            self.run_tmux(g, actions);
+            return None;
+        }
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return None;
+        };
         // tmux already shows on this host (only one pane per host may),
         // reached the same way: the agent joins that session.
         let route = route_key(&s.target);
@@ -12605,7 +12715,7 @@ impl Window {
                 .map(str::to_owned);
             let next_to = self.tmux.get(&g).and_then(|t| t.natives().first().copied());
             let actions = match (self.tmux.get_mut(&g), next_to) {
-                (Some(t), Some(n)) => t.start_agent(n, command, dir.as_deref()),
+                (Some(t), Some(n)) => t.start_agent(n, command, dir.as_deref(), worktree),
                 // Still bringing its windows back.
                 _ => {
                     return Some(Command::Notice(
@@ -12616,10 +12726,337 @@ impl Window {
             self.run_tmux(g, actions);
             return None;
         }
-        let line = crate::agents::start_line(command);
+        let line = crate::agents::start_line(command, worktree);
         self.send_host(id, line.as_bytes());
         self.attach_tmux(id, crate::agents::SESSION, false);
         None
+    }
+
+    /// Session > Coding agents > Start <agent> in a new git worktree: a
+    /// worktree and branch of the git repository pane `id` is in, made by
+    /// [`crate::worktree::add_command`], for agent `command` to start in
+    /// ([`Self::on_worktree`] starts it). A tmux pane's folder comes from
+    /// tmux; another pane's from its shell (OSC 7 or the prompt).
+    fn start_agent_worktree(&mut self, id: PaneId, command: &str) -> Option<Command> {
+        if let Some(refused) = self.agent_refused(id) {
+            return Some(refused);
+        }
+        if let Some(g) = self.panes.get(&id).and_then(Pane::gateway) {
+            // No worktree is made for an agent that could not start.
+            if self.tmux.get(&g).is_some_and(|t| t.joined().is_some()) {
+                return Some(Command::Notice(
+                    "This pane is in someone else's tmux session, which FeroSSH changes \
+                     nothing of: start the agent from a pane of your own."
+                        .into(),
+                ));
+            }
+            let actions = self
+                .tmux
+                .get_mut(&g)
+                .filter(|t| t.active())
+                .map(|t| t.ask_worktree_dir(id))
+                .unwrap_or_default();
+            if !actions.is_empty() {
+                self.worktree_asks.insert(id, command.to_owned());
+                self.run_tmux(g, actions);
+                return None;
+            }
+        }
+        let Some(dir) = self
+            .panes
+            .get(&id)
+            .and_then(|p| p.cwd.clone())
+            .filter(|d| d.starts_with(b"/"))
+        else {
+            return Some(Command::Notice(
+                "FeroSSH does not know which folder this pane is in: its shell has not \
+                 said (by OSC 7, or in a prompt FeroSSH can read). Use this from a shell \
+                 in the project's folder, or from a tmux pane there."
+                    .into(),
+            ));
+        };
+        self.make_worktree(id, dir, command.to_owned())
+    }
+
+    /// Runs [`crate::worktree::add_command`] for the repository folder
+    /// `dir` is in, on pane `id`'s connection; agent `command` starts in
+    /// the worktree once it is made.
+    fn make_worktree(&mut self, id: PaneId, dir: Vec<u8>, command: String) -> Option<Command> {
+        let base = crate::worktree::branch_base(&crate::tmux::agent_name(&command));
+        let (Some(connection), Some(input)) = (
+            self.pane_connection(id),
+            crate::worktree::add_input(&dir, &base),
+        ) else {
+            return Some(Command::Notice(
+                "FeroSSH cannot make a worktree from this pane: it needs a pane logged in \
+                 over SSH, in a folder whose name is on one line."
+                    .into(),
+            ));
+        };
+        self.run_worktree_job(
+            connection,
+            id,
+            crate::worktree::add_command(),
+            input,
+            WorktreeKind::Add { command },
+        );
+        None
+    }
+
+    /// Starts git worktree script `command` with `input` on its standard
+    /// input, on `connection`.
+    fn run_worktree_job(
+        &mut self,
+        connection: ChannelId,
+        pane: PaneId,
+        command: Vec<u8>,
+        input: Vec<u8>,
+        kind: WorktreeKind,
+    ) {
+        let channel = self.new_channel();
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        w.link.send(Message::Exec {
+            channel,
+            connection,
+            command,
+            split_stderr: true,
+        });
+        w.link.send(Message::Data {
+            channel,
+            bytes: input,
+        });
+        w.link.send(Message::Eof { channel });
+        self.worktree_jobs.insert(
+            channel,
+            WorktreeJob {
+                connection,
+                pane,
+                kind,
+                out: Vec::new(),
+                err: Vec::new(),
+            },
+        );
+    }
+
+    /// What a git worktree script said, or that it ended: the agent
+    /// starts in the new worktree, or the user is told what happened.
+    fn on_worktree(&mut self, channel: ChannelId, msg: Message) {
+        /// More is never needed: the answer is on the last lines.
+        const KEEP: usize = 16 * 1024;
+        let Some(j) = self.worktree_jobs.get_mut(&channel) else {
+            return;
+        };
+        let keep = |buf: &mut Vec<u8>, bytes: &[u8]| {
+            buf.extend_from_slice(bytes);
+            if buf.len() > KEEP {
+                let cut = buf.len() - KEEP;
+                buf.drain(..cut);
+            }
+        };
+        let reason = match msg {
+            Message::Data { bytes, .. } => {
+                keep(&mut j.out, &bytes);
+                return;
+            }
+            Message::ExecStderr { bytes, .. } => {
+                keep(&mut j.err, &bytes);
+                return;
+            }
+            Message::Disconnected { reason, .. } => reason,
+            _ => return,
+        };
+        let Some(j) = self.worktree_jobs.remove(&channel) else {
+            return;
+        };
+        let host = self
+            .panes
+            .get(&j.pane)
+            .map(Pane::host_label)
+            .unwrap_or_default();
+        let host = crate::ssh::sanitize(&host);
+        let why = |said: &str| {
+            if said.is_empty() {
+                format!(
+                    "no answer from the server ({}). It needs sh and git, as Linux and macOS \
+                     servers have",
+                    crate::ssh::sanitize(&reason)
+                )
+            } else {
+                format!("git said: {said}")
+            }
+        };
+        let text = match j.kind {
+            WorktreeKind::Add { command } => {
+                use crate::worktree::Added;
+                match crate::worktree::parse_add(&j.out, &j.err) {
+                    Added::Made(w) => {
+                        if !self.panes.contains_key(&j.pane) {
+                            format!(
+                                "Made worktree {} on branch {} on {host}, but the pane it was \
+                                 asked from has closed, so no agent started there.",
+                                crate::ssh::sanitize_line(&w.path),
+                                w.branch
+                            )
+                        } else {
+                            if let Some(next) = self.start_agent_at(j.pane, &command, Some(&w)) {
+                                self.queued.push(next);
+                            }
+                            return;
+                        }
+                    }
+                    Added::NoGit => format!("{host} has no git command, so no worktree was made."),
+                    Added::NoDir => format!(
+                        "The pane's folder is not on {host} any more, or cannot be entered."
+                    ),
+                    Added::NoRepo => format!(
+                        "This pane's folder on {host} is not in a git repository, so there \
+                         is nothing to make a worktree of. cd into the project first."
+                    ),
+                    Added::Full => format!(
+                        "Every branch name for this agent is taken on {host} (up to -99): \
+                         remove some of its old worktrees and branches first."
+                    ),
+                    Added::Failed(said) => {
+                        format!("Could not make a worktree on {host}: {}.", why(&said))
+                    }
+                }
+            }
+            WorktreeKind::Remove(w) => {
+                use crate::worktree::Removal;
+                let path = crate::ssh::sanitize_line(&w.path);
+                match crate::worktree::parse_remove(&j.out, &j.err) {
+                    Removal::Removed { branch_deleted } => {
+                        // The agent's window goes with its folder, if it
+                        // is still the same agent's.
+                        if self.worktree_of(j.pane) == Some(&w)
+                            && let Some(g) = self.panes.get(&j.pane).and_then(Pane::gateway)
+                            && let Some(t) = self.tmux.get_mut(&g)
+                        {
+                            let actions = t.close_agent_window(j.pane);
+                            self.run_tmux(g, actions);
+                        }
+                        if branch_deleted {
+                            format!(
+                                "Removed worktree {path} on {host}, and its branch {} (it was \
+                                 merged).",
+                                w.branch
+                            )
+                        } else {
+                            format!(
+                                "Removed worktree {path} on {host}. Its branch {} stays, with \
+                                 the agent's commits: merge it, or delete it with git branch -D.",
+                                w.branch
+                            )
+                        }
+                    }
+                    Removal::Kept(said) => format!(
+                        "git kept worktree {path} on {host}, and the agent runs on: {}. \
+                         Commit or throw away its changes first.",
+                        if said.is_empty() {
+                            "it has uncommitted or untracked changes, or is locked".to_owned()
+                        } else {
+                            said
+                        }
+                    ),
+                    Removal::NoGit => format!("{host} has no git command."),
+                    Removal::NoDir => format!(
+                        "The worktree {path} is not on {host} any more. git worktree prune in \
+                         the repository forgets it."
+                    ),
+                    Removal::NoRepo | Removal::Other => format!(
+                        "{path} on {host} is no longer the worktree of branch {}, so nothing \
+                         was removed.",
+                        w.branch
+                    ),
+                    Removal::Main => format!(
+                        "{path} on {host} is the repository's main worktree: FeroSSH never \
+                         removes that."
+                    ),
+                    Removal::Failed(said) => {
+                        format!(
+                            "Could not remove worktree {path} on {host}: {}.",
+                            why(&said)
+                        )
+                    }
+                }
+            }
+        };
+        self.queued.push(Command::Notice(text));
+    }
+
+    /// Session > Coding agents > Remove this agent's worktree: for an agent
+    /// pane started in a worktree of its own, asks first.
+    fn ask_remove_worktree(&mut self, id: PaneId) -> Option<Command> {
+        let (Some(w), Some(agent)) = (self.worktree_of(id).cloned(), self.agent_of(id)) else {
+            return Some(Command::Notice(
+                "This pane is not a coding agent started in a worktree of its own. Use it \
+                 from the pane of an agent started with Session > Coding agents > Start ... \
+                 in a new git worktree."
+                    .into(),
+            ));
+        };
+        let agent = agent.to_owned();
+        if self
+            .panes
+            .get(&id)
+            .and_then(Pane::gateway)
+            .and_then(|g| self.tmux.get(&g))
+            .is_some_and(|t| t.joined().is_some())
+        {
+            return Some(Command::Notice(
+                "This agent runs in someone else's tmux session, which FeroSSH changes \
+                 nothing of."
+                    .into(),
+            ));
+        }
+        let host = self
+            .panes
+            .get(&id)
+            .map(Pane::host_label)
+            .unwrap_or_default();
+        Some(Command::RemoveWorktree {
+            pane: id,
+            worktree: w,
+            agent,
+            host,
+        })
+    }
+
+    /// Removes worktree `w` of agent pane `id`, as the user confirmed:
+    /// [`crate::worktree::remove_command`] on its connection, and the
+    /// agent's window once the folder is gone ([`Self::on_worktree`]).
+    fn remove_worktree(&mut self, id: PaneId, w: &crate::worktree::Worktree) -> Option<Command> {
+        // Still the same agent's worktree, after the dialog.
+        if self.worktree_of(id) != Some(w) {
+            return Some(Command::Notice(
+                "That agent's window has closed or changed meanwhile, so nothing was removed."
+                    .into(),
+            ));
+        }
+        let (Some(connection), Some(input)) =
+            (self.pane_connection(id), crate::worktree::remove_input(w))
+        else {
+            return Some(Command::Notice(
+                "The connection to that agent's host is closed: reconnect, then try again.".into(),
+            ));
+        };
+        self.run_worktree_job(
+            connection,
+            id,
+            crate::worktree::remove_command(),
+            input,
+            WorktreeKind::Remove(w.clone()),
+        );
+        None
+    }
+
+    /// The worktree of its own that coding agent pane `id` was started in,
+    /// if it was started in one.
+    fn worktree_of(&self, id: PaneId) -> Option<&crate::worktree::Worktree> {
+        let g = self.panes.get(&id).and_then(Pane::gateway)?;
+        self.tmux.get(&g)?.worktree_of(id)
     }
 
     /// A tmux pane just appeared: if its window runs a coding agent, its
@@ -20782,8 +21219,16 @@ impl Window {
                 let command = crate::agents::commands(&self.settings.agent_commands)
                     .get(i)
                     .cloned()?;
-                return self.start_agent(pane, &command);
+                return self.start_agent(pane, &command, false);
             }
+            id if (cmd::WORKTREE_START..cmd::WORKTREE_END).contains(&id) => {
+                let i = (id - cmd::WORKTREE_START) as usize;
+                let command = crate::agents::commands(&self.settings.agent_commands)
+                    .get(i)
+                    .cloned()?;
+                return self.start_agent(pane, &command, true);
+            }
+            cmd::WORKTREE_REMOVE => return self.ask_remove_worktree(pane),
             cmd::STATUS_BAR => {
                 self.settings.status_bar = !self.settings.status_bar;
                 self.save_settings();
@@ -24131,6 +24576,15 @@ enum Command {
     ConfirmAgent {
         pane: PaneId,
         command: String,
+        host: String,
+        /// In a new git worktree of its own.
+        worktree: bool,
+    },
+    /// Session > Coding agents > Remove this agent's worktree: asks first.
+    RemoveWorktree {
+        pane: PaneId,
+        worktree: crate::worktree::Worktree,
+        agent: String,
         host: String,
     },
     /// A snippet is about to go to a pane with the Production theme: asks
@@ -28070,6 +28524,7 @@ fn run_command(hwnd: HWND, command: Command) {
             pane,
             command,
             host,
+            worktree,
         } => {
             let text = format!(
                 "Start the coding agent {} on {host}, which has the Production theme?\n\n\
@@ -28080,7 +28535,37 @@ fn run_command(hwnd: HWND, command: Command) {
                     .collect::<String>(),
             );
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
-                && let Some(next) = with_window(|w| w.start_agent_now(pane, &command)).flatten()
+                && let Some(next) = with_window(|w| {
+                    if worktree {
+                        w.start_agent_worktree(pane, &command)
+                    } else {
+                        w.start_agent_now(pane, &command)
+                    }
+                })
+                .flatten()
+            {
+                run_command(hwnd, next);
+            }
+        }
+        Command::RemoveWorktree {
+            pane,
+            worktree,
+            agent,
+            host,
+        } => {
+            let text = format!(
+                "Remove the worktree of {agent} on {host}?\n\n\
+                 Folder: {}\nBranch: {}\n\n\
+                 git removes the folder only when everything in it is committed: \
+                 uncommitted or untracked changes keep it, and nothing else happens. \
+                 Once it is gone, the agent's tmux window closes (the agent stops), \
+                 and the branch is deleted only if it is merged, so the agent's \
+                 commits stay.",
+                crate::ssh::sanitize_line(&worktree.path),
+                worktree.branch,
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
+                && let Some(next) = with_window(|w| w.remove_worktree(pane, &worktree)).flatten()
             {
                 run_command(hwnd, next);
             }

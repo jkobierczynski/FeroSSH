@@ -40,6 +40,10 @@ pub fn command() -> Vec<u8> {
             .to_owned(),
         "cd -- \"$t\" || exit 2".to_owned(),
         "printf \"@ferossh-diff top %s\\n\" \"$t\"; e=0; i=0".to_owned(),
+        // The branch checked out (an agent's worktree has its own).
+        "if b=$(git symbolic-ref -q --short HEAD 2>/dev/null); then \
+         printf \"@ferossh-diff branch %s\\n\" \"$b\"; fi"
+            .to_owned(),
         // The commit is looked up once: one an agent makes meanwhile
         // neither renames the heading nor moves what is compared.
         format!(
@@ -112,6 +116,8 @@ pub enum Outcome {
 pub struct Diff {
     /// The repository's top folder.
     pub top: String,
+    /// The branch checked out there; `None` for a detached HEAD.
+    pub branch: Option<String>,
     /// The commit compared against, as short hash and subject; `None`
     /// before the first commit.
     pub head: Option<String>,
@@ -274,6 +280,7 @@ pub fn parse(out: &[u8]) -> Outcome {
                 "nodir" => return Outcome::NoDir,
                 "norepo" => return Outcome::NoRepo,
                 "top" => diff.top = clean(arg),
+                "branch" if !arg.is_empty() => diff.branch = Some(clean(arg)),
                 "head" => diff.head = Some(clean(arg)),
                 "failed" => diff.failed = true,
                 "more" => diff.more = true,
@@ -599,10 +606,13 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
         .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
     let (top, _) = fit(&diff.top, cols.saturating_sub(12));
     out.push(format!("\x1b[0;1mChanges in {top}{RESET}"));
-    let since = match &diff.head {
+    let mut since = match &diff.head {
         Some(h) => format!("since commit {h}"),
         None => "no commits yet: staged, then unstaged".to_owned(),
     };
+    if let Some(b) = &diff.branch {
+        since = format!("On branch {b}, {since}");
+    }
     out.push(format!("{DIM}{}{RESET}", fit(&since, cols).0));
     let count = match diff.files.len() {
         1 => "1 file".to_owned(),
@@ -869,6 +879,23 @@ mod tests {
     }
 
     #[test]
+    fn the_branch_shows_in_the_heading() {
+        let Outcome::Changes(d) = parse(
+            b"@ferossh-diff top /r\n@ferossh-diff branch claude-2\x1b[2J\n@ferossh-diff head abc Init\n",
+        ) else {
+            panic!()
+        };
+        assert_eq!(d.branch, Some(clean("claude-2\x1b[2J")));
+        let look = Look {
+            removed: [0; 3],
+            added: [0; 3],
+        };
+        let r = render(&d, 80, &look, &[]);
+        assert!(r.text.contains("On branch claude-2"), "{}", r.text);
+        assert!(!r.text.contains("\x1b[2J"), "{}", r.text);
+    }
+
+    #[test]
     fn markers_say_why_there_is_nothing() {
         assert_eq!(parse(b"@ferossh-diff norepo\n"), Outcome::NoRepo);
         assert_eq!(parse(b"@ferossh-diff nodir\n"), Outcome::NoDir);
@@ -1112,6 +1139,8 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
         assert_eq!(d.head, None);
         assert_eq!(d.files.len(), 1);
         git(&["commit", "-q", "-m", "first"]);
+        // An agent's branch, as in its worktree.
+        git(&["checkout", "-q", "-b", "claude-2"]);
         std::fs::write(repo.join("a.txt"), "one\nTWO\nthree\n").unwrap();
         std::fs::write(repo.join("sub").join("new file.md"), "hello\n").unwrap();
         std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
@@ -1120,6 +1149,7 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
             panic!()
         };
         assert!(d.top.ends_with("my repo's"), "{}", d.top);
+        assert_eq!(d.branch.as_deref(), Some("claude-2"));
         // The untracked files' "they differ" (status 1) is no failure.
         assert!(!d.failed);
         assert!(d.head.as_deref().unwrap().ends_with(" first"));
