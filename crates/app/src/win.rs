@@ -15316,14 +15316,43 @@ impl Window {
         if !self.settings.tmux_keys {
             return None;
         }
-        let gateway = self.panes.get(&id).and_then(Pane::gateway)?;
-        let t = self.tmux.get(&gateway).filter(|t| t.active())?;
-        // Until tmux answers, its default.
+        let p = self.panes.get(&id)?;
+        if let Some(t) = p
+            .gateway()
+            .and_then(|g| self.tmux.get(&g))
+            .filter(|t| t.active())
+        {
+            // Until tmux answers, its default.
+            return Some(
+                t.keys()
+                    .and_then(tmux_keys::Keys::parse)
+                    .unwrap_or_default(),
+            );
+        }
+        // A shell on this PC (cmd, PowerShell, WSL) or a WSL gateway
+        // waiting for Enter: the same keys work its tabs and panes, with
+        // the prefix of an open tmux session, else tmux's default. Not a
+        // plain SSH pane, which may run tmux of its own.
+        if !matches!(p.host, Host::Local { .. } | Host::Wsl(_)) {
+            return None;
+        }
         Some(
-            t.keys()
-                .and_then(tmux_keys::Keys::parse)
+            self.tmux
+                .values()
+                .filter(|t| t.active())
+                .find_map(|t| t.keys().and_then(tmux_keys::Keys::parse))
                 .unwrap_or_default(),
         )
+    }
+
+    /// Whether pane `id` is a pane of an open tmux session (not a local
+    /// shell using the tmux keybindings).
+    fn in_tmux(&self, id: PaneId) -> bool {
+        self.panes
+            .get(&id)
+            .and_then(Pane::gateway)
+            .and_then(|g| self.tmux.get(&g))
+            .is_some_and(Tmux::active)
     }
 
     /// A character typed in pane `id`, for the tmux keybindings: the
@@ -15415,10 +15444,26 @@ impl Window {
                     self.shared_close(&panes).unwrap_or(shared),
                 ))
             }
+            TmuxKey::ClosePane if !self.in_tmux(id) => Some(Command::Confirm {
+                text: "Close this pane? The program in it ends.".into(),
+                then: Box::new(Command::Id(cmd::CLOSE_PANE)),
+            }),
             TmuxKey::ClosePane => Some(Command::Confirm {
                 text: "Close this tmux pane? tmux ends the program in it (kill-pane).".into(),
                 then: Box::new(Command::Id(cmd::CLOSE_PANE)),
             }),
+            TmuxKey::CloseTab if !self.in_tmux(id) => {
+                let n = self.ws.tab().map_or(0, |t| t.root.panes().len());
+                let panes = if n == 1 {
+                    "its pane".to_owned()
+                } else {
+                    format!("its {n} panes")
+                };
+                Some(Command::Confirm {
+                    text: format!("Close this tab and {panes}? The programs in them end."),
+                    then: Box::new(Command::CloseTabNow(self.ws.active)),
+                })
+            }
             TmuxKey::CloseTab => {
                 let n = self.ws.tab().map_or(0, |t| t.root.panes().len());
                 let panes = if n == 1 {
@@ -15435,6 +15480,8 @@ impl Window {
                 })
             }
             TmuxKey::BreakPane => run(cmd::PANE_TO_TAB),
+            // Outside tmux there is no session to leave or pick.
+            TmuxKey::Detach | TmuxKey::ChooseSession if !self.in_tmux(id) => None,
             TmuxKey::Detach => run(cmd::TMUX_DETACH),
             TmuxKey::ChooseSession => run(cmd::TMUX_PICK),
             TmuxKey::ScrollBack => run(cmd::SCROLL_PAGE_UP),
