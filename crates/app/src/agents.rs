@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::attention::State;
 use crate::tmux::{AGENT_OPTION, agent_name};
+use crate::worktree::Worktree;
 
 /// The tmux session agents go into when none shows on the host.
 pub const SESSION: &str = "agents";
@@ -55,8 +56,18 @@ pub fn commands(configured: &[String]) -> Vec<String> {
 /// [`SESSION`] when there is none), marks it as an agent's and types the
 /// command there. Starts with a space, so shells that keep such lines out
 /// of their history do; ends in `; ` for the attach.
-pub fn start_line(command: &str) -> String {
+/// With `worktree`, the window starts in its folder instead, and is
+/// marked with it ([`crate::worktree::OPTION`]).
+pub fn start_line(command: &str, worktree: Option<&Worktree>) -> String {
     let name = sh_quote(&agent_name(command));
+    let dir = worktree.map_or_else(|| "\"$PWD\"".to_owned(), |w| sh_quote(&w.path));
+    let mark = worktree.map_or_else(String::new, |w| {
+        format!(
+            " && tmux set-option -w -t \"$p\" {} {}",
+            crate::worktree::OPTION,
+            sh_quote(&crate::worktree::option_value(w))
+        )
+    });
     let session = sh_quote(SESSION);
     let target = sh_quote(&format!("={SESSION}:"));
     let exact = sh_quote(&format!("={SESSION}"));
@@ -68,13 +79,15 @@ pub fn start_line(command: &str) -> String {
     // The `_` keeps newlines at the end of the name from `$(…)`.
     // When another client made the session meanwhile, new-session fails
     // and the window goes into that one. The new pane is named by its id,
-    // so the keys reach it whichever pane another client selects.
+    // so the keys reach it whichever pane another client selects. The
+    // worktree's mark comes before the agent's, so whoever sees the
+    // agent sees its branch too.
     let script = format!(
-        "d=$(printf %s_ \"$PWD\" | sed \"s/#/##/g\"); d=${{d%_}}; p=; \
+        "d=$(printf %s_ {dir} | sed \"s/#/##/g\"); d=${{d%_}}; p=; \
          tmux has-session -t {exact} 2>/dev/null || \
          p=$(tmux new-session -d -s {session} -c \"$d\" -n {name} -P -F '#{{pane_id}}' 2>/dev/null); \
          [ -n \"$p\" ] || p=$(tmux new-window -d -t {target} -c \"$d\" -n {name} -P -F '#{{pane_id}}'); \
-         [ -n \"$p\" ] && tmux set-option -w -t \"$p\" {AGENT_OPTION} {name} \
+         [ -n \"$p\" ]{mark} && tmux set-option -w -t \"$p\" {AGENT_OPTION} {name} \
          && tmux send-keys -t \"$p\" -H{keys}"
     );
     format!(" sh -c {}; ", sh_quote(&script))
@@ -317,7 +330,12 @@ mod tests {
     /// next to itself, in a fresh directory only this user can reach;
     /// what it logged. The line must succeed.
     #[cfg(unix)]
-    fn run_start_line(command: &str, fake: &str, cwd: &std::path::Path) -> Result<String, String> {
+    fn run_start_line(
+        command: &str,
+        worktree: Option<&Worktree>,
+        fake: &str,
+        cwd: &std::path::Path,
+    ) -> Result<String, String> {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -347,7 +365,7 @@ mod tests {
         ))
         .map_err(|e| e.to_string())?;
         // The line ends in `; ` for the attach that follows it.
-        let line = start_line(command);
+        let line = start_line(command, worktree);
         let status = std::process::Command::new("sh")
             .arg("-c")
             .arg(line.trim_end().trim_end_matches(';'))
@@ -369,7 +387,7 @@ mod tests {
     #[test]
     fn start_line_quotes_everything() {
         let command = "claude --append-system-prompt 'it''s' done\\;";
-        let line = start_line(command);
+        let line = start_line(command, None);
         assert!(line.starts_with(" sh -c '"), "{line}");
         assert!(line.ends_with("; "), "{line}");
         #[cfg(unix)]
@@ -377,7 +395,7 @@ mod tests {
             let fake = format!(
                 "{PRINT}[ \"$1\" = has-session ] && exit 1\n[ \"$1\" = new-session ] && echo %7\nexit 0\n"
             );
-            let text = run_start_line(command, &fake, std::path::Path::new("/"));
+            let text = run_start_line(command, None, &fake, std::path::Path::new("/"));
             let keys: String = command
                 .bytes()
                 .chain(*b"\r")
@@ -409,7 +427,7 @@ mod tests {
             std::env::temp_dir().join(format!("ferossh #{{pane_id}} {}\n\n", std::process::id()));
         let made = std::fs::create_dir_all(&dir);
         assert!(made.is_ok(), "{made:?}");
-        let text = run_start_line("codex", &fake, &dir);
+        let text = run_start_line("codex", None, &fake, &dir);
         let _ = std::fs::remove_dir_all(&dir);
         let text = text.unwrap_or_else(|e| e);
         // The name ends in newlines, which reach tmux as they are.
@@ -423,6 +441,33 @@ mod tests {
         );
         assert_eq!(calls[3], "[set-option][-w][-t][%8][@ferossh-agent][codex");
         assert_eq!(calls[4], "[send-keys][-t][%8][-H][63][6f][64][65][78][0d");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn start_line_in_a_worktree_starts_there_and_marks_it() {
+        let fake = format!(
+            "{PRINT}[ \"$1\" = has-session ] && exit 1\n[ \"$1\" = new-session ] && echo %7\nexit 0\n"
+        );
+        let wt = Worktree {
+            branch: "claude-2".into(),
+            path: "/srv/it's #1-claude-2".into(),
+        };
+        let text = run_start_line("claude", Some(&wt), &fake, std::path::Path::new("/"));
+        let text = text.unwrap_or_else(|e| e);
+        let calls: Vec<&str> = text.split_terminator("]\n").collect();
+        assert_eq!(calls.len(), 5, "{text:?}");
+        assert_eq!(
+            calls[1],
+            "[new-session][-d][-s][agents][-c][/srv/it's ##1-claude-2][-n][claude][-P][-F][#{pane_id}"
+        );
+        // The worktree's mark first, then the agent's.
+        assert_eq!(
+            calls[2],
+            "[set-option][-w][-t][%7][@ferossh-worktree][claude-2 /srv/it's #1-claude-2"
+        );
+        assert_eq!(calls[3], "[set-option][-w][-t][%7][@ferossh-agent][claude");
     }
 
     #[test]

@@ -272,6 +272,8 @@ mod winrm;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod workspaces;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod worktree;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod zmodem;
 
 use ferossh_config::forward::{ForwardKind, parse_config};
