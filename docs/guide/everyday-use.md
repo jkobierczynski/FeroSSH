@@ -998,6 +998,8 @@ function global:prompt {
         $c = if ($ok) { 0 } elseif ($code) { $code } else { 1 }
         $out += "$__fsE]133;D;$c$__fsA"; $global:__fsRan = $false
     }
+    $global:LASTEXITCODE = $code
+    if (-not $ok) { Write-Error 'failed' -ErrorAction Ignore }
     $out + "$__fsE]133;A$__fsA" + (& $global:__fsPrompt) + "$__fsE]133;B$__fsA"
 }
 $global:__fsReadLine = $function:PSConsoleHostReadLine

@@ -1114,6 +1114,15 @@ struct Pane {
     /// The coding agent a local tab was opened for (Session > Coding
     /// agents from a local shell), by name; tmux panes keep theirs in tmux.
     local_agent: Option<String>,
+    /// Session > Coding agents > Keep an audit trail turned this pane's
+    /// logging on, and started its recording: both end with the agent's
+    /// connection, while what the user turned on stays.
+    audit_log: bool,
+    audit_cast: bool,
+    /// How the local agent's own command ended (the first command a
+    /// local agent tab finished), and when; later commands in its
+    /// PowerShell do not change it.
+    agent_end: Option<(bool, Instant)>,
     /// Spaces out this pane's Windows notifications.
     throttle: crate::attention::Throttle,
     /// The remote working directory the shell last reported (OSC 7), or
@@ -3417,6 +3426,9 @@ fn new_pane(
         attention_since: None,
         quiet: None,
         local_agent: None,
+        audit_log: false,
+        audit_cast: false,
+        agent_end: None,
         throttle: crate::attention::Throttle::default(),
         cwd: None,
         cwd_host: None,
@@ -3459,7 +3471,14 @@ fn build_menu() -> Result<HMENU> {
         item(file, cmd::LOCAL_POWERSHELL, "Open local &PowerShell")?;
         // Filled with the distros each time it opens.
         let wsl = CreatePopupMenu()?;
-        item(wsl, cmd::WSL_OPEN, "(no WSL distro found)")?;
+        // Greyed until it opens, so the command palette offers nothing
+        // that does nothing.
+        AppendMenuW(
+            wsl,
+            MF_STRING | MF_GRAYED,
+            cmd::WSL_OPEN as usize,
+            w!("(no WSL distro found)"),
+        )?;
         AppendMenuW(file, MF_POPUP, wsl.0 as usize, w!("Open &WSL"))?;
         separator(file)?;
         item(file, cmd::UPLOAD, "&Upload files...\tCtrl+Shift+U")?;
@@ -5126,8 +5145,25 @@ impl Window {
         self.connlog_closing = false;
         self.connlog_up.remove(&id);
         self.connlog_ended.remove(&id);
+        // What the agent's audit trail turned on ends with it.
+        let (audit_log, audit_cast) = self
+            .panes
+            .get_mut(&id)
+            .map(|p| {
+                (
+                    std::mem::take(&mut p.audit_log),
+                    std::mem::take(&mut p.audit_cast),
+                )
+            })
+            .unwrap_or_default();
+        if audit_cast && self.panes.get(&id).is_some_and(|p| p.cast.is_some()) {
+            self.toggle_record(id);
+        }
         self.stop_log(id);
         if let Some(p) = self.panes.get_mut(&id) {
+            if audit_log {
+                p.log.enabled = false;
+            }
             p.host = Host::Ask(String::new());
             // The connection's enforced look goes with it; the next one
             // brings its own.
@@ -5142,6 +5178,7 @@ impl Window {
             p.local_cwd = None;
             p.hl_host = None;
             p.local_agent = None;
+            p.agent_end = None;
         }
         // A host's rules leave with it; the pane's own stop pattern stays.
         self.apply_highlight(id, false);
@@ -5435,12 +5472,20 @@ impl Window {
                     .map_or(crate::attention::State::Idle, |w| w.state(now));
                 let asked = p.attention_since.filter(|_| p.attention);
                 let (mut what, mut since) = crate::agents::status(asked, state, now);
-                // The shell's marks say when the agent itself ended.
+                // The shell's marks say when the agent itself ended: a
+                // local agent's own command, else the pane's last one.
+                let ended = if p.local_agent.is_some() {
+                    p.agent_end
+                } else {
+                    last.as_ref()
+                        .filter(|c| !c.running)
+                        .map(|c| (c.failed(), c.since))
+                };
                 if asked.is_none()
-                    && let Some(c) = last.as_ref().filter(|c| !c.running)
+                    && let Some((failed, at)) = ended
                 {
-                    what = if c.failed() { "failed" } else { "exited" };
-                    since = Some(now.saturating_duration_since(c.since));
+                    what = if failed { "failed" } else { "exited" };
+                    since = Some(now.saturating_duration_since(at));
                 }
                 live::Agent {
                     name: name.to_owned(),
@@ -11945,10 +11990,13 @@ impl Window {
             self.apply(id, effects);
         }
         // The workers, a message from each in turn so that a flooding
-        // host does not hold up the others.
+        // host does not hold up the others. Each gets one even when the
+        // local shells and WSL gateways used up the budget, so they
+        // cannot hold up SSH sessions and transfers either.
         let mut transfers = false;
         let connections: Vec<ChannelId> = self.workers.keys().copied().collect();
-        while !more {
+        let mut first = true;
+        while first || !more {
             let mut idle = true;
             for &connection in &connections {
                 let Some(event) = self
@@ -11961,10 +12009,11 @@ impl Window {
                 idle = false;
                 transfers |= self.on_worker_event(connection, event, &mut fed);
                 more = fed >= OUTPUT_BUDGET;
-                if more {
+                if more && !first {
                     break;
                 }
             }
+            first = false;
             if idle {
                 break;
             }
@@ -12331,6 +12380,12 @@ impl Window {
                     Action::CommandFinished(end) => {
                         // The Session manager tells failed commands.
                         chrome = true;
+                        if let Some(p) = self.panes.get_mut(&id)
+                            && p.local_agent.is_some()
+                            && p.agent_end.is_none()
+                        {
+                            p.agent_end = Some((end.exit.is_some_and(|c| c != 0), Instant::now()));
+                        }
                         if self.settings.notify_commands && end.took >= LONG_COMMAND {
                             let (what, body) = finished_note(&end);
                             chrome |= self.alert(id, Some(what), body);
@@ -13414,10 +13469,23 @@ impl Window {
         let wsl = crate::program::locate("wsl.exe")
             .map_err(|e| format!("WSL is not installed on this PC: {e}"))?;
         let args = crate::wsl::gateway_args(distro, dir, before, session);
+        let was_gateway = matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Wsl(_)));
         self.end_host(id);
         let notify = self.notifier();
-        let child = crate::pipes::PipeChild::spawn(&wsl, &args, notify)
-            .map_err(|e| format!("Could not start wsl.exe: {e}"))?;
+        let child = match crate::pipes::PipeChild::spawn(&wsl, &args, notify) {
+            Ok(c) => c,
+            Err(e) => {
+                // An ended gateway stays one, so Enter tries it again.
+                if was_gateway && let Some(p) = self.panes.get_mut(&id) {
+                    p.host = Host::Wsl(Box::new(WslGateway {
+                        distro: distro.to_owned(),
+                        session: session.to_owned(),
+                        child: None,
+                    }));
+                }
+                return Err(format!("Could not start wsl.exe: {e}"));
+            }
+        };
         let label = crate::wsl::label(distro);
         if let Some(p) = self.panes.get_mut(&id) {
             p.host = Host::Wsl(Box::new(WslGateway {
@@ -13471,13 +13539,16 @@ impl Window {
         command: &str,
         worktree: Option<&crate::worktree::Worktree>,
     ) -> Option<Command> {
-        let dir = self
+        let cwd = self
             .panes
             .get(&id)
             .and_then(|p| p.cwd.as_deref())
             .and_then(|d| std::str::from_utf8(d).ok())
-            .filter(|d| d.starts_with('/'))
             .map(str::to_owned);
+        let dir = cwd.clone().filter(|d| d.starts_with('/'));
+        // A folder the prompt showed as `~/...`, before anything said where
+        // home is.
+        let in_home = cwd.filter(|d| !d.starts_with('/') && d != "." && !d.is_empty());
         let shown = self
             .tmux
             .iter()
@@ -13502,7 +13573,24 @@ impl Window {
             self.run_tmux(g, actions);
             return None;
         }
-        let script = crate::agents::start_script(command, worktree);
+        // A gateway that has not started tmux yet would run the start
+        // script a second time in the same session.
+        let starting = self.panes.iter().any(|(g, p)| {
+            matches!(&p.host, Host::Wsl(w) if w.distro == distro && w.child.is_some())
+                && !self.tmux.get(g).is_some_and(|t| t.active())
+        });
+        if starting {
+            return Some(Command::Notice(
+                "tmux in WSL is still starting; try again in a moment.".into(),
+            ));
+        }
+        let mut script = crate::agents::start_script(command, worktree);
+        if worktree.is_none()
+            && dir.is_none()
+            && let Some(rel) = &in_home
+        {
+            script = crate::wsl::in_home_folder(rel, &script);
+        }
         let tab = self.new_tab_pane();
         self.focus_terminal();
         if let Err(e) = self.start_wsl_gateway(
@@ -13549,6 +13637,9 @@ impl Window {
             return;
         };
         let record = p.cast.is_none();
+        if !p.log.enabled {
+            p.audit_log = true;
+        }
         p.log.enabled = true;
         // An ordinary log opened before the pane was known to run an agent
         // ends, and the agent's own log follows it.
@@ -13558,6 +13649,9 @@ impl Window {
         self.start_log_as(id, Some(&agent));
         if record {
             let text = self.start_recording(id, Some(&agent));
+            if let Some(p) = self.panes.get_mut(&id) {
+                p.audit_cast = p.cast.is_some();
+            }
             self.show(id, &text);
         }
         self.update_menu_checks();
@@ -19913,11 +20007,13 @@ impl Window {
             _ => None,
         });
         let id = if idle { pane } else { self.new_tab_pane() };
-        // A workspace pane waiting for its SSH login is a local shell now.
-        if self
-            .workspace_extra
-            .get(&id)
-            .is_some_and(|e| e.dest.is_some())
+        // A workspace pane waiting for its SSH login is a local shell now;
+        // a Windows shell's startup commands are not for a WSL one.
+        if wsl.is_some()
+            || self
+                .workspace_extra
+                .get(&id)
+                .is_some_and(|e| e.dest.is_some())
             || self.workspace_waiting.destination(id).is_some()
         {
             self.workspace_extra.remove(&id);
@@ -23683,6 +23779,15 @@ impl Window {
             return false;
         }
         let host = dir.host.to_ascii_lowercase();
+        // A WSL shell whose prompt already named its host: a first report
+        // from another host is a nested ssh, not the shell.
+        if p.cwd_host.is_none()
+            && matches!(p.host, Host::Local { wsl: Some(_), .. })
+            && let Some(own) = &p.prompt_host
+            && !same_host_name(own, &host)
+        {
+            return false;
+        }
         let first = p.cwd_host.get_or_insert_with(|| host.clone());
         if *first != host {
             // A nested ssh on another host: its paths are not ours.
@@ -25256,6 +25361,14 @@ const SHELL_MARKS_HOW: &str = "Previous command, Next command and selecting a co
 const LONG_COMMAND: Duration = Duration::from_secs(10);
 
 /// The heading and text of a long command's notification.
+/// Whether host names `a` and `b` (lower case) name one host: the same,
+/// or one is the other's first label (a prompt shows `\h`, a report may
+/// give the full name).
+fn same_host_name(a: &str, b: &str) -> bool {
+    let first = |h: &str| h.split('.').next().unwrap_or(h).to_owned();
+    a == b || (first(a) == first(b) && (!a.contains('.') || !b.contains('.')))
+}
+
 fn finished_note(end: &ferossh_term::CommandEnd) -> (String, String) {
     let what = match end.exit {
         Some(c) if c != 0 => format!("Command failed (exit {c})"),
