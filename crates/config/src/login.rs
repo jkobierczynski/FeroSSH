@@ -68,7 +68,8 @@ pub enum Step {
     /// and lines finer than a `pause`.
     Delay(u32),
     /// In a snippet: moves FeroSSH's focus to the pane `left`, `right`,
-    /// `up` or `down` of this one; the steps after it go to that pane.
+    /// `up` or `down` of this one, or back to the `last` pane focused
+    /// before it (in any tab); the steps after it go to that pane.
     Pane(String),
     /// In a snippet: moves to the `next` or `prev` tab; the steps after
     /// it go to that tab's focused pane.
@@ -607,8 +608,8 @@ impl Step {
                 )),
             },
             "pane" => match rest.to_ascii_lowercase().as_str() {
-                d @ ("left" | "right" | "up" | "down") => Ok(Step::Pane(d.to_owned())),
-                _ => Err("pane takes left, right, up or down.".into()),
+                d @ ("left" | "right" | "up" | "down" | "last") => Ok(Step::Pane(d.to_owned())),
+                _ => Err("pane takes left, right, up, down or last.".into()),
             },
             "tab" => match rest.to_ascii_lowercase().as_str() {
                 "next" => Ok(Step::Tab("next".into())),
@@ -1235,6 +1236,7 @@ mod tests {
             ("delay 250", Step::Delay(250)),
             ("delay 1.5s", Step::Delay(1500)),
             ("pane Right", Step::Pane("right".into())),
+            ("pane last", Step::Pane("last".into())),
             ("tab previous", Step::Tab("prev".into())),
         ] {
             let got = Step::parse(text).unwrap();

@@ -7,6 +7,7 @@ This page explains each feature in turn. [Menu reference](menus.md) lists every 
 The window starts as one pane, with no tab strip. Ctrl+Shift+T opens a tab and the strip appears; Alt+Shift+= and Alt+Shift+- split the pane right or down. A new tab or pane on a host you are already logged in to opens another channel on the same connection, so there is no second login. A server that refuses another session on that connection (tinysshd takes one per connection; OpenSSH's sshd 10 by default, its MaxSessions) gets a login of its own for the new pane instead, and later panes on that host do the same. File transfer cannot share a connection on such a server: open an SFTP connection to the host (Type sftp, or `sftp://host`) instead.
 
 - Alt+arrows moves the focus, Alt+Shift+arrows grows the focused pane, and dragging a divider resizes.
+- Window > Back to the last pane goes back to the pane you were in before, in this tab or another; again goes back and forth. Back to the last pane and paste does the same and pastes the clipboard there. They have no keys until you give them one in Settings > Key bindings; scripts use `@pane last`.
 - Ctrl+Tab and Ctrl+Shift+Tab switch tabs. Drag a tab, or press Ctrl+Shift+PgUp and PgDn, to reorder it.
 - Ctrl+Shift+drag a pane onto another pane's edge to move it there, or onto its middle to swap the two.
 - To merge a tab back in as a pane, drag the tab down out of the strip onto a pane of the tab that appears, or use Window > Join tab into the tab before it (Ctrl+Shift+J). Window > Move pane to its own tab, or dropping a pane on the tab strip, makes it a tab again.
@@ -407,6 +408,7 @@ Insert or New adds a script (what you typed as a search becomes its name), F2 or
 | `@type y` | Types text without Enter. |
 | `@password`, `@secret enable` | Types the login password or a named secret. |
 | `@pane right` | Moves to the pane `left`, `right`, `up` or `down` of this one, like Alt+arrow; the rest of the script is typed there. `@key alt+right` instead sends Alt+Right to the host. |
+| `@pane last` | Moves back to the pane you were in before this one (in this tab or another), like Window > Back to the last pane; the rest of the script is typed there. With `@type ${clipboard}` after it, a script pastes what you copied into the pane you came from. |
 | `@tab next` | Moves to the `next` or `prev` tab; the rest of the script is typed in its focused pane. |
 
 `@@` types a plain `@`.

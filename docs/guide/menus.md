@@ -117,6 +117,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Show last hidden pane | | Puts the pane hidden last back where it was. |
 | Join tab into the tab before it | Ctrl+Shift+J | Puts this tab's panes into the tab to its left. |
 | Focus pane left, right, up, down | Alt+arrows | Moves the focus to the pane in that direction. |
+| Back to the last pane | | Moves the focus back to the pane focused before this one, in this tab or another; again goes back and forth between the two. Greyed when that pane has closed or is hidden. |
+| Back to the last pane and paste | | The same, then pastes the clipboard there as Ctrl+Shift+V does (with its checks and broadcast). Copy with Ctrl+Shift+C in one pane, then press it to paste into the pane you came from. |
 | Grow pane left, right, up, down | Alt+Shift+arrows | Moves the focused pane's edge that way. |
 | Broadcast input to this tab's panes | Ctrl+Shift+B | What you type and paste goes to every pane of the tab (see [Broadcast input](everyday-use.md#broadcast-input)). |
 | Broadcast input to all tabs | | The same, to every pane in every tab. |
