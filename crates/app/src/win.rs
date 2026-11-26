@@ -12775,6 +12775,16 @@ impl Window {
             if self.tmux.get(&g).is_some_and(|t| t.joined().is_some()) {
                 return Some(Command::Notice(JOINED_AGENT.into()));
             }
+            // A connection that never answers keeps only a few. Checked
+            // before tmux is asked: an ask whose answer nobody waits for
+            // would shift every later answer.
+            if self.worktree_asks.get(&id).is_some_and(|q| q.len() >= 16) {
+                return Some(Command::Notice(
+                    "tmux has not answered the last agent starts yet; try again in a \
+                     moment."
+                        .into(),
+                ));
+            }
             let actions = self
                 .tmux
                 .get_mut(&g)
@@ -12782,16 +12792,10 @@ impl Window {
                 .map(|t| t.ask_worktree_dir(id))
                 .unwrap_or_default();
             if !actions.is_empty() {
-                let asks = self.worktree_asks.entry(id).or_default();
-                // A connection that never answers keeps only a few.
-                if asks.len() >= 16 {
-                    return Some(Command::Notice(
-                        "tmux has not answered the last agent starts yet; try again in a \
-                         moment."
-                            .into(),
-                    ));
-                }
-                asks.push_back(command.to_owned());
+                self.worktree_asks
+                    .entry(id)
+                    .or_default()
+                    .push_back(command.to_owned());
                 self.run_tmux(g, actions);
                 return None;
             }
