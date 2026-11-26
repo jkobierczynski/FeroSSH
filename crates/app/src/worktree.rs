@@ -12,7 +12,9 @@
 //!
 //! Remove worktree runs `git worktree remove` (which keeps a worktree
 //! with uncommitted or untracked changes) and then `git branch -d` (which
-//! keeps a branch that is not merged yet), so it never throws away work.
+//! keeps a branch that is not merged yet), so committed and uncommitted
+//! work stays. Files git ignores (build output, `node_modules`, a local
+//! `.env`) go with the folder, as the confirmation says.
 //!
 //! The folder and names go on the scripts' standard input, never into
 //! the command, so nothing in them reaches a shell as code. What comes
@@ -100,6 +102,14 @@ pub fn option_value(w: &Worktree) -> String {
     format!("{} {}", w.branch, w.path)
 }
 
+/// `value` as one tmux argument, whole: single-quoted, with a `'` closed,
+/// escaped and opened again (`'\''`), which tmux joins up. tmux expands
+/// nothing in it (`set-option` without `-F`). `value` is an
+/// [`option_value`], so it has no control characters.
+pub fn tmux_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// [`OPTION`] as read back: only what [`option_value`] writes, so a
 /// value set by hand cannot put anything odd on the screen or into a
 /// command.
@@ -135,6 +145,11 @@ pub fn add_command() -> Vec<u8> {
              n=$((n+1)); [ $n -le {TRIES} ] || {{ echo {MARK} full; exit 0; }}; b=$a-$n; done"
         ),
         "w=$p/$r-$b".to_owned(),
+        // Only a folder the answer can carry back (see `valid_path`):
+        // nothing is made for one that could not be read.
+        format!("case $w in /*) ;; *) echo {MARK} badpath; exit 0;; esac"),
+        format!("case $w in *[[:cntrl:]]*) echo {MARK} badpath; exit 0;; esac"),
+        format!("[ ${{#w}} -le {MAX_PATH} ] || {{ echo {MARK} badpath; exit 0; }}"),
         // From the commit the asking pane has checked out.
         format!("git worktree add -b \"$b\" -- \"$w\" >&2 || {{ echo {MARK} failed; exit 0; }}"),
         format!("printf \"{MARK} made %s %s\\n\" \"$b\" \"$w\""),
@@ -172,6 +187,9 @@ pub enum Added {
     NoRepo,
     /// Every branch name from `agent` to `agent-99` is taken.
     Full,
+    /// The worktree's folder would have a control character in its name,
+    /// or be too long: nothing was made.
+    BadPath,
     /// git refused, or there was no answer: what it said, if anything.
     Failed(String),
 }
@@ -206,6 +224,7 @@ pub fn parse_add(out: &[u8], err: &[u8]) -> Added {
         "nodir" => Added::NoDir,
         "norepo" => Added::NoRepo,
         "full" => Added::Full,
+        "badpath" => Added::BadPath,
         "failed" => Added::Failed(last_said(err)),
         other => other
             .strip_prefix("made ")
@@ -335,6 +354,11 @@ mod tests {
         assert_eq!(parse_option("-x /tmp"), None);
         assert_eq!(parse_option("x /tmp/a\x1b[2Jb"), None);
         assert_eq!(parse_option(""), None);
+    }
+
+    #[test]
+    fn tmux_quoting_keeps_apostrophes() {
+        assert_eq!(tmux_quote("b /srv/it's"), "'b /srv/it'\\''s'");
     }
 
     #[test]
@@ -493,6 +517,16 @@ mod tests {
             second.path,
             canon.join("my repo $x-claude-2").to_str().unwrap()
         );
+        // A folder name that could not come back: nothing is made.
+        let tab = root.join("tab\there");
+        std::fs::create_dir_all(&tab).unwrap();
+        git(&tab, &["init", "-q"]);
+        std::fs::write(tab.join("a"), "a").unwrap();
+        git(&tab, &["add", "."]);
+        git(&tab, &["commit", "-qm", "one"]);
+        assert_eq!(add(&tab, "claude"), Added::BadPath);
+        assert!(git(&tab, &["branch", "--list", "claude"]).trim().is_empty());
+        assert!(!root.join("tab\there-claude").exists());
         // Not a repository, not a folder.
         assert_eq!(add(&root, "claude"), Added::NoRepo);
         assert_eq!(add(&root.join("nope"), "claude"), Added::NoDir);

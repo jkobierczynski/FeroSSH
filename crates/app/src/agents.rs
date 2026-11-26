@@ -79,13 +79,15 @@ pub fn start_line(command: &str, worktree: Option<&Worktree>) -> String {
     // The `_` keeps newlines at the end of the name from `$(…)`.
     // When another client made the session meanwhile, new-session fails
     // and the window goes into that one. The new pane is named by its id,
-    // so the keys reach it whichever pane another client selects.
+    // so the keys reach it whichever pane another client selects. The
+    // worktree's mark comes before the agent's, so whoever sees the
+    // agent sees its branch too.
     let script = format!(
         "d=$(printf %s_ {dir} | sed \"s/#/##/g\"); d=${{d%_}}; p=; \
          tmux has-session -t {exact} 2>/dev/null || \
          p=$(tmux new-session -d -s {session} -c \"$d\" -n {name} -P -F '#{{pane_id}}' 2>/dev/null); \
          [ -n \"$p\" ] || p=$(tmux new-window -d -t {target} -c \"$d\" -n {name} -P -F '#{{pane_id}}'); \
-         [ -n \"$p\" ] && tmux set-option -w -t \"$p\" {AGENT_OPTION} {name}{mark} \
+         [ -n \"$p\" ]{mark} && tmux set-option -w -t \"$p\" {AGENT_OPTION} {name} \
          && tmux send-keys -t \"$p\" -H{keys}"
     );
     format!(" sh -c {}; ", sh_quote(&script))
@@ -460,10 +462,12 @@ mod tests {
             calls[1],
             "[new-session][-d][-s][agents][-c][/srv/it's ##1-claude-2][-n][claude][-P][-F][#{pane_id}"
         );
+        // The worktree's mark first, then the agent's.
         assert_eq!(
-            calls[3],
+            calls[2],
             "[set-option][-w][-t][%7][@ferossh-worktree][claude-2 /srv/it's #1-claude-2"
         );
+        assert_eq!(calls[3], "[set-option][-w][-t][%7][@ferossh-agent][claude");
     }
 
     #[test]

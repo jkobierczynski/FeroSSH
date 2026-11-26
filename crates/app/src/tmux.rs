@@ -161,7 +161,8 @@ pub enum Action {
     DiffDir { native: Native, dir: String },
     /// Native pane `native`'s directory, as asked by
     /// [`Tmux::ask_worktree_dir`]: make a worktree of its repository.
-    WorktreeDir { native: Native, dir: String },
+    /// `None` when tmux did not say: one answer per ask, in order.
+    WorktreeDir { native: Native, dir: Option<String> },
 }
 
 /// Where a window made from a native action goes.
@@ -1556,6 +1557,20 @@ impl Tmux {
                     )));
                     return;
                 };
+                // The worktree's mark first: whoever sees the agent sees
+                // its branch too.
+                if let Some(wt) = worktree {
+                    self.send(
+                        &format!(
+                            "set-option -w -t @{w} {} {}",
+                            crate::worktree::OPTION,
+                            crate::worktree::tmux_quote(&crate::worktree::option_value(&wt))
+                        ),
+                        Tag::Ignore,
+                        out,
+                    );
+                    self.worktrees.insert(w, wt);
+                }
                 self.mark_agent(w, name.clone(), out);
                 self.send(
                     &format!(
@@ -1565,18 +1580,6 @@ impl Tmux {
                     Tag::Ignore,
                     out,
                 );
-                if let Some(wt) = worktree {
-                    self.send(
-                        &format!(
-                            "set-option -w -t @{w} {} {}",
-                            crate::worktree::OPTION,
-                            command::quote(&crate::worktree::option_value(&wt))
-                        ),
-                        Tag::Ignore,
-                        out,
-                    );
-                    self.worktrees.insert(w, wt);
-                }
                 let mut keys = line.into_bytes();
                 keys.push(b'\r');
                 for c in command::send_keys(p, &keys) {
@@ -1616,13 +1619,11 @@ impl Tmux {
                     .map(|l| String::from_utf8_lossy(l).into_owned())
                     .unwrap_or_default();
                 let dir = dir.trim_end_matches(['\r', '\n']);
-                if ok && !dir.is_empty() {
-                    let dir = dir.to_owned();
-                    out.push(if worktree {
-                        Action::WorktreeDir { native, dir }
-                    } else {
-                        Action::DiffDir { native, dir }
-                    });
+                let said = (ok && !dir.is_empty()).then(|| dir.to_owned());
+                if worktree {
+                    out.push(Action::WorktreeDir { native, dir: said });
+                } else if let Some(dir) = said {
+                    out.push(Action::DiffDir { native, dir });
                 } else {
                     out.push(Action::Notice(
                         "tmux did not say which folder that pane is in.".into(),
@@ -3756,12 +3757,14 @@ mod tests {
         let a0 = t.native_of(0).unwrap();
         let wt = Worktree {
             branch: "claude-2".into(),
-            path: "/srv/my app-claude-2".into(),
+            path: "/srv/my app's-claude-2".into(),
         };
         // The worktree's folder, not the pane's or the one given.
         assert_eq!(
             writes(&t.start_agent(a0, "claude", Some("/srv/other"), Some(&wt))),
-            ["new-window -d -c '/srv/my app-claude-2' -n 'claude' -P -F '#{window_id} #{pane_id}'"]
+            [
+                "new-window -d -c '/srv/my app'\\''s-claude-2' -n 'claude' -P -F '#{window_id} #{pane_id}'"
+            ]
         );
         // Replies 5 and 6 were the captures.
         let mut input = reply(5, &[]);
@@ -3769,14 +3772,15 @@ mod tests {
         input.extend(reply(7, &["@4 %9".into()]));
         let a = t.feed(&mut ws, &input);
         let w = writes(&a);
-        assert_eq!(w[0], "set-option -w -t @4 @ferossh-agent 'claude'");
+        // The worktree's mark first, the apostrophe kept.
         assert_eq!(
-            w[1],
-            "set-option -w -t @4 @ferossh-worktree 'claude-2 /srv/my app-claude-2'"
+            w[0],
+            "set-option -w -t @4 @ferossh-worktree 'claude-2 /srv/my app'\\''s-claude-2'"
         );
+        assert_eq!(w[1], "set-option -w -t @4 @ferossh-agent 'claude'");
         // Read back on the next attach, from any PC.
         let mut line = pane_line(9, 4, 80, 24, "b25f,80x24,0,0,9");
-        line.push_str(" claude claude-2 /srv/my app-claude-2");
+        line.push_str(" claude claude-2 /srv/my app's-claude-2");
         let parsed = parse_pane_line(line.as_bytes()).unwrap();
         assert_eq!(parsed.agent.as_deref(), Some("claude"));
         assert_eq!(parsed.worktree.as_ref(), Some(&wt));
@@ -3792,7 +3796,7 @@ mod tests {
         input.extend(reply(9, &[]));
         input.extend(reply(10, &[]));
         let mut line = pane_line(9, 4, 80, 24, "b25f,80x24,0,0,9");
-        line.push_str(" claude claude-2 /srv/my app-claude-2");
+        line.push_str(" claude claude-2 /srv/my app's-claude-2");
         input.extend(reply(11, &[line]));
         let a = t.feed(&mut ws, &input);
         let native = a
@@ -3828,7 +3832,7 @@ mod tests {
         assert!(
             a.contains(&Action::WorktreeDir {
                 native: a0,
-                dir: "/srv/my app ".into()
+                dir: Some("/srv/my app ".into())
             }),
             "{a:?}"
         );

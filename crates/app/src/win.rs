@@ -1559,8 +1559,8 @@ struct Window {
     /// exec channel.
     worktree_jobs: HashMap<ChannelId, WorktreeJob>,
     /// Agents to start in a new worktree, by the tmux pane whose folder
-    /// tmux was asked for.
-    worktree_asks: HashMap<PaneId, String>,
+    /// tmux was asked for, in the order asked (tmux answers in order).
+    worktree_asks: HashMap<PaneId, VecDeque<String>>,
     /// The inventory's OS and kernel being read, by channel.
     system_reads: HashMap<ChannelId, SystemRead>,
     /// Panes opened under a connection's old name before it was renamed:
@@ -4525,9 +4525,29 @@ impl Window {
                     }
                 }
                 tmux::Action::WorktreeDir { native, dir } => {
-                    if let Some(command) = self.worktree_asks.remove(&native)
-                        && let Some(next) = self.make_worktree(native, dir.into_bytes(), command)
+                    let command = self
+                        .worktree_asks
+                        .get_mut(&native)
+                        .and_then(VecDeque::pop_front);
+                    if self
+                        .worktree_asks
+                        .get(&native)
+                        .is_some_and(VecDeque::is_empty)
                     {
+                        self.worktree_asks.remove(&native);
+                    }
+                    let next = match (command, dir) {
+                        (Some(command), Some(dir)) => {
+                            self.make_worktree(native, dir.into_bytes(), command)
+                        }
+                        (Some(_), None) => Some(Command::Notice(
+                            "tmux did not say which folder that pane is in, so no worktree was \
+                             made."
+                                .into(),
+                        )),
+                        (None, _) => None,
+                    };
+                    if let Some(next) = next {
                         self.queued.push(next);
                     }
                 }
@@ -5696,6 +5716,11 @@ impl Window {
                 .winrm_closing
                 .values()
                 .any(|w| w.connection() == connection)
+            // A git worktree script, until its outcome is told.
+            || self
+                .worktree_jobs
+                .values()
+                .any(|j| j.connection == connection)
     }
 
     /// Ends the workers that retired long enough ago.
@@ -12686,24 +12711,9 @@ impl Window {
             self.run_tmux(g, actions);
             return None;
         }
-        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
-            return None;
-        };
         // tmux already shows on this host (only one pane per host may),
         // reached the same way: the agent joins that session.
-        let route = route_key(&s.target);
-        let shown = self
-            .tmux
-            .iter()
-            .find(|(g, t)| {
-                t.active()
-                    && matches!(
-                        self.panes.get(g).map(|p| &p.host),
-                        Some(Host::Ssh(other)) if route_key(&other.target) == route
-                    )
-            })
-            .map(|(g, _)| *g);
-        if let Some(g) = shown {
+        if let Some(g) = self.shown_tmux(id) {
             // In this shell's directory, when it is known as an absolute
             // path; otherwise the tmux pane's.
             let dir = self
@@ -12732,6 +12742,25 @@ impl Window {
         None
     }
 
+    /// The tmux gateway pane that shows tmux for SSH pane `id`'s host,
+    /// reached the same way, if one does.
+    fn shown_tmux(&self, id: PaneId) -> Option<PaneId> {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return None;
+        };
+        let route = route_key(&s.target);
+        self.tmux
+            .iter()
+            .find(|(g, t)| {
+                t.active()
+                    && matches!(
+                        self.panes.get(g).map(|p| &p.host),
+                        Some(Host::Ssh(other)) if route_key(&other.target) == route
+                    )
+            })
+            .map(|(g, _)| *g)
+    }
+
     /// Session > Coding agents > Start <agent> in a new git worktree: a
     /// worktree and branch of the git repository pane `id` is in, made by
     /// [`crate::worktree::add_command`], for agent `command` to start in
@@ -12744,11 +12773,7 @@ impl Window {
         if let Some(g) = self.panes.get(&id).and_then(Pane::gateway) {
             // No worktree is made for an agent that could not start.
             if self.tmux.get(&g).is_some_and(|t| t.joined().is_some()) {
-                return Some(Command::Notice(
-                    "This pane is in someone else's tmux session, which FeroSSH changes \
-                     nothing of: start the agent from a pane of your own."
-                        .into(),
-                ));
+                return Some(Command::Notice(JOINED_AGENT.into()));
             }
             let actions = self
                 .tmux
@@ -12757,10 +12782,27 @@ impl Window {
                 .map(|t| t.ask_worktree_dir(id))
                 .unwrap_or_default();
             if !actions.is_empty() {
-                self.worktree_asks.insert(id, command.to_owned());
+                let asks = self.worktree_asks.entry(id).or_default();
+                // A connection that never answers keeps only a few.
+                if asks.len() >= 16 {
+                    return Some(Command::Notice(
+                        "tmux has not answered the last agent starts yet; try again in a \
+                         moment."
+                            .into(),
+                    ));
+                }
+                asks.push_back(command.to_owned());
                 self.run_tmux(g, actions);
                 return None;
             }
+        }
+        // The agent would join the tmux session shown for this host.
+        if self
+            .shown_tmux(id)
+            .and_then(|g| self.tmux.get(&g))
+            .is_some_and(|t| t.joined().is_some())
+        {
+            return Some(Command::Notice(JOINED_AGENT.into()));
         }
         let Some(dir) = self
             .panes
@@ -12870,6 +12912,8 @@ impl Window {
         let Some(j) = self.worktree_jobs.remove(&channel) else {
             return;
         };
+        // Its connection may have had nothing else keeping it.
+        self.prune_workers();
         let host = self
             .panes
             .get(&j.pane)
@@ -12913,6 +12957,10 @@ impl Window {
                     Added::NoRepo => format!(
                         "This pane's folder on {host} is not in a git repository, so there \
                          is nothing to make a worktree of. cd into the project first."
+                    ),
+                    Added::BadPath => format!(
+                        "The worktree's folder name on {host} would have a control character \
+                         in it, or be too long, so nothing was made."
                     ),
                     Added::Full => format!(
                         "Every branch name for this agent is taken on {host} (up to -99): \
@@ -24754,6 +24802,10 @@ fn finished_note(end: &ferossh_term::CommandEnd) -> (String, String) {
     (what, body)
 }
 
+/// Why an agent does not start in a joined tmux session.
+const JOINED_AGENT: &str = "This agent would start in someone else's tmux session, which \
+    FeroSSH changes nothing of: start it from a connection of your own.";
+
 const DIFF_HOW: &str = "Show what changed works in a pane logged in to a server over SSH (or \
      a tmux pane there), in a folder of a git repository.";
 /// Scrollback a diff tab keeps beyond [`crate::diff::MAX_ROWS`].
@@ -28558,6 +28610,8 @@ fn run_command(hwnd: HWND, command: Command) {
                  Folder: {}\nBranch: {}\n\n\
                  git removes the folder only when everything in it is committed: \
                  uncommitted or untracked changes keep it, and nothing else happens. \
+                 Files git ignores (build output, node_modules, a local .env) are \
+                 deleted with the folder. \
                  Once it is gone, the agent's tmux window closes (the agent stops), \
                  and the branch is deleted only if it is merged, so the agent's \
                  commits stay.",
