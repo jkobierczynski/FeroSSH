@@ -62,6 +62,7 @@ Coming from PuTTY, KiTTY, WinSCP or another client? File > Import and export > I
 | `ferossh.exe --workspace NAME` | Opens a saved workspace: its tabs and split panes, each on its connection (see [Workspaces](everyday-use.md#workspaces)). A path to a `.workspace` file works too. |
 | `ferossh.exe --local [command]` | Opens a local shell or command instead of SSH, for example `--local wsl -d Ubuntu`. |
 | `ferossh.exe --check-sandbox` | Reports what the sandbox can do on this PC. Pipe it through `more` to read it all. |
+| `ferossh.exe --check-conpty` | Starts PowerShell the way a local PowerShell pane does, types three commands and reports whether this Windows' console layer (ConPTY) passes the prompt marks through, in the right place. Pipe it through `more`. |
 
 To open `ssh://` and `sftp://` links on web pages, in wikis or in inventories with FeroSSH, turn on Settings > Open links (see [Opening ssh:// links](everyday-use.md#opening-ssh-links)).
 | `ferossh.exe --new-security-key [--hello] [--ed25519] FILE` | Makes a new FIDO2 key file, like `ssh-keygen -t ecdsa-sk`. `--hello` uses Windows Hello, so no hardware key is needed. |
