@@ -121,6 +121,60 @@ pub fn parse_option(value: &str) -> Option<Worktree> {
     })
 }
 
+/// The agents waiting to start in a new worktree, by the tmux pane whose
+/// folder tmux was asked for, in the order asked: tmux answers in order,
+/// so each answer goes with the oldest ask of its pane.
+#[derive(Debug)]
+pub struct Asks<K> {
+    by: std::collections::HashMap<K, std::collections::VecDeque<String>>,
+}
+
+impl<K> Default for Asks<K> {
+    fn default() -> Self {
+        Self {
+            by: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Copy> Asks<K> {
+    /// A connection that never answers keeps only this many per pane.
+    pub const MAX: usize = 16;
+
+    /// Asks, with `ask`, for pane `key`'s folder to start agent `command`
+    /// in. `None` when the pane has [`Self::MAX`] unanswered: then `ask`
+    /// is not called, since an ask whose answer nobody waits for would
+    /// shift every later answer. Nothing is kept when `ask` sends nothing.
+    pub fn ask<A>(
+        &mut self,
+        key: K,
+        command: &str,
+        ask: impl FnOnce() -> Vec<A>,
+    ) -> Option<Vec<A>> {
+        if self.by.get(&key).is_some_and(|q| q.len() >= Self::MAX) {
+            return None;
+        }
+        let sent = ask();
+        if !sent.is_empty() {
+            self.by
+                .entry(key)
+                .or_default()
+                .push_back(command.to_owned());
+        }
+        Some(sent)
+    }
+
+    /// The agent command tmux's answer for pane `key` belongs to.
+    pub fn answered(&mut self, key: K) -> Option<String> {
+        let q = self.by.get_mut(&key)?;
+        let command = q.pop_front();
+        if q.is_empty() {
+            self.by.remove(&key);
+        }
+        command
+    }
+}
+
 /// The command that makes the worktree. The login shell only starts `sh`
 /// with it, so csh and fish run it too; cmd.exe and PowerShell cannot.
 /// One line (csh ends a quote at a line break), no single quote, no `!`
@@ -327,6 +381,39 @@ pub fn parse_remove(out: &[u8], err: &[u8]) -> Removal {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asks_wait_in_order_and_a_full_pane_asks_nothing() {
+        let mut asks = Asks::<u32>::default();
+        let mut sent = 0;
+        for n in 0..Asks::<u32>::MAX {
+            let a = asks.ask(1, &format!("agent{n}"), || {
+                sent += 1;
+                vec![n]
+            });
+            assert_eq!(a, Some(vec![n]));
+        }
+        // Full: tmux is not asked, so no answer is left without its ask.
+        assert_eq!(
+            asks.ask(1, "late", || -> Vec<usize> { unreachable!() }),
+            None
+        );
+        assert_eq!(sent, Asks::<u32>::MAX);
+        // Another pane still asks.
+        assert_eq!(asks.ask(2, "other", || vec![0]), Some(vec![0]));
+        // Nothing sent, nothing kept.
+        assert_eq!(asks.ask(3, "none", Vec::<u8>::new), Some(Vec::new()));
+        assert_eq!(asks.answered(3), None);
+        // The later answers go with their own asks, oldest first.
+        assert_eq!(asks.answered(1).as_deref(), Some("agent0"));
+        assert_eq!(asks.ask(1, "now", || vec![0]), Some(vec![0]));
+        for n in 1..Asks::<u32>::MAX {
+            assert_eq!(asks.answered(1), Some(format!("agent{n}")));
+        }
+        assert_eq!(asks.answered(1).as_deref(), Some("now"));
+        assert_eq!(asks.answered(1), None);
+        assert_eq!(asks.answered(2).as_deref(), Some("other"));
+    }
 
     #[test]
     fn branch_names_are_plain() {

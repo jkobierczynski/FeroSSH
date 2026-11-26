@@ -1560,7 +1560,7 @@ struct Window {
     worktree_jobs: HashMap<ChannelId, WorktreeJob>,
     /// Agents to start in a new worktree, by the tmux pane whose folder
     /// tmux was asked for, in the order asked (tmux answers in order).
-    worktree_asks: HashMap<PaneId, VecDeque<String>>,
+    worktree_asks: crate::worktree::Asks<PaneId>,
     /// The inventory's OS and kernel being read, by channel.
     system_reads: HashMap<ChannelId, SystemRead>,
     /// Panes opened under a connection's old name before it was renamed:
@@ -3109,7 +3109,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
                 worktree_jobs: HashMap::new(),
-                worktree_asks: HashMap::new(),
+                worktree_asks: crate::worktree::Asks::default(),
                 system_reads: HashMap::new(),
                 inventory_renames: HashMap::new(),
                 inventory_pending: Vec::new(),
@@ -4525,17 +4525,7 @@ impl Window {
                     }
                 }
                 tmux::Action::WorktreeDir { native, dir } => {
-                    let command = self
-                        .worktree_asks
-                        .get_mut(&native)
-                        .and_then(VecDeque::pop_front);
-                    if self
-                        .worktree_asks
-                        .get(&native)
-                        .is_some_and(VecDeque::is_empty)
-                    {
-                        self.worktree_asks.remove(&native);
-                    }
+                    let command = self.worktree_asks.answered(native);
                     let next = match (command, dir) {
                         (Some(command), Some(dir)) => {
                             self.make_worktree(native, dir.into_bytes(), command)
@@ -12787,27 +12777,21 @@ impl Window {
             return Some(Command::Notice(JOINED_AGENT.into()));
         }
         if let Some(g) = self.panes.get(&id).and_then(Pane::gateway) {
-            // A connection that never answers keeps only a few. Checked
-            // before tmux is asked: an ask whose answer nobody waits for
-            // would shift every later answer.
-            if self.worktree_asks.get(&id).is_some_and(|q| q.len() >= 16) {
+            let tmux = &mut self.tmux;
+            let asked = self.worktree_asks.ask(id, command, || {
+                tmux.get_mut(&g)
+                    .filter(|t| t.active())
+                    .map(|t| t.ask_worktree_dir(id))
+                    .unwrap_or_default()
+            });
+            let Some(actions) = asked else {
                 return Some(Command::Notice(
                     "tmux has not answered the last agent starts yet; try again in a \
                      moment."
                         .into(),
                 ));
-            }
-            let actions = self
-                .tmux
-                .get_mut(&g)
-                .filter(|t| t.active())
-                .map(|t| t.ask_worktree_dir(id))
-                .unwrap_or_default();
+            };
             if !actions.is_empty() {
-                self.worktree_asks
-                    .entry(id)
-                    .or_default()
-                    .push_back(command.to_owned());
                 self.run_tmux(g, actions);
                 return None;
             }
