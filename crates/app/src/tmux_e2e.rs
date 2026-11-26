@@ -825,7 +825,7 @@ fn real_tmux_agent_window_is_marked_and_found_again() {
     // at the new window's shell.
     let actions = a
         .tmux
-        .start_agent(first, "printf 'agent-%s\\n' $((40+2))", None);
+        .start_agent(first, "printf 'agent-%s\\n' $((40+2))", None, None);
     a.apply(actions);
     a.until("the agent's tab", |h| h.ws.all_panes().len() == 2);
     let agent = *a.ws.all_panes().iter().find(|&&p| p != first).unwrap();
@@ -898,8 +898,8 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
         shim.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let run = |command: &str| {
-        let line = crate::agents::start_line(command);
+    let run_in = |command: &str, worktree: Option<&crate::worktree::Worktree>| {
+        let line = crate::agents::start_line(command, worktree);
         // The line's own status: the last tmux call's.
         let status = Command::new("sh")
             .args(["-c", &line])
@@ -911,6 +911,7 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
             .unwrap();
         assert!(status.success());
     };
+    let run = |command: &str| run_in(command, None);
     // First the session is made, then a second agent joins it. What the
     // commands print differs from what is typed, so it shows they ran.
     run("printf 'out-%s\\n' first");
@@ -947,6 +948,33 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
         }
         assert!(shown(&screen), "{screen}");
     }
+    // An agent in a worktree starts in its folder, whatever the shell's,
+    // and its window says which one it is.
+    let wt_dir = scratch
+        .0
+        .canonicalize()
+        .unwrap()
+        .join("app #1 it's-claude-2");
+    std::fs::create_dir_all(&wt_dir).unwrap();
+    let wt = crate::worktree::Worktree {
+        branch: "claude-2".into(),
+        path: wt_dir.display().to_string(),
+    };
+    run_in("printf 'out-%s\\n' third", Some(&wt));
+    let third = tmux_cmd(
+        &server,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "=agents:2",
+            "#{@ferossh-agent}|#{@ferossh-worktree}|#{pane_current_path}",
+        ],
+    );
+    assert_eq!(
+        third.trim(),
+        format!("printf|claude-2 {}|{}", wt.path, wt.path)
+    );
 }
 
 #[test]

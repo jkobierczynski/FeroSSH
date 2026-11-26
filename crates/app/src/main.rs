@@ -274,6 +274,8 @@ mod winrm;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod workspaces;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod worktree;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod wsl;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod zmodem;

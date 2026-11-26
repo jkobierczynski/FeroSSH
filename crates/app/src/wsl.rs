@@ -344,7 +344,7 @@ mod e2e {
         let dir = std::env::temp_dir().join(format!("ferossh-wsl-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.to_str().unwrap().to_owned();
-        let script = crate::agents::start_script("cat");
+        let script = crate::agents::start_script("cat", None);
         let c = spawn(&socket, Some(&script));
         let mut client = Client::<u32>::new();
         until(&c, &mut client, |e| e.contains(&Event::Started));
