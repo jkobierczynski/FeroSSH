@@ -865,6 +865,11 @@ pub struct Settings {
     /// The bell counts as asking for attention (Settings > Notify on the
     /// bell too). On unless turned off; only matters with notifications.
     pub notify_bell: bool,
+    /// A command that ran for a while and finished raises a notification
+    /// (Settings > Notify when a long command finishes), from the shell's
+    /// OSC 133 marks. Off unless turned on; only matters with
+    /// notifications.
+    pub notify_commands: bool,
     /// The coding agents Session > Coding agents offers to start, as
     /// command lines (`AgentCommand claude --model opus`, one line each,
     /// in menu order). Empty: the built-in list.
@@ -1079,6 +1084,7 @@ impl Default for Settings {
             status_bar: false,
             notifications: false,
             notify_bell: true,
+            notify_commands: false,
             agent_commands: Vec::new(),
             copy_on_select: false,
             right_click_paste: false,
@@ -1532,6 +1538,10 @@ impl Settings {
                 "notifybell" => {
                     block = Block::Top;
                     s.notify_bell = yes(&args).unwrap_or(true);
+                }
+                "notifycommands" => {
+                    block = Block::Top;
+                    s.notify_commands = yes(&args).unwrap_or(false);
                 }
                 "agentcommand" => {
                     block = Block::Top;
@@ -2118,6 +2128,7 @@ impl Settings {
         let _ = writeln!(out, "StatusBar {}", flag(self.status_bar));
         let _ = writeln!(out, "Notifications {}", flag(self.notifications));
         let _ = writeln!(out, "NotifyBell {}", flag(self.notify_bell));
+        let _ = writeln!(out, "NotifyCommands {}", flag(self.notify_commands));
         for c in &self.agent_commands {
             if !c.chars().any(char::is_control) {
                 let _ = writeln!(out, "AgentCommand {}", c.trim());
@@ -3335,9 +3346,9 @@ DesktopShareSelection yes
     #[test]
     fn notifications_are_off_unless_turned_on() {
         let d = Settings::default();
-        assert!(!d.notifications && d.notify_bell);
-        let s = Settings::parse("Notifications yes\nNotifyBell no\n");
-        assert!(s.notifications && !s.notify_bell);
+        assert!(!d.notifications && d.notify_bell && !d.notify_commands);
+        let s = Settings::parse("Notifications yes\nNotifyBell no\nNotifyCommands yes\n");
+        assert!(s.notifications && !s.notify_bell && s.notify_commands);
         assert_eq!(Settings::parse(&s.to_text()), s);
     }
 

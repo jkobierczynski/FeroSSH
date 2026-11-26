@@ -1,7 +1,8 @@
 //! OSC 7, the working directory a shell reports (`ESC ] 7 ; file://host/path
 //! BEL`). The parser underneath drops it, so the host's output is watched
 //! for it on the side; the side pane's file view follows it. The same
-//! watch finds the notifications of [`crate::notify`].
+//! watch finds the notifications of [`crate::notify`] and the OSC 133
+//! prompt and command marks of shell integration.
 
 use crate::notify::{self, Kitty, Notification};
 
@@ -39,6 +40,24 @@ pub(crate) struct CwdScanner {
 pub(crate) enum Found {
     Dir(WorkingDir),
     Notify(Notification),
+    /// An OSC 133 mark, with the index in the scanned bytes just past the
+    /// end of its sequence: where the cursor stands for it once the bytes
+    /// before are on the screen.
+    Mark(Mark, usize),
+}
+
+/// An OSC 133 mark (FinalTerm's shell integration, as kitty, WezTerm,
+/// iTerm2, VS Code and Windows Terminal read it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mark {
+    /// `A`: a prompt starts here.
+    Prompt,
+    /// `B`: the prompt ends, typing starts here.
+    Input,
+    /// `C`: the command runs; its output starts here.
+    Output,
+    /// `D[;code]`: the command finished, with its exit code when given.
+    Done(Option<i32>),
 }
 
 /// A reported working directory.
@@ -56,7 +75,7 @@ impl CwdScanner {
     /// in them, in order.
     pub(crate) fn scan(&mut self, bytes: &[u8]) -> Vec<Found> {
         let mut found = Vec::new();
-        for &b in bytes {
+        for (i, &b) in bytes.iter().enumerate() {
             self.state = match (self.state, b) {
                 // CAN and SUB abort any sequence.
                 (_, 0x18 | 0x1a) => State::Ground,
@@ -69,7 +88,7 @@ impl CwdScanner {
                 (State::Esc, 0x1b) => State::Esc,
                 (State::Esc, _) => State::Ground,
                 (State::Osc, 0x07) => {
-                    found.extend(self.found());
+                    found.extend(self.found(i + 1));
                     State::Ground
                 }
                 (State::Osc, 0x1b) => State::OscEsc,
@@ -79,7 +98,7 @@ impl CwdScanner {
                     State::Osc
                 }
                 (State::OscEsc, b'\\') => {
-                    found.extend(self.found());
+                    found.extend(self.found(i + 1));
                     State::Ground
                 }
                 // An ESC that starts something else ends the OSC unfinished.
@@ -110,12 +129,43 @@ impl CwdScanner {
         }
     }
 
-    fn found(&mut self) -> Option<Found> {
+    /// What the OSC just ended (at `end` in the scanned bytes) says.
+    fn found(&mut self, end: usize) -> Option<Found> {
         if let Some(dir) = parse(&self.buf) {
             return Some(Found::Dir(dir));
         }
+        if let Some(mark) = parse_mark(&self.buf) {
+            return Some(Found::Mark(mark, end));
+        }
         notify::parse(&self.buf, &mut self.kitty).map(Found::Notify)
     }
+}
+
+/// `133;A`, `133;B`, `133;C` or `133;D[;code]`, each maybe with more
+/// `;key=value` options after it. A secondary prompt (`A;k=s`, a
+/// continuation line) starts no new command; the other marks of the
+/// family (`P`, `L`, `I`) are not needed.
+fn parse_mark(osc: &[u8]) -> Option<Mark> {
+    let rest = osc.strip_prefix(b"133;")?;
+    let mut parts = rest.split(|&b| b == b';');
+    let kind = parts.next()?;
+    Some(match kind {
+        b"A" => {
+            if parts.any(|p| p == b"k=s" || p == b"k=c") {
+                return None;
+            }
+            Mark::Prompt
+        }
+        b"B" => Mark::Input,
+        b"C" => Mark::Output,
+        b"D" => Mark::Done(
+            parts
+                .next()
+                .and_then(|c| std::str::from_utf8(c).ok())
+                .and_then(|c| c.parse::<i32>().ok()),
+        ),
+        _ => return None,
+    })
 }
 
 fn hex(b: u8) -> Option<u8> {
@@ -302,5 +352,57 @@ mod tests {
                 })
             ]
         );
+    }
+
+    #[test]
+    fn finds_command_marks_with_their_ends() {
+        let mut s = CwdScanner::default();
+        let bytes =
+            b"\x1b]133;D;2\x07\x1b]133;A\x1b\\$ \x1b]133;B\x07ls\r\n\x1b]133;C;cmdline=ls\x07";
+        let got = s.scan(bytes);
+        let ends: Vec<usize> = got
+            .iter()
+            .filter_map(|f| match f {
+                Found::Mark(_, e) => Some(*e),
+                _ => None,
+            })
+            .collect();
+        let marks: Vec<Mark> = got
+            .iter()
+            .filter_map(|f| match f {
+                Found::Mark(m, _) => Some(*m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            [Mark::Done(Some(2)), Mark::Prompt, Mark::Input, Mark::Output]
+        );
+        // Each end is just past the sequence's terminator.
+        for &e in &ends {
+            assert!(matches!(bytes[e - 1], 0x07 | b'\\'));
+        }
+        assert_eq!(&bytes[ends[1]..ends[1] + 2], b"$ ");
+    }
+
+    #[test]
+    fn reads_exit_codes_and_skips_other_marks() {
+        let one = |osc: &[u8]| parse_mark(osc);
+        assert_eq!(one(b"133;D"), Some(Mark::Done(None)));
+        assert_eq!(one(b"133;D;0"), Some(Mark::Done(Some(0))));
+        assert_eq!(one(b"133;D;-1;aid=7"), Some(Mark::Done(Some(-1))));
+        assert_eq!(one(b"133;D;x"), Some(Mark::Done(None)));
+        assert_eq!(one(b"133;A;cl=m;aid=3"), Some(Mark::Prompt));
+        assert_eq!(one(b"133;A;k=s"), None, "a continuation prompt");
+        assert_eq!(one(b"133;P;k=i"), None);
+        assert_eq!(one(b"133;"), None);
+        assert_eq!(one(b"1330;A"), None);
+        // Split one byte at a time, the end still points past it.
+        let mut s = CwdScanner::default();
+        let mut got = Vec::new();
+        for b in b"x\x1b]133;C\x07" {
+            got.extend(s.scan(&[*b]));
+        }
+        assert_eq!(got, [Found::Mark(Mark::Output, 1)]);
     }
 }

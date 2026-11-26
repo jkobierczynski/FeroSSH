@@ -49,7 +49,7 @@ Built on 18 November 2026 as Session > Coding agents > Offer to forward and open
 
 ## 5. Rendering for agent TUIs (built)
 
-Built on 18 November 2026 as Session > Coding agents > Kitty keyboard protocol for programs that ask for it (`KittyKeyboard`) and Shift+Enter types a new line (`ShiftEnter`), both off by default. Synchronized output and OSC 8 links were already there. OSC 133 prompt marks and OSC 9;4 progress are left for later. See [Keys and drawing for agent interfaces](../guide/everyday-use.md#keys-and-drawing-for-agent-interfaces).
+Built on 18 November 2026 as Session > Coding agents > Kitty keyboard protocol for programs that ask for it (`KittyKeyboard`) and Shift+Enter types a new line (`ShiftEnter`), both off by default. Synchronized output and OSC 8 links were already there. OSC 133 prompt marks were built on 26 November 2026 (see [Shell integration](../guide/everyday-use.md#shell-integration-prompt-marks)); OSC 9;4 progress is left for later. See [Keys and drawing for agent interfaces](../guide/everyday-use.md#keys-and-drawing-for-agent-interfaces).
 
 **What FeroSSH has.** Synchronized output (DEC mode 2026), OSC 8 links with the real target shown before opening, bracketed paste, true colour, OSC 52 clipboard with a prompt, and fast redraws.
 

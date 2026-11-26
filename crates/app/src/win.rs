@@ -415,6 +415,8 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::SCROLL_PAGE_DOWN, Always, &["Shift+PageDown"]),
         d(cmd::SCROLL_TOP, Always, &["Ctrl+Shift+Home"]),
         d(cmd::SCROLL_BOTTOM, Always, &["Ctrl+Shift+End"]),
+        d(cmd::PREV_COMMAND, Always, &["Ctrl+Shift+Up"]),
+        d(cmd::NEXT_COMMAND, Always, &["Ctrl+Shift+Down"]),
         d(cmd::SESSIONS, Always, &["Ctrl+Shift+S"]),
         d(cmd::LIVE, Always, &["Ctrl+Shift+L"]),
         d(cmd::FILES, Always, &["Ctrl+Shift+E"]),
@@ -598,6 +600,12 @@ mod cmd {
     pub const SUGGEST_WORD: u32 = 518;
     pub const SUGGEST_NEXT: u32 = 519;
     pub const SUGGEST_PREV: u32 = 520;
+    /// Edit > Previous command, Next command, Select command output, Copy
+    /// last command's output: from the shell's OSC 133 marks.
+    pub const PREV_COMMAND: u32 = 522;
+    pub const NEXT_COMMAND: u32 = 523;
+    pub const SELECT_OUTPUT: u32 = 524;
+    pub const COPY_OUTPUT: u32 = 525;
     pub const SUGGEST_FORGET: u32 = 521;
     pub const LOG_TOGGLE: u32 = 600;
     pub const LOG_RAW: u32 = 601;
@@ -675,6 +683,8 @@ mod cmd {
     /// Settings > Desktop notifications, and Notify on the bell too.
     pub const NOTIFY: u32 = 650;
     pub const NOTIFY_BELL: u32 = 651;
+    /// Settings > Notify when a long command finishes.
+    pub const NOTIFY_COMMANDS: u32 = 684;
     /// Session > Notify when this pane goes quiet.
     pub const NOTIFY_QUIET: u32 = 652;
     /// Session > Coding agents > Agent dashboard; the menu's first item.
@@ -1078,6 +1088,8 @@ struct Pane {
     /// Where the scroll mark was last drawn, so moving or hiding it can
     /// repaint the rows it covered.
     mark: Option<Rect>,
+    /// Where the marks beside failed commands were last drawn, likewise.
+    fails: Vec<Rect>,
     /// A remote desktop shown instead of the terminal, which then only
     /// carries messages (the `desktop-viewer` feature).
     desktop: Option<Box<Desktop>>,
@@ -1134,6 +1146,27 @@ impl Pane {
         let w = scale(MARK_WIDTH_DIP, dpi).max(2);
         let right = self.rect.right() - scale(MARK_INSET_DIP, dpi).max(1);
         Some(Rect::new(right - w, oy + offset, w, size))
+    }
+
+    /// The marks beside the commands that failed (OSC 133 exit code
+    /// other than 0): a thin bar in the left padding of each such
+    /// command's line, never over the text.
+    fn fail_marks(&self, dpi: u32) -> Vec<Rect> {
+        let (_, oy) = self.origin(dpi);
+        let ch = self.metrics.height as i32;
+        let w = scale(MARK_WIDTH_DIP, dpi).max(2);
+        let x = self.rect.x + scale(MARK_INSET_DIP, dpi).max(1);
+        self.term
+            .failed_rows()
+            .into_iter()
+            .map(|y| Rect::new(x, oy + y as i32 * ch, w, ch))
+            .filter(|r| r.bottom() <= self.rect.bottom())
+            .collect()
+    }
+
+    /// The colour of the failed-command marks: the theme's red.
+    fn fail_colour(&self) -> Rgb {
+        self.theme.ansi[1]
     }
 
     /// The scroll mark's colour: the theme's text, faded well into its
@@ -3316,6 +3349,7 @@ fn new_pane(
         cwd_reported: false,
         prompt_host: None,
         mark: None,
+        fails: Vec::new(),
         desktop: None,
         no_broadcast: false,
         start_dir: None,
@@ -3572,6 +3606,12 @@ fn build_menu() -> Result<HMENU> {
             "Follow &new output\tCtrl+Shift+End",
         )?;
         item(edit, cmd::CLEAR_SCROLLBACK, "C&lear scrollback")?;
+        separator(edit)?;
+        item(edit, cmd::PREV_COMMAND, "Previous comman&d\tCtrl+Shift+Up")?;
+        item(edit, cmd::NEXT_COMMAND, "Ne&xt command\tCtrl+Shift+Down")?;
+        item(edit, cmd::SELECT_OUTPUT, "Select command &output")?;
+        item(edit, cmd::COPY_OUTPUT, "Copy last command's ou&tput")?;
+        separator(edit)?;
         item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as script...")?;
         separator(edit)?;
         item(edit, cmd::COPY_ON_SELECT, "Copy on &select")?;
@@ -3647,6 +3687,11 @@ fn build_menu() -> Result<HMENU> {
         item(view, cmd::STATUS_BAR, "Server stat&us bar")?;
         item(view, cmd::NOTIFY, "Desktop &notifications")?;
         item(view, cmd::NOTIFY_BELL, "Notify on the &bell too")?;
+        item(
+            view,
+            cmd::NOTIFY_COMMANDS,
+            "Notify when a long co&mmand finishes",
+        )?;
         separator(view)?;
         item(view, cmd::ZOOM_IN, "&Larger text\tCtrl+=")?;
         item(view, cmd::ZOOM_OUT, "&Smaller text\tCtrl+-")?;
@@ -5201,13 +5246,25 @@ impl Window {
             if tab.is_none() && !user_hid {
                 notes.push("script run");
             }
+            let last = p.term.last_command();
+            let command = last
+                .as_ref()
+                .filter(|c| c.failed())
+                .map(|c| format!("last command failed (exit {})", c.exit.unwrap_or_default()));
             let agent = self.agent_of(id).map(|name| {
                 let state = p
                     .quiet
                     .as_ref()
                     .map_or(crate::attention::State::Idle, |w| w.state(now));
                 let asked = p.attention_since.filter(|_| p.attention);
-                let (what, since) = crate::agents::status(asked, state, now);
+                let (mut what, mut since) = crate::agents::status(asked, state, now);
+                // The shell's marks say when the agent itself ended.
+                if asked.is_none()
+                    && let Some(c) = last.as_ref().filter(|c| !c.running)
+                {
+                    what = if c.failed() { "failed" } else { "exited" };
+                    since = Some(now.saturating_duration_since(c.since));
+                }
                 live::Agent {
                     name: name.to_owned(),
                     state: what,
@@ -5227,6 +5284,7 @@ impl Window {
                 title: p.title.clone().filter(|t| !t.is_empty()),
                 state: st,
                 notes,
+                command,
                 focused: tab.is_some() && id == focused,
             });
         }
@@ -12021,6 +12079,14 @@ impl Window {
                     Action::Notify(n) => {
                         chrome |= self.alert(id, n.title, n.body);
                     }
+                    Action::CommandFinished(end) => {
+                        // The Session manager tells failed commands.
+                        chrome = true;
+                        if self.settings.notify_commands && end.took >= LONG_COMMAND {
+                            let (what, body) = finished_note(&end);
+                            chrome |= self.alert(id, Some(what), body);
+                        }
+                    }
                     Action::WorkingDirectory(dir) => {
                         if self.on_working_dir(id, dir) {
                             chrome = true;
@@ -13022,6 +13088,17 @@ impl Window {
             }
             pane.mark = mark;
         }
+        let fails = pane.fail_marks(self.dpi);
+        if fails != pane.fails {
+            let (_, oy) = pane.origin(self.dpi);
+            let ch = pane.metrics.height.max(1) as i32;
+            let last = pane.grid.rows().saturating_sub(1);
+            for r in pane.fails.iter().chain(&fails) {
+                let y = ((r.y - oy) / ch).max(0) as usize;
+                pane.grid.mark_dirty(y.min(last));
+            }
+            pane.fails = fails;
+        }
         self.invalidate_dirty(id);
     }
 
@@ -13936,6 +14013,11 @@ impl Window {
                 && let Some(m) = p.scroll_mark(self.dpi)
             {
                 out.push((pixel(m), p.mark_colour()));
+            }
+            if let Some(p) = self.panes.get(&id) {
+                for f in &p.fails {
+                    out.push((pixel(*f), p.fail_colour()));
+                }
             }
         }
         if let Some(Drag::Pane { active: true, .. } | Drag::Tab { out: true, .. }) = &self.drag {
@@ -20683,6 +20765,11 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::NOTIFY_COMMANDS => {
+                self.settings.notify_commands = !self.settings.notify_commands;
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::NOTIFY_QUIET => self.toggle_quiet(pane),
             cmd::AGENT_DIFF => return self.show_changes(pane),
             cmd::AGENTS_SHOW => {
@@ -21049,6 +21136,25 @@ impl Window {
                     text: "Clear the command history of every host?".into(),
                     then: Box::new(Command::ClearAllHistory),
                 });
+            }
+            cmd::PREV_COMMAND | cmd::NEXT_COMMAND | cmd::SELECT_OUTPUT | cmd::COPY_OUTPUT => {
+                let term = &mut self.panes.get_mut(&pane)?.term;
+                if !term.shell_integration() {
+                    return Some(Command::Notice(SHELL_MARKS_HOW.into()));
+                }
+                let done = match id {
+                    cmd::PREV_COMMAND => term.jump_to_command(true),
+                    cmd::NEXT_COMMAND => term.jump_to_command(false),
+                    cmd::SELECT_OUTPUT => term.select_command_output(false),
+                    _ => term.select_command_output(true),
+                };
+                if !done {
+                    return None;
+                }
+                self.refresh(pane);
+                if id == cmd::COPY_OUTPUT {
+                    return Some(Command::Copy);
+                }
             }
             cmd::SCROLL_PAGE_UP | cmd::SCROLL_PAGE_DOWN | cmd::SCROLL_TOP | cmd::SCROLL_BOTTOM => {
                 let term = &mut self.panes.get_mut(&pane)?.term;
@@ -21904,6 +22010,7 @@ impl Window {
                 (cmd::STATUS_BAR, s.status_bar),
                 (cmd::NOTIFY, s.notifications),
                 (cmd::NOTIFY_BELL, s.notify_bell),
+                (cmd::NOTIFY_COMMANDS, s.notify_commands),
                 (cmd::NOTIFY_QUIET, p.is_some_and(|p| p.quiet.is_some())),
                 (cmd::TMUX_LAYOUT, own_layout),
                 (cmd::BROADCAST_TAB, self.broadcast == broadcast::Scope::Tab),
@@ -21978,6 +22085,7 @@ impl Window {
             (cmd::LAST_PANE, self.back_pane().is_some()),
             (cmd::LAST_PANE_PASTE, self.back_pane().is_some()),
             (cmd::NOTIFY_BELL, self.settings.notifications),
+            (cmd::NOTIFY_COMMANDS, self.settings.notifications),
             (
                 cmd::NOTIFY_QUIET,
                 // A watch can always be taken off; a new one needs
@@ -24168,6 +24276,30 @@ fn desktop_size(rect: Rect) -> (u16, u16) {
 
 /// Session > Remote desktop > Open virtual desktop on a pane that is not logged in.
 /// Where Show what changed works.
+/// What Edit > Previous command and the others need.
+const SHELL_MARKS_HOW: &str = "Previous command, Next command and selecting a command's output \
+     need a shell that marks its prompts and commands (OSC 133). fish 4 does by itself, and \
+     oh-my-posh with its shell integration on; for bash, zsh, older fish, PowerShell and cmd, \
+     see Shell integration in the user guide.";
+
+/// A command that ran at least this long raises a notification when it
+/// finishes (Settings > Notify when a long command finishes).
+const LONG_COMMAND: Duration = Duration::from_secs(10);
+
+/// The heading and text of a long command's notification.
+fn finished_note(end: &ferossh_term::CommandEnd) -> (String, String) {
+    let what = match end.exit {
+        Some(c) if c != 0 => format!("Command failed (exit {c})"),
+        _ => "Command finished".to_owned(),
+    };
+    let took = crate::attention::spoken(end.took);
+    let body = match &end.command {
+        Some(c) => format!("{c}\nRan for {took}."),
+        None => format!("Ran for {took}."),
+    };
+    (what, body)
+}
+
 const DIFF_HOW: &str = "Show what changed works in a pane logged in to a server over SSH (or \
      a tmux pane there), in a folder of a git repository.";
 /// Scrollback a diff tab keeps beyond [`crate::diff::MAX_ROWS`].
