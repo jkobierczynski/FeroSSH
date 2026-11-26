@@ -122,6 +122,17 @@ jobs:
             Get-Content "check-$exe.txt" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
             if ($p.ExitCode -ne 0) { throw "$exe.exe --check-sandbox exited with $($p.ExitCode)" }
           }
+      # PowerShell's prompt marks (OSC 133) through this Windows' ConPTY.
+      # Report only: older consoles drop or move them, which FeroSSH
+      # copes with, so the result says what this runner does.
+      - name: Check shell marks through ConPTY (report only)
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $p = Start-Process -FilePath "dist/ferossh.exe" -ArgumentList '--check-conpty' `
+            -Wait -PassThru -NoNewWindow -RedirectStandardOutput "check-conpty.txt"
+          "ferossh.exe --check-conpty (exit $($p.ExitCode)):" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          Get-Content "check-conpty.txt" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
       - name: Check the exe's imports, CFG and CET marks
         shell: pwsh
         run: |

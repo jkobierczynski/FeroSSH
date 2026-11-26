@@ -23,6 +23,7 @@ ferossh.exe telnet://router   # Telnet (unencrypted), port 23 unless given
 ferossh.exe winrm://LAB\admin@win-srv  # PowerShell on a Windows server over WinRM
 ferossh.exe --local [command]  # a local shell
 ferossh.exe --check-sandbox    # report what the sandbox can do on this PC
+ferossh.exe --check-conpty     # check PowerShell prompt marks through ConPTY
 ```
 
 `HostName`, `User`, `Port`, `IdentityFile`, `CertificateFile`, `IdentitiesOnly`, `IdentityAgent`, `Tag`, `Include`, `Match`, `ProxyJump`, `ProxyCommand`, `ForwardAgent`, `GSSAPIAuthentication`, `GSSAPIDelegateCredentials`, `GSSAPIServerIdentity`, `SendEnv`, `SetEnv`, `RemoteCommand`, `RequestTTY`, `SessionType`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `HostKeyAlias`, `AddressFamily` and the forwarding keywords (`LocalForward`, `RemoteForward`, `DynamicForward`, `ForwardX11`, `GatewayPorts`, `ClearAllForwardings`) are read from `~/.ssh/config`.

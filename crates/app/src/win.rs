@@ -506,6 +506,10 @@ fn bindable(id: u32) -> bool {
 /// Menu command ids. Shortcuts map to the same ids.
 mod cmd {
     pub const LOCAL_SHELL: u32 = 100;
+    /// File > Open local PowerShell.
+    pub const LOCAL_POWERSHELL: u32 = 119;
+    /// Settings > Shell integration for local PowerShell.
+    pub const LOCAL_SHELL_HOOK: u32 = 138;
     pub const EXIT: u32 = 101;
     pub const CONNECT: u32 = 102;
     pub const RECONNECT: u32 = 103;
@@ -813,6 +817,9 @@ enum Host {
     Local {
         shell: Option<Shell>,
         exited: bool,
+        /// The command line it runs (and runs again on Enter), before
+        /// FeroSSH's shell integration is added to it.
+        command: String,
     },
     Ssh(Box<SshSession>),
     /// A pane of the tmux session that SSH pane `gateway` runs in control
@@ -3415,6 +3422,7 @@ fn build_menu() -> Result<HMENU> {
         AppendMenuW(file, MF_POPUP, recent.0 as usize, w!("Recen&t connections"))?;
         separator(file)?;
         item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
+        item(file, cmd::LOCAL_POWERSHELL, "Open local &PowerShell")?;
         separator(file)?;
         item(file, cmd::UPLOAD, "&Upload files...\tCtrl+Shift+U")?;
         item(file, cmd::DOWNLOADS, "Open do&wnload folder")?;
@@ -3729,6 +3737,11 @@ fn build_menu() -> Result<HMENU> {
             view,
             cmd::NOTIFY_COMMANDS,
             "Notify when a long co&mmand finishes",
+        )?;
+        item(
+            view,
+            cmd::LOCAL_SHELL_HOOK,
+            "Shell integration for local Power&Shell",
         )?;
         separator(view)?;
         item(view, cmd::ZOOM_IN, "&Larger text\tCtrl+=")?;
@@ -5090,23 +5103,48 @@ impl Window {
         self.prune_forwards();
     }
 
+    /// Starts pane `id`'s local shell again (the same command it ran), or
+    /// the local shell.
     fn start_shell(&mut self, id: PaneId) {
-        self.start_shell_in(id, None);
+        let command = self.local_command(id);
+        self.start_command_in(id, &command, None);
+    }
+
+    /// The command local pane `id` runs, or the local shell's.
+    fn local_command(&self, id: PaneId) -> String {
+        match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Local { command, .. }) => command.clone(),
+            _ => self.command.clone(),
+        }
     }
 
     /// Starts the local shell in folder `dir`, or in the profile folder.
     fn start_shell_in(&mut self, id: PaneId, dir: Option<&str>) {
+        let command = self.command.clone();
+        self.start_command_in(id, &command, dir);
+    }
+
+    /// Starts `command` on this PC in pane `id`, in folder `dir`, or in the
+    /// profile folder. A PowerShell gets FeroSSH's prompt marks while
+    /// Settings > Shell integration for local PowerShell is on.
+    fn start_command_in(&mut self, id: PaneId, command: &str, dir: Option<&str>) {
         self.end_host(id);
         let notify = self.notifier();
+        let launched = if self.settings.local_shell_integration {
+            crate::shell_hook::with_hook(command)
+        } else {
+            command.to_owned()
+        };
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
         let (cols, rows) = (p.term.cols(), p.term.rows());
-        match Shell::spawn(&self.command, cols, rows, dir, notify) {
+        match Shell::spawn(&launched, cols, rows, dir, notify) {
             Ok(shell) => {
                 p.host = Host::Local {
                     shell: Some(shell),
                     exited: false,
+                    command: command.to_owned(),
                 };
                 self.start_log(id);
                 // A workspace's local pane runs its script once its shell
@@ -5116,12 +5154,13 @@ impl Window {
             Err(e) => {
                 let text = format!(
                     "\x1b[0;31mCould not start {}: {}\x1b[0m\r\nPress Enter to try again.\r\n",
-                    self.command,
+                    command,
                     e.message()
                 );
                 p.host = Host::Local {
                     shell: None,
                     exited: true,
+                    command: command.to_owned(),
                 };
                 self.show(id, &text);
             }
@@ -10870,6 +10909,7 @@ impl Window {
             Some(Host::Local {
                 shell: Some(shell),
                 exited: false,
+                ..
             }) => {
                 shell.write(bytes);
                 return;
@@ -11553,6 +11593,7 @@ impl Window {
             Host::Local {
                 shell: Some(_),
                 exited: false,
+                ..
             }
             | Host::Tmux { .. }
             | Host::Serial { port: Some(_), .. } => true,
@@ -11655,6 +11696,7 @@ impl Window {
                     Host::Local {
                         shell: Some(shell),
                         exited: false,
+                        ..
                     },
                 ..
             }) = self.panes.get_mut(&id)
@@ -11685,11 +11727,11 @@ impl Window {
                             }
                         }
                         self.stop_log(id);
-                        if let Some(p) = self.panes.get_mut(&id) {
-                            p.host = Host::Local {
-                                shell: None,
-                                exited: true,
-                            };
+                        if let Some(p) = self.panes.get_mut(&id)
+                            && let Host::Local { shell, exited, .. } = &mut p.host
+                        {
+                            *shell = None;
+                            *exited = true;
                         }
                         let text = format!(
                             "\r\n\x1b[0;90m[Process exited with code {code}. Press Enter to start a new one.]\x1b[0m\r\n"
@@ -19486,6 +19528,12 @@ impl Window {
     /// prompt or holds a local shell that ended, else in a new tab, so a
     /// running SSH, Telnet, serial or tmux session is never ended.
     fn local_shell_in_new_tab(&mut self, pane: PaneId) {
+        let command = self.command.clone();
+        self.local_command_in_new_tab(pane, &command);
+    }
+
+    /// [`Self::local_shell_in_new_tab`] for `command`.
+    fn local_command_in_new_tab(&mut self, pane: PaneId, command: &str) {
         let idle = match self.panes.get(&pane).map(|p| &p.host) {
             Some(Host::Ask(t)) => t.is_empty(),
             Some(Host::Local { exited, .. }) => *exited,
@@ -19509,7 +19557,7 @@ impl Window {
             self.workspace_tmux.remove(&id);
         }
         self.focus_terminal();
-        self.start_shell_in(id, dir.as_deref());
+        self.start_command_in(id, command, dir.as_deref());
     }
 
     /// Gives the keyboard back to the focused pane. Unless Settings >
@@ -19679,7 +19727,7 @@ impl Window {
             Ssh(Box<Target>),
             Telnet(TelnetTarget),
             Winrm(WinrmTarget),
-            Local,
+            Local(String),
             Ask,
         }
         let from = self.host_pane(from);
@@ -19693,7 +19741,7 @@ impl Window {
             Some(Host::Ssh(s)) => Like::Ssh(Box::new(s.target.clone())),
             Some(Host::Telnet(s)) => Like::Telnet(s.target.clone()),
             Some(Host::Winrm(s)) => Like::Winrm(s.target.clone()),
-            Some(Host::Local { .. }) => Like::Local,
+            Some(Host::Local { command, .. }) => Like::Local(command.clone()),
             _ => Like::Ask,
         };
         match like {
@@ -19710,7 +19758,7 @@ impl Window {
             }
             Like::Telnet(target) => self.connect_telnet(id, target),
             Like::Winrm(target) => self.connect_winrm(id, target),
-            Like::Local => self.start_shell_in(id, local_cwd.as_deref()),
+            Like::Local(command) => self.start_command_in(id, &command, local_cwd.as_deref()),
             Like::Ask => self.ask_destination(id),
         }
     }
@@ -20957,6 +21005,11 @@ impl Window {
             cmd::SNIPPET_FOLDER => return Some(Command::OpenFolder(snippets_dir())),
             cmd::WRITE_LIBRARY => return Some(Command::WriteLibrary),
             cmd::LOCAL_SHELL => self.local_shell_in_new_tab(pane),
+            cmd::LOCAL_POWERSHELL => {
+                let pwsh = crate::program::find("pwsh.exe", &crate::program::search_dirs());
+                let command = crate::shell_hook::powershell_command(pwsh.is_some());
+                self.local_command_in_new_tab(pane, &command);
+            }
             cmd::CONNECT => self.connect_in_new_tab(pane),
             cmd::RECONNECT => {
                 let pane = self.host_pane(pane);
@@ -21268,6 +21321,16 @@ impl Window {
                 self.settings.notify_commands = !self.settings.notify_commands;
                 self.save_settings();
                 self.update_menu_checks();
+            }
+            cmd::LOCAL_SHELL_HOOK => {
+                self.settings.local_shell_integration = !self.settings.local_shell_integration;
+                self.save_settings();
+                self.update_menu_checks();
+                return Some(Command::Notice(
+                    "This takes effect in PowerShell panes opened from now on; the ones open \
+                     now keep what they started with."
+                        .into(),
+                ));
             }
             cmd::NOTIFY_QUIET => self.toggle_quiet(pane),
             cmd::AGENT_DIFF => return self.show_changes(pane),
@@ -22518,6 +22581,7 @@ impl Window {
                 (cmd::NOTIFY, s.notifications),
                 (cmd::NOTIFY_BELL, s.notify_bell),
                 (cmd::NOTIFY_COMMANDS, s.notify_commands),
+                (cmd::LOCAL_SHELL_HOOK, s.local_shell_integration),
                 (cmd::NOTIFY_QUIET, p.is_some_and(|p| p.quiet.is_some())),
                 (cmd::TMUX_LAYOUT, own_layout),
                 (cmd::BROADCAST_TAB, self.broadcast == broadcast::Scope::Tab),

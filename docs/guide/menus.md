@@ -19,6 +19,7 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 | Recent connections > (a connection) | | The last eight hosts you connected to, from Connect to... or the connection manager, newest first: picking one connects again, as a double click in the connection manager does. Kept in `ferossh.conf` (`Recent` lines), so a master password vault holds them too. |
 | Recent connections > Clear this list | | Forgets them. |
 | Open local shell | | Opens a Windows command prompt (`%COMSPEC%`, usually `cmd.exe`) in a new tab. To start another program, use `ferossh.exe --local wsl -d Ubuntu` and the like. |
+| Open local PowerShell | | Opens PowerShell in a new tab: PowerShell 7 (`pwsh.exe`) when it is installed, else Windows PowerShell. With Settings > Shell integration for local PowerShell on, it sends prompt marks without any change to your profile (see [Shell integration](everyday-use.md#shell-integration-prompt-marks)). A split of it opens PowerShell too. |
 | Upload files... | Ctrl+Shift+U | Picks files on your PC and uploads them over SFTP to the folder the file view shows, or the shell's current folder. |
 | Open download folder | | Opens the folder downloads go to in Explorer. |
 | Import and export > Import connections... | | Brings saved sessions over from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT (see [Imports](everyday-use.md#importing-from-other-clients)). |
@@ -62,6 +63,7 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 | Desktop notifications | ✓ off | A tab badge and a Windows notification when a pane wants you: a notification the host sends (OSC 9, 777 or 99), the bell, or quiet after work. See [Notifications](everyday-use.md#notifications-coding-agents-and-long-jobs). `Notifications`. |
 | Notify on the bell too | ✓ on | The bell counts as asking for attention. Greyed out while notifications are off. `NotifyBell`. |
 | Notify when a long command finishes | off | A command that ran 10 seconds or more raises a notification when it finishes, from the shell's OSC 133 marks (see [Shell integration](everyday-use.md#shell-integration-prompt-marks)). Greyed out while notifications are off. `NotifyCommands`. |
+| Shell integration for local PowerShell | ✓ on | PowerShell panes FeroSSH starts on this PC (File > Open local PowerShell, `--local powershell`, `--local pwsh`) get FeroSSH's prompt and command marks, added after your profile runs, so Previous command, Select command output, failed-command bars and the agent dashboard's *exited*/*failed* work there. A profile that already has the hook from the user guide is left alone. Takes effect in PowerShell panes opened afterwards. `LocalShellIntegration`. |
 | Larger text | Ctrl+= (or Ctrl+wheel up) | Makes the focused pane's text bigger. |
 | Smaller text | Ctrl+- (or Ctrl+wheel down) | Makes it smaller. |
 | Reset text size | Ctrl+0 | Back to the pane's normal size. |

@@ -976,7 +976,9 @@ function __ferossh_done --on-event fish_postexec
 end
 ```
 
-PowerShell 5.1 or 7, in your profile (`notepad $PROFILE`):
+**Local PowerShell needs nothing:** PowerShell panes FeroSSH starts on this PC (File > Open local PowerShell, or `--local pwsh`) get the marks from FeroSSH itself while Settings > Shell integration for local PowerShell is on, as it is unless you turn it off. FeroSSH adds the hook after your profile runs, so it wraps your own prompt (oh-my-posh and starship included), and leaves it out when your profile already has the one below. For PowerShell on a Windows SSH server, add it yourself.
+
+PowerShell 5.1 or 7 elsewhere, in your profile (`notepad $PROFILE`):
 
 ```powershell
 # FeroSSH shell integration (OSC 133)
@@ -1005,7 +1007,7 @@ cmd can mark its prompts but not its commands, so only Previous command and Next
 setx PROMPT "$e]133;A$e\$P$G$e]133;B$e\"
 ```
 
-PowerShell and cmd on Windows (a local shell, or an SSH server on Windows) run on Windows' console layer (ConPTY), which on older Windows versions drops these marks; there the features stay off, as without marks.
+PowerShell and cmd on Windows (a local shell, or an SSH server on Windows) run on Windows' console layer (ConPTY), which on older Windows versions drops these marks, or sends them ahead of the text they belong to; there the features stay off, or land a line off. `ferossh.exe --check-conpty | more` tells you which your Windows does: it starts PowerShell with the hook, runs three commands and checks each one's end, exit code, line and output.
 
 ## Command suggestions
 

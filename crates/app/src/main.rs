@@ -23,7 +23,9 @@
 //! milestone 2 did. `--theme NAME`, before the rest, picks the pane's
 //! colour theme. `--new-security-key [--hello] [--ed25519] FILE` makes a
 //! FIDO2 security key file (see `newkey`). `--check-sandbox` starts the
-//! sandboxed processes and reports whether they run (see `selfcheck`).
+//! sandboxed processes and reports whether they run (see `selfcheck`);
+//! `--check-conpty` checks PowerShell's prompt marks through ConPTY (see
+//! `conpty_check`).
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -55,6 +57,8 @@ mod connlog_store;
 mod connlog_view;
 #[cfg(windows)]
 mod conpty;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod conpty_check;
 #[cfg(windows)]
 mod credential_panel;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -218,6 +222,8 @@ mod session_form;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod sessions;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod shell_hook;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod snippets_view;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod ssh;
@@ -297,6 +303,8 @@ enum Launch {
     NewSecurityKey(newkey::NewKey),
     /// Start the sandboxed processes, check that they run, and report.
     CheckSandbox,
+    /// Check PowerShell's OSC 133 marks through ConPTY, and report.
+    CheckConpty,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -376,6 +384,7 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
                 return newkey::parse(&rest).map(Launch::NewSecurityKey);
             }
             "--check-sandbox" => return Ok(Launch::CheckSandbox),
+            "--check-conpty" => return Ok(Launch::CheckConpty),
             "--no-sandbox" => sandbox = false,
             "--workspace" => {
                 workspace = Some(
@@ -489,6 +498,7 @@ fn main() -> windows::core::Result<()> {
         }
         Ok(Launch::NewSecurityKey(key)) => win::new_security_key(&key),
         Ok(Launch::CheckSandbox) => std::process::exit(selfcheck::run()),
+        Ok(Launch::CheckConpty) => std::process::exit(conpty_check::run()),
         #[cfg(feature = "viewer")]
         Ok(Launch::Viewer(input, output)) => {
             // Decoding only: no window, no network, no files.
@@ -550,6 +560,7 @@ mod tests {
             Ok(Launch::NewSecurityKey(k)) if k.hello
         ));
         assert_eq!(parse(&["--check-sandbox"]), Ok(Launch::CheckSandbox));
+        assert_eq!(parse(&["--check-conpty"]), Ok(Launch::CheckConpty));
         assert_eq!(
             parse(&["--workspace", "Web servers", "--no-sandbox"]),
             Ok(Launch::Workspace {
