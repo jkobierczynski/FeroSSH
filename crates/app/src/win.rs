@@ -12761,6 +12761,18 @@ impl Window {
             .map(|(g, _)| *g)
     }
 
+    /// Whether an agent started from pane `id` would land in someone
+    /// else's tmux session (joined, so FeroSSH changes nothing of it):
+    /// the tmux pane's own, or the one shown for this host.
+    fn agent_would_join(&self, id: PaneId) -> bool {
+        let g = match self.panes.get(&id).and_then(Pane::gateway) {
+            Some(g) => Some(g),
+            None => self.shown_tmux(id),
+        };
+        g.and_then(|g| self.tmux.get(&g))
+            .is_some_and(|t| t.joined().is_some())
+    }
+
     /// Session > Coding agents > Start <agent> in a new git worktree: a
     /// worktree and branch of the git repository pane `id` is in, made by
     /// [`crate::worktree::add_command`], for agent `command` to start in
@@ -12770,11 +12782,11 @@ impl Window {
         if let Some(refused) = self.agent_refused(id) {
             return Some(refused);
         }
+        // No worktree is made for an agent that could not start.
+        if self.agent_would_join(id) {
+            return Some(Command::Notice(JOINED_AGENT.into()));
+        }
         if let Some(g) = self.panes.get(&id).and_then(Pane::gateway) {
-            // No worktree is made for an agent that could not start.
-            if self.tmux.get(&g).is_some_and(|t| t.joined().is_some()) {
-                return Some(Command::Notice(JOINED_AGENT.into()));
-            }
             // A connection that never answers keeps only a few. Checked
             // before tmux is asked: an ask whose answer nobody waits for
             // would shift every later answer.
@@ -12799,14 +12811,6 @@ impl Window {
                 self.run_tmux(g, actions);
                 return None;
             }
-        }
-        // The agent would join the tmux session shown for this host.
-        if self
-            .shown_tmux(id)
-            .and_then(|g| self.tmux.get(&g))
-            .is_some_and(|t| t.joined().is_some())
-        {
-            return Some(Command::Notice(JOINED_AGENT.into()));
         }
         let Some(dir) = self
             .panes
@@ -12940,18 +12944,30 @@ impl Window {
                 use crate::worktree::Added;
                 match crate::worktree::parse_add(&j.out, &j.err) {
                     Added::Made(w) => {
+                        // The worktree is there whatever happens next, so
+                        // a refusal says where.
+                        let made = format!(
+                            "Made worktree {} on branch {} on {host}, but no agent started \
+                             there",
+                            crate::ssh::sanitize_line(&w.path),
+                            w.branch
+                        );
+                        let undo = "Start one in it yourself, or remove it with git worktree \
+                                    remove and git branch -d.";
                         if !self.panes.contains_key(&j.pane) {
-                            format!(
-                                "Made worktree {} on branch {} on {host}, but the pane it was \
-                                 asked from has closed, so no agent started there.",
-                                crate::ssh::sanitize_line(&w.path),
-                                w.branch
-                            )
+                            format!("{made}: the pane it was asked from has closed. {undo}")
+                        } else if self.agent_would_join(j.pane) {
+                            // Joined someone else's session while git ran.
+                            format!("{made}: {JOINED_AGENT} {undo}")
                         } else {
-                            if let Some(next) = self.start_agent_at(j.pane, &command, Some(&w)) {
-                                self.queued.push(next);
+                            match self.start_agent_at(j.pane, &command, Some(&w)) {
+                                None => return,
+                                Some(Command::Notice(why)) => format!("{made}: {why} {undo}"),
+                                Some(next) => {
+                                    self.queued.push(next);
+                                    return;
+                                }
                             }
-                            return;
                         }
                     }
                     Added::NoGit => format!("{host} has no git command, so no worktree was made."),

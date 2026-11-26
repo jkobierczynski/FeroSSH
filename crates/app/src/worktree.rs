@@ -148,7 +148,13 @@ pub fn add_command() -> Vec<u8> {
         // Only a folder the answer can carry back (see `valid_path`):
         // nothing is made for one that could not be read.
         format!("case $w in /*) ;; *) echo {MARK} badpath; exit 0;; esac"),
+        // Byte by byte: the C0 controls and DEL, then the C1 controls
+        // (U+0080 to U+009F, \302\200 to \302\237 in UTF-8), which
+        // `char::is_control` refuses too.
+        "LC_ALL=C; export LC_ALL".to_owned(),
         format!("case $w in *[[:cntrl:]]*) echo {MARK} badpath; exit 0;; esac"),
+        "c=$(printf \"\\302[\\200-\\237]\")".to_owned(),
+        format!("case $w in *$c*) echo {MARK} badpath; exit 0;; esac"),
         format!("[ ${{#w}} -le {MAX_PATH} ] || {{ echo {MARK} badpath; exit 0; }}"),
         // From the commit the asking pane has checked out.
         format!("git worktree add -b \"$b\" -- \"$w\" >&2 || {{ echo {MARK} failed; exit 0; }}"),
@@ -527,6 +533,16 @@ mod tests {
         assert_eq!(add(&tab, "claude"), Added::BadPath);
         assert!(git(&tab, &["branch", "--list", "claude"]).trim().is_empty());
         assert!(!root.join("tab\there-claude").exists());
+        // Nor one with a C1 control (U+0085, next line) in it.
+        let nel = root.join("nel\u{85}here");
+        std::fs::create_dir_all(&nel).unwrap();
+        git(&nel, &["init", "-q"]);
+        std::fs::write(nel.join("a"), "a").unwrap();
+        git(&nel, &["add", "."]);
+        git(&nel, &["commit", "-qm", "one"]);
+        assert_eq!(add(&nel, "claude"), Added::BadPath);
+        assert!(git(&nel, &["branch", "--list", "claude"]).trim().is_empty());
+        assert!(!root.join("nel\u{85}here-claude").exists());
         // Not a repository, not a folder.
         assert_eq!(add(&root, "claude"), Added::NoRepo);
         assert_eq!(add(&root.join("nope"), "claude"), Added::NoDir);
