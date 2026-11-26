@@ -12755,12 +12755,17 @@ impl Window {
     /// else's tmux session (joined, so FeroSSH changes nothing of it):
     /// the tmux pane's own, or the one shown for this host.
     fn agent_would_join(&self, id: PaneId) -> bool {
+        self.agent_tmux(id).is_some_and(|t| t.joined().is_some())
+    }
+
+    /// The tmux an agent started from pane `id` would start in, when one
+    /// runs: the tmux pane's own, or the one shown for this host.
+    fn agent_tmux(&self, id: PaneId) -> Option<&tmux::Tmux> {
         let g = match self.panes.get(&id).and_then(Pane::gateway) {
             Some(g) => Some(g),
             None => self.shown_tmux(id),
         };
         g.and_then(|g| self.tmux.get(&g))
-            .is_some_and(|t| t.joined().is_some())
     }
 
     /// Session > Coding agents > Start <agent> in a new git worktree: a
@@ -12943,6 +12948,11 @@ impl Window {
                         } else if self.agent_would_join(j.pane) {
                             // Joined someone else's session while git ran.
                             format!("{made}: {JOINED_AGENT} {undo}")
+                        } else if self.agent_tmux(j.pane).is_some_and(tmux::Tmux::agents_full) {
+                            format!(
+                                "{made}: tmux has not answered the last agent starts yet. \
+                                 {undo}"
+                            )
                         } else {
                             match self.start_agent_at(j.pane, &command, Some(&w)) {
                                 None => return,

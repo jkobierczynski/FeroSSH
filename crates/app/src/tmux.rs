@@ -2390,6 +2390,12 @@ impl Tmux {
         }
     }
 
+    /// Whether [`Self::start_agent`] would refuse for the starts tmux has
+    /// not answered yet.
+    pub fn agents_full(&self) -> bool {
+        self.agents_waiting.len() >= 16
+    }
+
     /// Starts coding agent `command` in a new tmux window, a tab after
     /// `native`'s, in its directory: the window is named and marked with
     /// [`AGENT_OPTION`], and the command is typed at its shell, so the
@@ -2413,7 +2419,7 @@ impl Tmux {
         }
         // A connection that never answers keeps only a few; the ones it
         // accepted still finish.
-        if self.agents_waiting.len() >= 16 {
+        if self.agents_full() {
             out.push(Action::Notice(
                 "tmux has not answered the last agent starts yet; try again in a moment.".into(),
             ));
