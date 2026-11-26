@@ -107,6 +107,8 @@ pub struct Agent {
     pub waited: Option<std::time::Duration>,
     /// What it last said ([`crate::agents::last_line`]).
     pub last: Option<String>,
+    /// The branch of its own worktree, when it was started in one.
+    pub branch: Option<String>,
 }
 
 impl Agent {
@@ -174,7 +176,12 @@ impl LiveSession {
                 .is_some_and(|t| t.to_lowercase().contains(&q))
             || self.kind.name().to_lowercase().contains(&q)
             || self.agent.as_ref().is_some_and(|a| {
-                "agent".contains(&q) || a.name.to_lowercase().contains(&q) || a.state.contains(&q)
+                "agent".contains(&q)
+                    || a.name.to_lowercase().contains(&q)
+                    || a.state.contains(&q)
+                    || a.branch
+                        .as_deref()
+                        .is_some_and(|b| b.to_lowercase().contains(&q))
             })
     }
 
@@ -627,12 +634,19 @@ impl LiveView {
                                 .since
                                 .as_deref()
                                 .filter(|_| s.state == LiveState::Connected);
-                            [host, since, s.command.as_deref(), a.last.as_deref()]
-                                .into_iter()
-                                .flatten()
-                                .filter(|t| !t.is_empty())
-                                .collect::<Vec<_>>()
-                                .join(" \u{b7} ")
+                            let branch = a.branch.as_ref().map(|b| format!("branch {b}"));
+                            [
+                                branch.as_deref(),
+                                host,
+                                since,
+                                s.command.as_deref(),
+                                a.last.as_deref(),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" \u{b7} ")
                         },
                         focused: s.focused,
                     })
@@ -724,6 +738,7 @@ mod tests {
             since: None,
             waited: None,
             last: None,
+            branch: None,
         });
         let mut v = LiveView::default();
         let rows = v.rows(&all);
@@ -766,6 +781,7 @@ mod tests {
             since: Some("1 min".into()),
             waited: None,
             last: Some("Bye".into()),
+            branch: None,
         });
         all[1].state = LiveState::Connected;
         let mut v = LiveView::default();
@@ -787,6 +803,7 @@ mod tests {
             since: Some(since.into()),
             waited: waited.map(std::time::Duration::from_secs),
             last: Some(last.into()),
+            branch: None,
         };
         all[0].agent = Some(agent("codex", "working", "2 min", None, "Running tests"));
         all[1].agent = Some(agent(
@@ -822,6 +839,19 @@ mod tests {
             rows[0].details,
             format!("{} \u{b7} 5 min \u{b7} Apply edit?", all[2].target)
         );
+        // An agent in its own worktree shows its branch first, and is
+        // found by it.
+        if let Some(a) = all[0].agent.as_mut() {
+            a.branch = Some("codex-2".into());
+        }
+        let rows = v.rows(&all);
+        assert_eq!(
+            rows[2].details,
+            "branch codex-2 \u{b7} 2 min \u{b7} Running tests"
+        );
+        v.set_query("is:agent codex-2");
+        assert_eq!(v.rows(&all).len(), 1);
+        v.set_query(AGENTS_ONLY);
         // A word after the filter narrows it.
         v.set_query("is:agent web");
         assert_eq!(v.rows(&all).len(), 1);
