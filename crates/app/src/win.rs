@@ -22226,6 +22226,8 @@ impl Window {
                     return None;
                 }
                 p.log.enabled = !p.log.enabled;
+                // The user's choice now, not the agent audit trail's.
+                p.audit_log = false;
                 // A choice made while no session is live is the user's
                 // own: no rule's saved setting may undo it later.
                 if !live {
@@ -22272,7 +22274,13 @@ impl Window {
             }
             cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
             cmd::LOG_VERIFY => return Some(Command::VerifyLog),
-            cmd::RECORD_CAST => self.toggle_record(pane),
+            cmd::RECORD_CAST => {
+                // The user's choice now, not the agent audit trail's.
+                if let Some(p) = self.panes.get_mut(&pane) {
+                    p.audit_cast = false;
+                }
+                self.toggle_record(pane);
+            }
             cmd::PLAY_CAST => return Some(Command::PlayCast),
             cmd::SERIAL_BREAK => {
                 let pane = self.focused_id();
