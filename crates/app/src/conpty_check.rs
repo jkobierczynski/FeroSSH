@@ -13,7 +13,10 @@
 //! [`Check`] does the reading and deciding, so it is tested here against
 //! scripted output; [`run`] drives it with a real ConPTY on Windows.
 
-use ferossh_term::{Action, Settings, Terminal};
+use ferossh_term::{Action, CommandEnd, Settings, Terminal};
+
+/// The prompt mark (OSC 133 `A`) as PowerShell sends it.
+const PROMPT_MARK: &[u8] = b"\x1b]133;A";
 
 /// What the check types, the exit code each must end with, and what it
 /// must print.
@@ -37,6 +40,11 @@ pub struct Check {
     wrong: bool,
     /// Every command has ended (or the check gave up).
     done: bool,
+    /// The awaited command's end, held until the next prompt's mark
+    /// closes its output.
+    ended: Option<CommandEnd>,
+    /// The last bytes fed, for a prompt mark split across reads.
+    tail: Vec<u8>,
 }
 
 impl Default for Check {
@@ -53,6 +61,8 @@ impl Check {
             lines: Vec::new(),
             wrong: false,
             done: false,
+            ended: None,
+            tail: Vec::new(),
         }
     }
 
@@ -65,12 +75,18 @@ impl Check {
     /// ended.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.term.feed(bytes);
+        let mut seen = std::mem::take(&mut self.tail);
+        seen.extend_from_slice(bytes);
+        let prompted = seen.windows(PROMPT_MARK.len()).any(|w| w == PROMPT_MARK);
+        let keep = seen.len().saturating_sub(PROMPT_MARK.len() - 1);
+        self.tail = seen.split_off(keep);
         let mut typed = Vec::new();
-        let mut ended = Vec::new();
         for action in self.term.take_actions() {
             match action {
                 Action::Reply(r) => typed.extend_from_slice(&r),
-                Action::CommandFinished(end) => ended.push(end),
+                Action::CommandFinished(end) if self.ended.is_none() => {
+                    self.ended = Some(end);
+                }
                 _ => {}
             }
         }
@@ -86,7 +102,12 @@ impl Check {
             }
             return typed;
         };
-        let Some(end) = ended.into_iter().next() else {
+        // A command's output ends at the next prompt, which comes after
+        // its end mark; until then the output cannot be read.
+        if self.ended.is_none() || !prompted {
+            return typed;
+        }
+        let Some(end) = self.ended.take() else {
             return typed;
         };
         let (line, exit, output) = STEPS.get(step).copied().unwrap_or_default();
@@ -282,6 +303,22 @@ mod tests {
             lines.iter().any(|l| l.contains("output read as")),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn an_end_mark_read_apart_from_the_next_prompt() {
+        let mut c = Check::new();
+        c.feed(prompt(None).as_bytes());
+        c.feed(command(STEPS[0].0, STEPS[0].2, 0, false).as_bytes());
+        // The second command's end, then (in another read, split inside
+        // the mark) the next prompt.
+        let typed = c.feed(format!("{}\r\n{E}C{BEL}{E}D;3{BEL}\x1b]13", STEPS[1].0).as_bytes());
+        assert!(typed.is_empty(), "typed before the prompt");
+        let typed = c.feed(format!("3;A{BEL}PS C:\\> {E}B{BEL}").as_bytes());
+        assert_eq!(typed, b"Write-Output ferossh-check-two\r");
+        c.feed(command(STEPS[2].0, STEPS[2].2, 0, false).as_bytes());
+        let (lines, code) = c.report();
+        assert_eq!(code, 0, "{lines:#?}");
     }
 
     #[test]

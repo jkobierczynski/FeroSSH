@@ -59,6 +59,14 @@ pub fn commands(configured: &[String]) -> Vec<String> {
 /// With `worktree`, the window starts in its folder instead, and is
 /// marked with it ([`crate::worktree::OPTION`]).
 pub fn start_line(command: &str, worktree: Option<&Worktree>) -> String {
+    format!(" sh -c {}; ", sh_quote(&start_script(command, worktree)))
+}
+
+/// The `sh` script of [`start_line`]: run in the directory the agent
+/// starts in (or for `worktree`, anywhere), it opens and marks the
+/// agent's window in session [`SESSION`] and types the command there. A
+/// WSL gateway runs it before it attaches ([`crate::wsl`]).
+pub fn start_script(command: &str, worktree: Option<&Worktree>) -> String {
     let name = sh_quote(&agent_name(command));
     let dir = worktree.map_or_else(|| "\"$PWD\"".to_owned(), |w| sh_quote(&w.path));
     let mark = worktree.map_or_else(String::new, |w| {
@@ -82,15 +90,14 @@ pub fn start_line(command: &str, worktree: Option<&Worktree>) -> String {
     // so the keys reach it whichever pane another client selects. The
     // worktree's mark comes before the agent's, so whoever sees the
     // agent sees its branch too.
-    let script = format!(
+    format!(
         "d=$(printf %s_ {dir} | sed \"s/#/##/g\"); d=${{d%_}}; p=; \
          tmux has-session -t {exact} 2>/dev/null || \
          p=$(tmux new-session -d -s {session} -c \"$d\" -n {name} -P -F '#{{pane_id}}' 2>/dev/null); \
          [ -n \"$p\" ] || p=$(tmux new-window -d -t {target} -c \"$d\" -n {name} -P -F '#{{pane_id}}'); \
          [ -n \"$p\" ]{mark} && tmux set-option -w -t \"$p\" {AGENT_OPTION} {name} \
          && tmux send-keys -t \"$p\" -H{keys}"
-    );
-    format!(" sh -c {}; ", sh_quote(&script))
+    )
 }
 
 /// `bytes` as ` 63 6c …`, for `send-keys -H`.

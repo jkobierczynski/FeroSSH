@@ -491,6 +491,7 @@ fn bindable(id: u32) -> bool {
     let lists = [
         cmd::WINDOW_COLOURS..cmd::FONT,
         cmd::AGENT_START..cmd::AGENT_END,
+        cmd::WSL_OPEN..cmd::WSL_END,
         cmd::WORKTREE_START..cmd::WORKTREE_END,
         cmd::FONT..cmd::COPY,
         cmd::REMOTE_APP_CLIP..cmd::REMOTE_APP_CLIP_LAST + 1,
@@ -510,6 +511,10 @@ mod cmd {
     pub const LOCAL_POWERSHELL: u32 = 119;
     /// Settings > Shell integration for local PowerShell.
     pub const LOCAL_SHELL_HOOK: u32 = 138;
+    /// File > Open WSL > (a distro), in the order listed: the default
+    /// distro first.
+    pub const WSL_OPEN: u32 = 120;
+    pub const WSL_END: u32 = 136;
     pub const EXIT: u32 = 101;
     pub const CONNECT: u32 = 102;
     pub const RECONNECT: u32 = 103;
@@ -809,6 +814,17 @@ enum Typed {
 const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, sftp://host for file transfer only, telnet://host[:port], winrm://[user@]host[:port] (winrms:// for HTTPS), or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
 
 /// What a pane is connected to.
+/// A WSL gateway's process and what it attaches.
+#[derive(Debug)]
+struct WslGateway {
+    /// The distro (`""`: the default one).
+    distro: String,
+    /// tmux's session.
+    session: String,
+    /// `wsl.exe` running tmux; `None` once it ended.
+    child: Option<crate::pipes::PipeChild>,
+}
+
 enum Host {
     /// Asking for a destination; the text typed so far.
     Ask(String),
@@ -820,7 +836,14 @@ enum Host {
         /// The command line it runs (and runs again on Enter), before
         /// FeroSSH's shell integration is added to it.
         command: String,
+        /// The WSL distro it opens (`""`: the default one), for a WSL
+        /// shell (File > Open WSL).
+        wsl: Option<String>,
     },
+    /// tmux in control mode in a WSL distro, on plain pipes: the gateway
+    /// of its tmux panes (see [`crate::wsl`]). Shows only when tmux ended,
+    /// when Enter attaches again.
+    Wsl(Box<WslGateway>),
     Ssh(Box<SshSession>),
     /// A pane of the tmux session that SSH pane `gateway` runs in control
     /// mode; `label` names the host.
@@ -1088,6 +1111,18 @@ struct Pane {
     attention_since: Option<Instant>,
     /// Session > Notify when this pane goes quiet.
     quiet: Option<crate::attention::Watch>,
+    /// The coding agent a local tab was opened for (Session > Coding
+    /// agents from a local shell), by name; tmux panes keep theirs in tmux.
+    local_agent: Option<String>,
+    /// Session > Coding agents > Keep an audit trail turned this pane's
+    /// logging on, and started its recording: both end with the agent's
+    /// connection, while what the user turned on stays.
+    audit_log: bool,
+    audit_cast: bool,
+    /// How the local agent's own command ended (the first command a
+    /// local agent tab finished), and when; later commands in its
+    /// PowerShell do not change it.
+    agent_end: Option<(bool, Instant)>,
     /// Spaces out this pane's Windows notifications.
     throttle: crate::attention::Throttle,
     /// The remote working directory the shell last reported (OSC 7), or
@@ -1215,7 +1250,9 @@ impl Pane {
     fn host_label(&self) -> String {
         match &self.host {
             Host::Ssh(s) => s.target.label(),
+            Host::Local { wsl: Some(d), .. } => crate::wsl::label(d),
             Host::Local { .. } => "local".to_owned(),
+            Host::Wsl(g) => crate::wsl::label(&g.distro),
             Host::Ask(_) => "new tab".to_owned(),
             Host::Tmux { label, .. } | Host::Desktop { label, .. } => label.clone(),
             Host::Serial { target, .. } => target.label(),
@@ -1259,6 +1296,7 @@ impl Pane {
             },
             // tmux panes exist only while the gateway is logged in.
             Host::Tmux { .. } | Host::Serial { port: Some(_), .. } => Health::Connected,
+            Host::Wsl(g) if g.child.is_some() => Health::Connected,
             _ => Health::Idle,
         }
     }
@@ -1533,6 +1571,9 @@ struct Window {
     /// The panes of the notifications asked for and not on screen yet,
     /// oldest first; Windows shows them one after the other.
     toast_queue: VecDeque<PaneId>,
+    /// The WSL distros File > Open WSL listed when it last opened, in its
+    /// order.
+    wsl_distros: Vec<crate::wsl::Distro>,
     /// SSH panes reconnecting after their connection dropped.
     retries: HashMap<PaneId, Retry>,
     /// SSH panes whose next login shares no connection: the server refused
@@ -3104,6 +3145,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 toast_pane: None,
                 agent_states: Vec::new(),
                 toast_queue: VecDeque::new(),
+                wsl_distros: Vec::new(),
                 retries: HashMap::new(),
                 login_alone: HashSet::new(),
                 swapping_login: None,
@@ -3383,6 +3425,10 @@ fn new_pane(
         attention: false,
         attention_since: None,
         quiet: None,
+        local_agent: None,
+        audit_log: false,
+        audit_cast: false,
+        agent_end: None,
         throttle: crate::attention::Throttle::default(),
         cwd: None,
         cwd_host: None,
@@ -3423,6 +3469,17 @@ fn build_menu() -> Result<HMENU> {
         separator(file)?;
         item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
         item(file, cmd::LOCAL_POWERSHELL, "Open local &PowerShell")?;
+        // Filled with the distros each time it opens.
+        let wsl = CreatePopupMenu()?;
+        // Greyed until it opens, so the command palette offers nothing
+        // that does nothing.
+        AppendMenuW(
+            wsl,
+            MF_STRING | MF_GRAYED,
+            cmd::WSL_OPEN as usize,
+            w!("(no WSL distro found)"),
+        )?;
+        AppendMenuW(file, MF_POPUP, wsl.0 as usize, w!("Open &WSL"))?;
         separator(file)?;
         item(file, cmd::UPLOAD, "&Upload files...\tCtrl+Shift+U")?;
         item(file, cmd::DOWNLOADS, "Open do&wnload folder")?;
@@ -4414,6 +4471,12 @@ impl Window {
     fn send_host(&mut self, id: PaneId, bytes: &[u8]) {
         let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
             Some(Host::Ssh(s)) => s.input(bytes),
+            Some(Host::Wsl(g)) => {
+                if let Some(c) = &g.child {
+                    c.write(bytes.to_vec());
+                }
+                return;
+            }
             _ => return,
         };
         self.apply(id, effects);
@@ -4594,6 +4657,7 @@ impl Window {
         };
         let (label, scrollback) = match &g.host {
             Host::Ssh(s) => (s.target.label(), self.scrollback_for(&s.target)),
+            Host::Wsl(w) => (crate::wsl::label(&w.distro), None),
             _ => (String::new(), None),
         };
         let mut font = g.font.clone();
@@ -5081,8 +5145,25 @@ impl Window {
         self.connlog_closing = false;
         self.connlog_up.remove(&id);
         self.connlog_ended.remove(&id);
+        // What the agent's audit trail turned on ends with it.
+        let (audit_log, audit_cast) = self
+            .panes
+            .get_mut(&id)
+            .map(|p| {
+                (
+                    std::mem::take(&mut p.audit_log),
+                    std::mem::take(&mut p.audit_cast),
+                )
+            })
+            .unwrap_or_default();
+        if audit_cast && self.panes.get(&id).is_some_and(|p| p.cast.is_some()) {
+            self.toggle_record(id);
+        }
         self.stop_log(id);
         if let Some(p) = self.panes.get_mut(&id) {
+            if audit_log {
+                p.log.enabled = false;
+            }
             p.host = Host::Ask(String::new());
             // The connection's enforced look goes with it; the next one
             // brings its own.
@@ -5096,6 +5177,8 @@ impl Window {
             p.start_dir = None;
             p.local_cwd = None;
             p.hl_host = None;
+            p.local_agent = None;
+            p.agent_end = None;
         }
         // A host's rules leave with it; the pane's own stop pattern stays.
         self.apply_highlight(id, false);
@@ -5107,7 +5190,8 @@ impl Window {
     /// the local shell.
     fn start_shell(&mut self, id: PaneId) {
         let command = self.local_command(id);
-        self.start_command_in(id, &command, None);
+        let wsl = self.local_wsl(id);
+        self.start_local(id, &command, None, wsl, None);
     }
 
     /// The command local pane `id` runs, or the local shell's.
@@ -5128,13 +5212,37 @@ impl Window {
     /// profile folder. A PowerShell gets FeroSSH's prompt marks while
     /// Settings > Shell integration for local PowerShell is on.
     fn start_command_in(&mut self, id: PaneId, command: &str, dir: Option<&str>) {
+        self.start_local(id, command, dir, None, None);
+    }
+
+    /// The WSL distro local pane `id` opens, if it is a WSL shell.
+    fn local_wsl(&self, id: PaneId) -> Option<String> {
+        match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Local { wsl, .. }) => wsl.clone(),
+            _ => None,
+        }
+    }
+
+    /// [`Self::start_command_in`], for WSL distro `wsl` when it is one,
+    /// running `launched` this time when given (`command` is what Enter
+    /// starts after it exits).
+    fn start_local(
+        &mut self,
+        id: PaneId,
+        command: &str,
+        dir: Option<&str>,
+        wsl: Option<String>,
+        launched: Option<String>,
+    ) {
         self.end_host(id);
         let notify = self.notifier();
-        let launched = if self.settings.local_shell_integration {
-            crate::shell_hook::with_hook(command)
-        } else {
-            command.to_owned()
-        };
+        let launched = launched.unwrap_or_else(|| {
+            if self.settings.local_shell_integration {
+                crate::shell_hook::with_hook(command)
+            } else {
+                command.to_owned()
+            }
+        });
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
@@ -5145,6 +5253,7 @@ impl Window {
                     shell: Some(shell),
                     exited: false,
                     command: command.to_owned(),
+                    wsl,
                 };
                 self.start_log(id);
                 // A workspace's local pane runs its script once its shell
@@ -5161,6 +5270,7 @@ impl Window {
                     shell: None,
                     exited: true,
                     command: command.to_owned(),
+                    wsl,
                 };
                 self.show(id, &text);
             }
@@ -5311,9 +5421,19 @@ impl Window {
                 Host::Desktop { label, .. } => {
                     (live::Kind::Desktop, label.clone(), LiveState::Connected)
                 }
-                Host::Local { exited, .. } => (
+                Host::Wsl(g) => (
                     live::Kind::Local,
-                    "local shell".to_owned(),
+                    format!("{} tmux", crate::wsl::label(&g.distro)),
+                    if g.child.is_some() {
+                        LiveState::Connected
+                    } else {
+                        LiveState::Ended
+                    },
+                ),
+                Host::Local { exited, wsl, .. } => (
+                    live::Kind::Local,
+                    wsl.as_deref()
+                        .map_or_else(|| "local shell".to_owned(), crate::wsl::label),
                     if *exited {
                         LiveState::Ended
                     } else {
@@ -5352,12 +5472,20 @@ impl Window {
                     .map_or(crate::attention::State::Idle, |w| w.state(now));
                 let asked = p.attention_since.filter(|_| p.attention);
                 let (mut what, mut since) = crate::agents::status(asked, state, now);
-                // The shell's marks say when the agent itself ended.
+                // The shell's marks say when the agent itself ended: a
+                // local agent's own command, else the pane's last one.
+                let ended = if p.local_agent.is_some() {
+                    p.agent_end
+                } else {
+                    last.as_ref()
+                        .filter(|c| !c.running)
+                        .map(|c| (c.failed(), c.since))
+                };
                 if asked.is_none()
-                    && let Some(c) = last.as_ref().filter(|c| !c.running)
+                    && let Some((failed, at)) = ended
                 {
-                    what = if c.failed() { "failed" } else { "exited" };
-                    since = Some(now.saturating_duration_since(c.since));
+                    what = if failed { "failed" } else { "exited" };
+                    since = Some(now.saturating_duration_since(at));
                 }
                 live::Agent {
                     name: name.to_owned(),
@@ -10993,6 +11121,15 @@ impl Window {
                 self.track_typing(id, &bytes);
                 self.send(id, bytes);
             }
+            // Shows only while tmux is not attached: Enter attaches again.
+            Host::Wsl(g) => {
+                if enter && g.child.is_none() {
+                    let (distro, session) = (g.distro.clone(), g.session.clone());
+                    if let Err(e) = self.start_wsl_gateway(id, &distro, None, None, &session) {
+                        self.show(id, &format!("\x1b[0;31m{e}\x1b[0m\r\n"));
+                    }
+                }
+            }
             // Typing reaches the desktop before this; the pane only shows
             // messages once it ended. A recording has no host.
             Host::Desktop { .. } | Host::Replay(_) | Host::Diff(_) => {}
@@ -11332,6 +11469,8 @@ impl Window {
                 s.target.port
             ),
             Host::Tmux { gateway, .. } => return self.history_key(*gateway),
+            Host::Local { wsl: Some(d), .. } => format!("wsl:{}", d.to_lowercase()),
+            Host::Wsl(g) => format!("wsl:{}", g.distro.to_lowercase()),
             Host::Local { .. } => "local".to_owned(),
             Host::Serial { target, .. } => format!("serial:{}", target.port),
             Host::Telnet(s) => format!(
@@ -11745,6 +11884,33 @@ impl Window {
                 }
             }
         }
+        // The WSL gateways: tmux in control mode.
+        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        for id in ids {
+            loop {
+                let out = match self.panes.get(&id).map(|p| &p.host) {
+                    Some(Host::Wsl(g)) => match &g.child {
+                        Some(c) => c.try_read(),
+                        None => None,
+                    },
+                    _ => None,
+                };
+                let Some(out) = out else {
+                    break;
+                };
+                match out {
+                    crate::pipes::Output::Data(data) => {
+                        fed += data.len();
+                        self.host_output(id, &data);
+                    }
+                    crate::pipes::Output::Exited(code) => self.wsl_gateway_ended(id, code),
+                }
+                if fed >= OUTPUT_BUDGET {
+                    more = true;
+                    break;
+                }
+            }
+        }
         // The serial consoles.
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {
@@ -11824,10 +11990,13 @@ impl Window {
             self.apply(id, effects);
         }
         // The workers, a message from each in turn so that a flooding
-        // host does not hold up the others.
+        // host does not hold up the others. Each gets one even when the
+        // local shells and WSL gateways used up the budget, so they
+        // cannot hold up SSH sessions and transfers either.
         let mut transfers = false;
         let connections: Vec<ChannelId> = self.workers.keys().copied().collect();
-        while !more {
+        let mut first = true;
+        while first || !more {
             let mut idle = true;
             for &connection in &connections {
                 let Some(event) = self
@@ -11840,10 +12009,11 @@ impl Window {
                 idle = false;
                 transfers |= self.on_worker_event(connection, event, &mut fed);
                 more = fed >= OUTPUT_BUDGET;
-                if more {
+                if more && !first {
                     break;
                 }
             }
+            first = false;
             if idle {
                 break;
             }
@@ -12210,6 +12380,12 @@ impl Window {
                     Action::CommandFinished(end) => {
                         // The Session manager tells failed commands.
                         chrome = true;
+                        if let Some(p) = self.panes.get_mut(&id)
+                            && p.local_agent.is_some()
+                            && p.agent_end.is_none()
+                        {
+                            p.agent_end = Some((end.exit.is_some_and(|c| c != 0), Instant::now()));
+                        }
                         if self.settings.notify_commands && end.took >= LONG_COMMAND {
                             let (what, body) = finished_note(&end);
                             chrome |= self.alert(id, Some(what), body);
@@ -12635,6 +12811,34 @@ impl Window {
         self.refresh(id);
     }
 
+    /// File > Open WSL: the distros WSL has, the default first.
+    fn fill_wsl(&mut self, menu: HMENU) {
+        self.wsl_distros = crate::wsl::distros();
+        // SAFETY: our popup menu; it is being opened, when changing it is
+        // allowed. Every item is replaced.
+        unsafe {
+            while GetMenuItemCount(Some(menu)) > 0 {
+                let _ = DeleteMenu(menu, 0, MF_BYPOSITION);
+            }
+            if self.wsl_distros.is_empty() {
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING | MF_GRAYED,
+                    cmd::WSL_OPEN as usize,
+                    w!("(no WSL distro found)"),
+                );
+            }
+            for (id, d) in (cmd::WSL_OPEN..cmd::WSL_END).zip(&self.wsl_distros) {
+                let label = if d.default {
+                    format!("{} (default)", d.name)
+                } else {
+                    d.name.clone()
+                };
+                let _ = AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(label));
+            }
+        }
+    }
+
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
@@ -12645,8 +12849,15 @@ impl Window {
                 let _ = DeleteMenu(menu, 9, MF_BYPOSITION);
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            // From a Windows shell on this PC the agent gets a tab of its
+            // own; everywhere else a tmux window.
+            let local = matches!(
+                self.panes.get(&self.focused_id()).map(|p| &p.host),
+                Some(Host::Local { wsl: None, .. })
+            );
+            let place = if local { "in a new tab" } else { "in tmux" };
             for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
-                let label = format!("Start {} in tmux", c.replace('&', "&&"));
+                let label = format!("Start {} {place}", c.replace('&', "&&"));
                 let _ = AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(label));
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -12691,11 +12902,18 @@ impl Window {
     /// Why a coding agent cannot start from pane `id`, if it cannot: what
     /// to tell the user.
     fn agent_refused(&self, id: PaneId) -> Option<Command> {
-        const HOW: &str = "A coding agent starts in tmux on a server: use it from a pane \
-            that is logged in to one over SSH.";
+        const HOW: &str = "A coding agent starts in tmux on a server or in WSL, or in a tab \
+            of its own on this PC: use it from a pane logged in to a server over SSH, a WSL \
+            pane (File > Open WSL) or a local shell.";
         if let Some(g) = self.panes.get(&id).and_then(Pane::gateway) {
             return (!self.tmux.get(&g).is_some_and(tmux::Tmux::active))
                 .then(|| Command::Notice(HOW.into()));
+        }
+        // On this PC: a WSL shell or gateway, or a Windows shell.
+        match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Local { exited: false, .. }) => return None,
+            Some(Host::Wsl(g)) if g.child.is_some() => return None,
+            _ => {}
         }
         let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
             return Some(Command::Notice(HOW.into()));
@@ -12742,6 +12960,21 @@ impl Window {
                 .map(|t| t.start_agent(id, command, None, worktree))?;
             self.run_tmux(g, actions);
             return None;
+        }
+        // On this PC: in tmux in WSL, or in a tab of its own.
+        match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Local { wsl: Some(d), .. }) => {
+                let d = d.clone();
+                return self.start_wsl_agent(id, &d, command, worktree);
+            }
+            Some(Host::Wsl(g)) => {
+                let d = g.distro.clone();
+                return self.start_wsl_agent(id, &d, command, worktree);
+            }
+            Some(Host::Local { wsl: None, .. }) => {
+                return self.start_local_agent(id, command, worktree.map(|w| w.path.as_str()));
+            }
+            _ => {}
         }
         // tmux already shows on this host (only one pane per host may),
         // reached the same way: the agent joins that session.
@@ -13163,6 +13396,215 @@ impl Window {
         self.tmux.get(&g)?.worktree_of(id)
     }
 
+    /// Starts coding agent `command` from local pane `id`, on this PC in a
+    /// tab of its own: PowerShell (with FeroSSH's shell integration while
+    /// it is on), in the local shell's folder, runs the command, and stays
+    /// when the agent exits. The tab is watched as an agent pane. Without
+    /// tmux on Windows, the agent ends when its tab closes or FeroSSH
+    /// exits.
+    fn start_local_agent(
+        &mut self,
+        id: PaneId,
+        command: &str,
+        folder: Option<&str>,
+    ) -> Option<Command> {
+        let dir = folder.map(str::to_owned).or_else(|| {
+            self.panes.get(&id).and_then(|p| match p.host {
+                Host::Local {
+                    exited: false,
+                    wsl: None,
+                    ..
+                } => p.local_cwd.clone(),
+                _ => None,
+            })
+        });
+        let pwsh = crate::program::find("pwsh.exe", &crate::program::search_dirs()).is_some();
+        let shell = crate::shell_hook::powershell_command(pwsh);
+        let launched = crate::shell_hook::agent_command(
+            &shell,
+            command,
+            self.settings.local_shell_integration,
+        );
+        let tab = self.new_tab_pane();
+        self.focus_terminal();
+        self.start_local(tab, &shell, dir.as_deref(), None, Some(launched));
+        let name = crate::tmux::agent_name(command);
+        let p = self.panes.get_mut(&tab)?;
+        if !matches!(p.host, Host::Local { shell: Some(_), .. }) {
+            // It did not start; the pane says why.
+            return None;
+        }
+        p.local_agent = Some(name.clone());
+        p.name = live::clean_name(&name);
+        if p.quiet.is_none() {
+            p.quiet = Some(crate::attention::Watch::new());
+            self.update_quiet_timer();
+        }
+        if self.settings.agent_audit {
+            self.audit_agent(tab);
+        }
+        self.update_title();
+        self.refresh_chrome();
+        None
+    }
+
+    /// File > Open WSL > `distro`: its shell in a new tab.
+    fn open_wsl(&mut self, pane: PaneId, distro: &str) {
+        let command = crate::wsl::shell_command(distro);
+        self.local_command_in_new_tab(pane, &command, Some(distro.to_owned()));
+    }
+
+    /// Makes pane `id` a WSL gateway: tmux session `session` of `distro`
+    /// in control mode, on pipes, after running script `before` in Linux
+    /// folder `dir` (see [`crate::wsl`]). The tmux watcher shows its
+    /// windows once control mode starts.
+    fn start_wsl_gateway(
+        &mut self,
+        id: PaneId,
+        distro: &str,
+        dir: Option<&str>,
+        before: Option<&str>,
+        session: &str,
+    ) -> std::result::Result<(), String> {
+        let wsl = crate::program::locate("wsl.exe")
+            .map_err(|e| format!("WSL is not installed on this PC: {e}"))?;
+        let args = crate::wsl::gateway_args(distro, dir, before, session);
+        let was_gateway = matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Wsl(_)));
+        self.end_host(id);
+        let notify = self.notifier();
+        let child = match crate::pipes::PipeChild::spawn(&wsl, &args, notify) {
+            Ok(c) => c,
+            Err(e) => {
+                // An ended gateway stays one, so Enter tries it again.
+                if was_gateway && let Some(p) = self.panes.get_mut(&id) {
+                    p.host = Host::Wsl(Box::new(WslGateway {
+                        distro: distro.to_owned(),
+                        session: session.to_owned(),
+                        child: None,
+                    }));
+                }
+                return Err(format!("Could not start wsl.exe: {e}"));
+            }
+        };
+        let label = crate::wsl::label(distro);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.host = Host::Wsl(Box::new(WslGateway {
+                distro: distro.to_owned(),
+                session: session.to_owned(),
+                child: Some(child),
+            }));
+        }
+        self.show(
+            id,
+            &format!("\x1b[0;90mStarting tmux in {label}...\x1b[0m\r\n"),
+        );
+        self.update_title();
+        self.refresh_chrome();
+        Ok(())
+    }
+
+    /// WSL gateway `id`'s `wsl.exe` ended: its tmux panes go, and it shows
+    /// again, waiting for Enter.
+    fn wsl_gateway_ended(&mut self, id: PaneId, code: Option<i32>) {
+        if let Some(mut t) = self.tmux.remove(&id) {
+            let actions = t.connection_lost(&mut self.ws);
+            self.run_tmux(id, actions);
+        }
+        let Some(Host::Wsl(g)) = self.panes.get_mut(&id).map(|p| &mut p.host) else {
+            return;
+        };
+        g.child = None;
+        let label = crate::wsl::label(&g.distro);
+        let code = code
+            .filter(|c| *c != 0)
+            .map_or(String::new(), |c| format!(" (exit code {c})"));
+        self.show(
+            id,
+            &format!(
+                "\r\n\x1b[0;90m[tmux in {label} ended{code}. Press Enter to attach again.]\x1b[0m\r\n"
+            ),
+        );
+        self.after_structure_change();
+        self.refresh_chrome();
+    }
+
+    /// Starts coding agent `command` from WSL shell `id` of `distro`, in
+    /// tmux in that distro: in a new window of the tmux session a gateway
+    /// already shows for it, or else in session `agents` through a new
+    /// gateway in a new tab. In the shell's folder when it reported one.
+    fn start_wsl_agent(
+        &mut self,
+        id: PaneId,
+        distro: &str,
+        command: &str,
+        worktree: Option<&crate::worktree::Worktree>,
+    ) -> Option<Command> {
+        let cwd = self
+            .panes
+            .get(&id)
+            .and_then(|p| p.cwd.as_deref())
+            .and_then(|d| std::str::from_utf8(d).ok())
+            .map(str::to_owned);
+        let dir = cwd.clone().filter(|d| d.starts_with('/'));
+        // A folder the prompt showed as `~/...`, before anything said where
+        // home is.
+        let in_home = cwd.filter(|d| !d.starts_with('/') && d != "." && !d.is_empty());
+        let shown = self
+            .tmux
+            .iter()
+            .find(|(g, t)| {
+                t.active()
+                    && matches!(
+                        self.panes.get(g).map(|p| &p.host),
+                        Some(Host::Wsl(w)) if w.distro == distro && w.child.is_some()
+                    )
+            })
+            .map(|(g, _)| *g);
+        if let Some(g) = shown {
+            let next_to = self.tmux.get(&g).and_then(|t| t.natives().first().copied());
+            let actions = match (self.tmux.get_mut(&g), next_to) {
+                (Some(t), Some(n)) => t.start_agent(n, command, dir.as_deref(), worktree),
+                _ => {
+                    return Some(Command::Notice(
+                        "tmux in WSL is still starting; try again in a moment.".into(),
+                    ));
+                }
+            };
+            self.run_tmux(g, actions);
+            return None;
+        }
+        // A gateway that has not started tmux yet would run the start
+        // script a second time in the same session.
+        let starting = self.panes.iter().any(|(g, p)| {
+            matches!(&p.host, Host::Wsl(w) if w.distro == distro && w.child.is_some())
+                && !self.tmux.get(g).is_some_and(|t| t.active())
+        });
+        if starting {
+            return Some(Command::Notice(
+                "tmux in WSL is still starting; try again in a moment.".into(),
+            ));
+        }
+        let mut script = crate::agents::start_script(command, worktree);
+        if worktree.is_none()
+            && dir.is_none()
+            && let Some(rel) = &in_home
+        {
+            script = crate::wsl::in_home_folder(rel, &script);
+        }
+        let tab = self.new_tab_pane();
+        self.focus_terminal();
+        if let Err(e) = self.start_wsl_gateway(
+            tab,
+            distro,
+            dir.as_deref(),
+            Some(&script),
+            crate::agents::SESSION,
+        ) {
+            self.show(tab, &format!("\x1b[0;31m{e}\x1b[0m\r\n"));
+        }
+        None
+    }
+
     /// A tmux pane just appeared: if its window runs a coding agent, its
     /// output is watched, for its state in the Session manager and, with
     /// notifications on, to say when it goes quiet.
@@ -13195,6 +13637,9 @@ impl Window {
             return;
         };
         let record = p.cast.is_none();
+        if !p.log.enabled {
+            p.audit_log = true;
+        }
         p.log.enabled = true;
         // An ordinary log opened before the pane was known to run an agent
         // ends, and the agent's own log follows it.
@@ -13204,6 +13649,9 @@ impl Window {
         self.start_log_as(id, Some(&agent));
         if record {
             let text = self.start_recording(id, Some(&agent));
+            if let Some(p) = self.panes.get_mut(&id) {
+                p.audit_cast = p.cast.is_some();
+            }
             self.show(id, &text);
         }
         self.update_menu_checks();
@@ -13304,7 +13752,11 @@ impl Window {
 
     /// The coding agent pane `id` runs, by name, if it runs one.
     fn agent_of(&self, id: PaneId) -> Option<&str> {
-        let g = self.panes.get(&id).and_then(Pane::gateway)?;
+        let p = self.panes.get(&id)?;
+        if let Some(name) = &p.local_agent {
+            return Some(name);
+        }
+        let g = p.gateway()?;
         self.tmux.get(&g)?.agent_of(id)
     }
 
@@ -14864,14 +15316,43 @@ impl Window {
         if !self.settings.tmux_keys {
             return None;
         }
-        let gateway = self.panes.get(&id).and_then(Pane::gateway)?;
-        let t = self.tmux.get(&gateway).filter(|t| t.active())?;
-        // Until tmux answers, its default.
+        let p = self.panes.get(&id)?;
+        if let Some(t) = p
+            .gateway()
+            .and_then(|g| self.tmux.get(&g))
+            .filter(|t| t.active())
+        {
+            // Until tmux answers, its default.
+            return Some(
+                t.keys()
+                    .and_then(tmux_keys::Keys::parse)
+                    .unwrap_or_default(),
+            );
+        }
+        // A shell on this PC (cmd, PowerShell, WSL) or a WSL gateway
+        // waiting for Enter: the same keys work its tabs and panes, with
+        // the prefix of an open tmux session, else tmux's default. Not a
+        // plain SSH pane, which may run tmux of its own.
+        if !matches!(p.host, Host::Local { .. } | Host::Wsl(_)) {
+            return None;
+        }
         Some(
-            t.keys()
-                .and_then(tmux_keys::Keys::parse)
+            self.tmux
+                .values()
+                .filter(|t| t.active())
+                .find_map(|t| t.keys().and_then(tmux_keys::Keys::parse))
                 .unwrap_or_default(),
         )
+    }
+
+    /// Whether pane `id` is a pane of an open tmux session (not a local
+    /// shell using the tmux keybindings).
+    fn in_tmux(&self, id: PaneId) -> bool {
+        self.panes
+            .get(&id)
+            .and_then(Pane::gateway)
+            .and_then(|g| self.tmux.get(&g))
+            .is_some_and(Tmux::active)
     }
 
     /// A character typed in pane `id`, for the tmux keybindings: the
@@ -14963,10 +15444,26 @@ impl Window {
                     self.shared_close(&panes).unwrap_or(shared),
                 ))
             }
+            TmuxKey::ClosePane if !self.in_tmux(id) => Some(Command::Confirm {
+                text: "Close this pane? The program in it ends.".into(),
+                then: Box::new(Command::Id(cmd::CLOSE_PANE)),
+            }),
             TmuxKey::ClosePane => Some(Command::Confirm {
                 text: "Close this tmux pane? tmux ends the program in it (kill-pane).".into(),
                 then: Box::new(Command::Id(cmd::CLOSE_PANE)),
             }),
+            TmuxKey::CloseTab if !self.in_tmux(id) => {
+                let n = self.ws.tab().map_or(0, |t| t.root.panes().len());
+                let panes = if n == 1 {
+                    "its pane".to_owned()
+                } else {
+                    format!("its {n} panes")
+                };
+                Some(Command::Confirm {
+                    text: format!("Close this tab and {panes}? The programs in them end."),
+                    then: Box::new(Command::CloseTabNow(self.ws.active)),
+                })
+            }
             TmuxKey::CloseTab => {
                 let n = self.ws.tab().map_or(0, |t| t.root.panes().len());
                 let panes = if n == 1 {
@@ -14983,6 +15480,8 @@ impl Window {
                 })
             }
             TmuxKey::BreakPane => run(cmd::PANE_TO_TAB),
+            // Outside tmux there is no session to leave or pick.
+            TmuxKey::Detach | TmuxKey::ChooseSession if !self.in_tmux(id) => None,
             TmuxKey::Detach => run(cmd::TMUX_DETACH),
             TmuxKey::ChooseSession => run(cmd::TMUX_PICK),
             TmuxKey::ScrollBack => run(cmd::SCROLL_PAGE_UP),
@@ -18606,7 +19105,11 @@ impl Window {
             return Some(spec);
         }
         let (open, dir, host) = match &from.host {
-            Host::Ask(_) => (WsOpen::Prompt, None, None),
+            // A workspace opens Windows shells only: a WSL pane comes back
+            // as a prompt.
+            Host::Ask(_) | Host::Wsl(_) | Host::Local { wsl: Some(_), .. } => {
+                (WsOpen::Prompt, None, None)
+            }
             Host::Local { .. } => (WsOpen::Local, from.local_cwd.clone(), None),
             Host::Ssh(s) => {
                 let t = &s.target;
@@ -19529,27 +20032,35 @@ impl Window {
     /// running SSH, Telnet, serial or tmux session is never ended.
     fn local_shell_in_new_tab(&mut self, pane: PaneId) {
         let command = self.command.clone();
-        self.local_command_in_new_tab(pane, &command);
+        self.local_command_in_new_tab(pane, &command, None);
     }
 
-    /// [`Self::local_shell_in_new_tab`] for `command`.
-    fn local_command_in_new_tab(&mut self, pane: PaneId, command: &str) {
+    /// [`Self::local_shell_in_new_tab`] for `command`, a shell of WSL
+    /// distro `wsl` when it is one.
+    fn local_command_in_new_tab(&mut self, pane: PaneId, command: &str, wsl: Option<String>) {
         let idle = match self.panes.get(&pane).map(|p| &p.host) {
             Some(Host::Ask(t)) => t.is_empty(),
             Some(Host::Local { exited, .. }) => *exited,
             _ => false,
         };
-        // From a live local shell, in its folder.
+        // From a live local shell, in its folder (a Windows one: not from
+        // or for a WSL shell).
         let dir = self.panes.get(&pane).and_then(|p| match p.host {
-            Host::Local { exited: false, .. } => p.local_cwd.clone(),
+            Host::Local {
+                exited: false,
+                wsl: None,
+                ..
+            } if wsl.is_none() => p.local_cwd.clone(),
             _ => None,
         });
         let id = if idle { pane } else { self.new_tab_pane() };
-        // A workspace pane waiting for its SSH login is a local shell now.
-        if self
-            .workspace_extra
-            .get(&id)
-            .is_some_and(|e| e.dest.is_some())
+        // A workspace pane waiting for its SSH login is a local shell now;
+        // a Windows shell's startup commands are not for a WSL one.
+        if wsl.is_some()
+            || self
+                .workspace_extra
+                .get(&id)
+                .is_some_and(|e| e.dest.is_some())
             || self.workspace_waiting.destination(id).is_some()
         {
             self.workspace_extra.remove(&id);
@@ -19557,7 +20068,7 @@ impl Window {
             self.workspace_tmux.remove(&id);
         }
         self.focus_terminal();
-        self.start_command_in(id, command, dir.as_deref());
+        self.start_local(id, command, dir.as_deref(), wsl, None);
     }
 
     /// Gives the keyboard back to the focused pane. Unless Settings >
@@ -19727,7 +20238,7 @@ impl Window {
             Ssh(Box<Target>),
             Telnet(TelnetTarget),
             Winrm(WinrmTarget),
-            Local(String),
+            Local(String, Option<String>),
             Ask,
         }
         let from = self.host_pane(from);
@@ -19741,7 +20252,7 @@ impl Window {
             Some(Host::Ssh(s)) => Like::Ssh(Box::new(s.target.clone())),
             Some(Host::Telnet(s)) => Like::Telnet(s.target.clone()),
             Some(Host::Winrm(s)) => Like::Winrm(s.target.clone()),
-            Some(Host::Local { command, .. }) => Like::Local(command.clone()),
+            Some(Host::Local { command, wsl, .. }) => Like::Local(command.clone(), wsl.clone()),
             _ => Like::Ask,
         };
         match like {
@@ -19758,7 +20269,14 @@ impl Window {
             }
             Like::Telnet(target) => self.connect_telnet(id, target),
             Like::Winrm(target) => self.connect_winrm(id, target),
-            Like::Local(command) => self.start_command_in(id, &command, local_cwd.as_deref()),
+            // A WSL shell's folder is a Linux one, which Windows cannot
+            // start a process in: its split starts in the home folder.
+            Like::Local(command, Some(wsl)) => {
+                self.start_local(id, &command, None, Some(wsl), None);
+            }
+            Like::Local(command, None) => {
+                self.start_command_in(id, &command, local_cwd.as_deref());
+            }
             Like::Ask => self.ask_destination(id),
         }
     }
@@ -21008,7 +21526,7 @@ impl Window {
             cmd::LOCAL_POWERSHELL => {
                 let pwsh = crate::program::find("pwsh.exe", &crate::program::search_dirs());
                 let command = crate::shell_hook::powershell_command(pwsh.is_some());
-                self.local_command_in_new_tab(pane, &command);
+                self.local_command_in_new_tab(pane, &command, None);
             }
             cmd::CONNECT => self.connect_in_new_tab(pane),
             cmd::RECONNECT => {
@@ -21339,6 +21857,11 @@ impl Window {
                 self.live_view.set_query(crate::live::AGENTS_ONLY);
                 self.refresh_chrome();
             }
+            id if (cmd::WSL_OPEN..cmd::WSL_END).contains(&id) => {
+                let i = (id - cmd::WSL_OPEN) as usize;
+                let distro = self.wsl_distros.get(i)?.name.clone();
+                self.open_wsl(pane, &distro);
+            }
             id if (cmd::AGENT_START..cmd::AGENT_END).contains(&id) => {
                 let i = (id - cmd::AGENT_START) as usize;
                 let command = crate::agents::commands(&self.settings.agent_commands)
@@ -21479,6 +22002,8 @@ impl Window {
                     return None;
                 }
                 p.log.enabled = !p.log.enabled;
+                // The user's choice now, not the agent audit trail's.
+                p.audit_log = false;
                 // A choice made while no session is live is the user's
                 // own: no rule's saved setting may undo it later.
                 if !live {
@@ -21525,7 +22050,13 @@ impl Window {
             }
             cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
             cmd::LOG_VERIFY => return Some(Command::VerifyLog),
-            cmd::RECORD_CAST => self.toggle_record(pane),
+            cmd::RECORD_CAST => {
+                // The user's choice now, not the agent audit trail's.
+                if let Some(p) = self.panes.get_mut(&pane) {
+                    p.audit_cast = false;
+                }
+                self.toggle_record(pane);
+            }
             cmd::PLAY_CAST => return Some(Command::PlayCast),
             cmd::SERIAL_BREAK => {
                 let pane = self.focused_id();
@@ -23295,10 +23826,23 @@ impl Window {
         let Some(p) = self.panes.get_mut(&id) else {
             return false;
         };
-        if !matches!(p.host, Host::Ssh(_) | Host::Tmux { .. }) {
+        // A WSL shell's folder is known too: its coding agents start there.
+        if !matches!(
+            p.host,
+            Host::Ssh(_) | Host::Tmux { .. } | Host::Local { wsl: Some(_), .. }
+        ) {
             return false;
         }
         let host = dir.host.to_ascii_lowercase();
+        // A WSL shell whose prompt already named its host: a first report
+        // from another host is a nested ssh, not the shell.
+        if p.cwd_host.is_none()
+            && matches!(p.host, Host::Local { wsl: Some(_), .. })
+            && let Some(own) = &p.prompt_host
+            && !same_host_name(own, &host)
+        {
+            return false;
+        }
         let first = p.cwd_host.get_or_insert_with(|| host.clone());
         if *first != host {
             // A nested ssh on another host: its paths are not ours.
@@ -23327,7 +23871,12 @@ impl Window {
         let Some(p) = self.panes.get(&id) else {
             return false;
         };
-        if p.cwd_reported || !matches!(p.host, Host::Ssh(_) | Host::Tmux { .. }) {
+        if p.cwd_reported
+            || !matches!(
+                p.host,
+                Host::Ssh(_) | Host::Tmux { .. } | Host::Local { wsl: Some(_), .. }
+            )
+        {
             return false;
         }
         let Some(dir) = p.term.prompt_line().as_deref().and_then(prompt_dir) else {
@@ -24867,6 +25416,14 @@ const SHELL_MARKS_HOW: &str = "Previous command, Next command and selecting a co
 const LONG_COMMAND: Duration = Duration::from_secs(10);
 
 /// The heading and text of a long command's notification.
+/// Whether host names `a` and `b` (lower case) name one host: the same,
+/// or one is the other's first label (a prompt shows `\h`, a report may
+/// give the full name).
+fn same_host_name(a: &str, b: &str) -> bool {
+    let first = |h: &str| h.split('.').next().unwrap_or(h).to_owned();
+    a == b || (first(a) == first(b) && (!a.contains('.') || !b.contains('.')))
+}
+
 fn finished_note(end: &ferossh_term::CommandEnd) -> (String, String) {
     let what = match end.exit {
         Some(c) if c != 0 => format!("Command failed (exit {c})"),
@@ -30616,6 +31173,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                     cmd::AGENTS_SHOW => {
                         with_window(|w| w.fill_agents(popup));
+                    }
+                    id if (cmd::WSL_OPEN..cmd::WSL_END).contains(&id) => {
+                        with_window(|w| w.fill_wsl(popup));
                     }
                     _ => {}
                 }
