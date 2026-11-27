@@ -1789,7 +1789,7 @@ struct Window {
     /// a pane's connection (by the pane with the session: a tmux pane's
     /// gateway), with the connection it was for; the profile's
     /// `SendAllKeys` otherwise, and once the pane opens another one.
-    all_keys: HashMap<PaneId, (Option<String>, bool)>,
+    all_keys: HashMap<PaneId, (String, bool)>,
     /// What a workspace gave its panes besides their place: what they run
     /// once logged in, and that their logins may keep passwords.
     workspace_extra: HashMap<PaneId, WorkspaceExtra>,
@@ -4440,24 +4440,51 @@ impl Window {
     /// `SendAllKeys yes` in the connection's profile).
     fn sends_all_keys(&self, id: PaneId) -> bool {
         let host = self.host_pane(id);
-        let alias = self.all_keys_alias(host);
+        let (identity, profile) = self.all_keys_identity(host);
         if let Some((was, on)) = self.all_keys.get(&host)
-            && *was == alias
+            && *was == identity
         {
             return *on;
         }
-        alias
+        profile
             .and_then(|a| self.settings.profile(&a))
             .is_some_and(|p| p.send_all_keys)
     }
 
-    /// The connection pane `host` shows, for [`Self::sends_all_keys`].
-    fn all_keys_alias(&self, host: PaneId) -> Option<String> {
+    /// What pane `host` shows, for [`Self::sends_all_keys`]: its kind and
+    /// connection (a toggle by hand holds only while that stays, across
+    /// reconnects), and the profile it reads `SendAllKeys` from.
+    fn all_keys_identity(&self, host: PaneId) -> (String, Option<String>) {
         match self.panes.get(&host).map(|p| &p.host) {
-            Some(Host::Ssh(s)) => Some(s.target.alias.clone()),
-            Some(Host::Telnet(s)) => Some(s.target.alias.clone()),
-            Some(Host::Serial { session, .. }) => session.clone(),
-            _ => None,
+            Some(Host::Ssh(s)) => (
+                format!("ssh {}", s.target.alias),
+                Some(s.target.alias.clone()),
+            ),
+            Some(Host::Telnet(s)) => (
+                format!("telnet {}", s.target.alias),
+                Some(s.target.alias.clone()),
+            ),
+            Some(Host::Winrm(s)) => (
+                format!("winrm {}", s.target.alias),
+                Some(s.target.alias.clone()),
+            ),
+            Some(Host::Serial {
+                session, target, ..
+            }) => (
+                format!(
+                    "serial {} {}",
+                    target.port,
+                    session.as_deref().unwrap_or_default()
+                ),
+                session.clone(),
+            ),
+            Some(Host::Local { command, wsl, .. }) => (
+                format!("local {command} {}", wsl.as_deref().unwrap_or("-")),
+                None,
+            ),
+            Some(Host::Ask(_)) => ("ask".to_owned(), None),
+            Some(_) => (format!("other {}", host), None),
+            None => (String::new(), None),
         }
     }
 
@@ -22947,8 +22974,8 @@ impl Window {
                 // owns it. The menu's tick shows it.
                 let host = self.host_pane(pane);
                 let on = !self.sends_all_keys(pane);
-                let alias = self.all_keys_alias(host);
-                self.all_keys.insert(host, (alias, on));
+                let (identity, _) = self.all_keys_identity(host);
+                self.all_keys.insert(host, (identity, on));
                 // A tmux prefix pressed before does not carry over.
                 self.tmux_armed = None;
                 self.tmux_repeat = None;
