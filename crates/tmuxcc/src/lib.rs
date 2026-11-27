@@ -31,6 +31,10 @@ pub const MIN_VERSION: Version = Version { major: 3, minor: 0 };
 /// (`refresh-client -C @1:80x24`), which FeroSSH layout needs.
 pub const WINDOW_SIZES_VERSION: Version = Version { major: 3, minor: 3 };
 
+/// The first tmux with control-mode flow control
+/// (`refresh-client -f pause-after=N`, `%pause`, `%extended-output`).
+pub const PAUSE_VERSION: Version = Version { major: 3, minor: 2 };
+
 /// A tmux release, as `#{version}` gives it ("3.4", "3.3a", "next-3.5").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {

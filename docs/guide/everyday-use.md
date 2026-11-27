@@ -659,6 +659,8 @@ Session > tmux > Attach tmux types `tmux -CC new-session -A -s main` at the pane
 
 Session > tmux > Detach tmux, closing FeroSSH or losing the network leaves everything running on the server. Closing a tab or pane of a tmux session closes that window or pane in tmux too, unless another client is attached to the same session (another FeroSSH connection, another PC or a terminal) and shows the same panes: then FeroSSH asks first. Yes (the default) detaches and closes this connection, so the other clients keep everything; No closes the panes in tmux for everyone; Cancel keeps them. Attach again, from this PC or another, and the tabs, splits, fonts and themes come back; after a dropped connection it reattaches by itself. Session > tmux > Switch tmux session lists the other sessions on the server (also offered right after attaching).
 
+On tmux 3.2 or later FeroSSH turns on tmux's flow control: when a pane prints faster than the link can carry (a big `cat` over a slow line) and falls more than 10 seconds behind, tmux skips what is waiting and FeroSSH draws the pane's screen as it is now, so the pane stays responsive and Ctrl+C shows at once. The lines skipped are not in FeroSSH's scrollback; tmux's own history still has them.
+
 tmux makes a window only as big as the smallest client attached to it. If another client (another PC, or one left behind by a dropped connection) keeps a window smaller than the pane, part of the pane stays empty; FeroSSH notices and offers to detach the other clients, and Session > tmux > Detach other clients does the same later.
 
 There are two layouts, kept per session:

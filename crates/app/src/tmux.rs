@@ -24,8 +24,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use ferossh_tmuxcc::layout::{self as tl, Cell, Kind, Shape};
 use ferossh_tmuxcc::saved::{self, Look, Saved};
 use ferossh_tmuxcc::{
-    Client, Event, MIN_VERSION, Notification, PaneId, SessionId, Version, WINDOW_SIZES_VERSION,
-    WindowId, command,
+    Client, Event, MIN_VERSION, Notification, PAUSE_VERSION, PaneId, SessionId, Version,
+    WINDOW_SIZES_VERSION, WindowId, command,
 };
 
 use crate::layout::{Axis, Dir, Node, PaneId as Native, Workspace};
@@ -35,6 +35,12 @@ use crate::worktree::Worktree;
 
 /// Output kept for a pane until its screen is restored.
 const MAX_BUFFER: usize = 4 << 20;
+/// How far (seconds) a pane's output may fall behind before tmux pauses
+/// it (`pause-after`): tmux then drops what is waiting instead of piling
+/// it up for a slow link, and FeroSSH asks for the pane's screen again.
+/// Without it, tmux queues everything and drops the whole client once
+/// it is minutes behind.
+const PAUSE_AFTER: u32 = 10;
 /// Panes whose output is kept before they are known.
 const MAX_ORPHANS: usize = 64;
 /// Windows FeroSSH shows; more are left to tmux.
@@ -195,6 +201,8 @@ enum Tag {
     Discover(WindowId),
     Capture(PaneId),
     CaptureAlternate(PaneId),
+    /// A paused pane's state, to draw its screen again after `%pause`.
+    Resync(PaneId),
     NewWindow(Placement),
     /// The window and pane a coding agent was started in.
     AgentWindow(Placement, u32),
@@ -1147,11 +1155,20 @@ impl Tmux {
                 self.on_layout_change(ws, window, &layout, out);
             }
             Notification::Pause { pane } => {
+                // tmux dropped the output it held back: carry on, and draw
+                // the pane's screen as it is now.
                 self.send(
                     &format!("refresh-client -A '%{pane}:continue'"),
                     Tag::Ignore,
                     out,
                 );
+                if self.panes.get(&pane).is_some_and(|p| p.restoring.is_none()) {
+                    self.send(
+                        &format!("list-panes -t %{pane} -F {}", command::quote(PANE_FORMAT)),
+                        Tag::Resync(pane),
+                        out,
+                    );
+                }
             }
             Notification::Exit { reason } if !reason.is_empty() => {
                 out.push(Action::Notice(format!("tmux: {reason}")));
@@ -1378,6 +1395,15 @@ impl Tmux {
                 let mut words = reply.split_whitespace();
                 let version = words.next().unwrap_or_default();
                 self.version = ok.then(|| Version::parse(version)).flatten();
+                // Flow control, for every client but one that only watches
+                // (it may not be let to continue a pane tmux paused).
+                if self.version.is_some_and(|v| v >= PAUSE_VERSION) && self.joined != Some(false) {
+                    self.send(
+                        &format!("refresh-client -f pause-after={PAUSE_AFTER}"),
+                        Tag::Ignore,
+                        out,
+                    );
+                }
                 // Releases are numbers ("3.4", "3.3a").
                 self.dev_build = !version.starts_with(|c: char| c.is_ascii_digit());
                 // The session's clients by name, suspended ones too (which
@@ -1520,6 +1546,36 @@ impl Tmux {
                 }) = self.panes.get_mut(&p)
                 {
                     r.normal = if ok { lines } else { Vec::new() };
+                }
+            }
+            Tag::Resync(p) => {
+                let state = lines
+                    .iter()
+                    .filter_map(|l| parse_pane_line(l))
+                    .find(|l| l.pane == p)
+                    .map(|l| l.state);
+                if ok
+                    && let Some(state) = state
+                    && let Some(pane) = self.panes.get_mut(&p)
+                    && pane.restoring.is_none()
+                {
+                    pane.restoring = Some(Restoring {
+                        buffer: Vec::new(),
+                        state,
+                        normal: Vec::new(),
+                    });
+                    // The screen only: the history before the pause is
+                    // still in the native scrollback.
+                    self.send(
+                        &format!("capture-pane -p -e -q -t %{p}"),
+                        Tag::Capture(p),
+                        out,
+                    );
+                    self.send(
+                        &format!("capture-pane -p -e -q -a -t %{p}"),
+                        Tag::CaptureAlternate(p),
+                        out,
+                    );
                 }
             }
             Tag::CaptureAlternate(p) => {
@@ -2857,6 +2913,11 @@ mod tests {
         out.into_bytes()
     }
 
+    /// The reply to `refresh-client -f pause-after=...`, sent once tmux
+    /// says its version (3.2 or later): fed on its own, after the
+    /// replies before it are read.
+    const PAUSE_ACK: &[u8] = b"%begin 9 90 1\n%end 9 90 1\n";
+
     fn writes(actions: &[Action]) -> Vec<String> {
         actions
             .iter()
@@ -2881,7 +2942,13 @@ mod tests {
         input.extend(reply(2, &[]));
         input.extend(reply(3, &[]));
         input.extend(reply(4, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]));
-        let actions = t.feed(&mut ws, &input);
+        let mut actions = t.feed(&mut ws, &input);
+        if writes(&actions)
+            .iter()
+            .any(|w| w.starts_with("refresh-client -f"))
+        {
+            actions.extend(t.feed(&mut ws, PAUSE_ACK));
+        }
         (t, ws, typed, actions)
     }
 
@@ -3051,7 +3118,7 @@ mod tests {
         t.feed(&mut ws, START);
         assert!(t.on_shared_server());
         let a = t.feed(&mut ws, &reply(1, &["3.4".into()]));
-        assert!(writes(&a).is_empty(), "{a:?}");
+        assert_eq!(writes(&a), ["refresh-client -f pause-after=10"], "{a:?}");
         // A later plain attach is the private server again.
         let _ = t.connection_lost(&mut ws);
         assert_eq!(
@@ -3310,7 +3377,8 @@ mod tests {
             &layout.map(|l| vec![l.to_owned()]).unwrap_or_default(),
         ));
         input.extend(reply(4, panes));
-        let actions = t.feed(&mut ws, &input);
+        let mut actions = t.feed(&mut ws, &input);
+        actions.extend(t.feed(&mut ws, PAUSE_ACK));
         (t, ws, actions)
     }
 
@@ -3507,6 +3575,75 @@ mod tests {
         let (t, ws, _) = attached(None, Some("ferossh1 active=0 hidden=@0"), &panes);
         assert_eq!(ws.all_panes(), [t.native_of(0).unwrap()]);
         assert!(ws.hidden().is_empty());
+    }
+
+    #[test]
+    fn flow_control_is_on_from_tmux_3_2_and_a_pause_redraws_the_screen() {
+        let panes = [pane_line(5, 1, 80, 24, "b25f,80x24,0,0,5")];
+        let (mut t, mut ws, a) = attached(Some("tmux"), None, &panes);
+        assert!(writes(&a).contains(&"refresh-client -f pause-after=10".to_owned()));
+        let native = t.native_of(5).unwrap();
+        // The restore's two captures.
+        t.feed(&mut ws, &reply(5, &[]));
+        t.feed(&mut ws, &reply(6, &[]));
+        // Output comes as %extended-output with the flag on.
+        let a = t.feed(&mut ws, b"%extended-output %5 20 : hi\n");
+        assert!(a.contains(&Action::Feed {
+            native,
+            bytes: b"hi".to_vec()
+        }));
+        let a = t.feed(&mut ws, b"%pause %5\n");
+        assert_eq!(
+            writes(&a),
+            [
+                "refresh-client -A '%5:continue'".to_owned(),
+                format!("list-panes -t %5 -F {}", command::quote(PANE_FORMAT)),
+            ]
+        );
+        // A second pause before the redraw asks for nothing more.
+        let a = t.feed(&mut ws, b"%begin 9 7 1\n%end 9 7 1\n");
+        assert!(writes(&a).is_empty());
+        let a = t.feed(
+            &mut ws,
+            &reply(8, &[pane_line(5, 1, 80, 24, "b25f,80x24,0,0,5")]),
+        );
+        assert_eq!(
+            writes(&a),
+            [
+                "capture-pane -p -e -q -t %5",
+                "capture-pane -p -e -q -a -t %5"
+            ]
+        );
+        let a = t.feed(&mut ws, b"%pause %5\n");
+        assert_eq!(writes(&a), ["refresh-client -A '%5:continue'"]);
+        t.feed(&mut ws, &reply(9, &["$ now".into()]));
+        let a = t.feed(&mut ws, &reply(10, &[]));
+        let fed = a.iter().find_map(|a| match a {
+            Action::Feed { native: n, bytes } if *n == native => {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            _ => None,
+        });
+        assert!(fed.is_some_and(|f| f.starts_with("\x1b[0m\x1b[H\x1b[2J$ now")));
+    }
+
+    #[test]
+    fn no_flow_control_before_tmux_3_2_or_when_only_watching() {
+        let (_, _, _, a) = attached_after("3.1", |_| Vec::new());
+        assert!(
+            !writes(&a).iter().any(|w| w.contains("pause-after")),
+            "{a:?}"
+        );
+        let (_, _, _, a) = attached_after("3.4", |t| t.join(None, Some("pair"), false));
+        assert!(
+            !writes(&a).iter().any(|w| w.contains("pause-after")),
+            "{a:?}"
+        );
+        let (_, _, _, a) = attached_after("3.4", |t| t.join(None, Some("pair"), true));
+        assert!(
+            writes(&a).iter().any(|w| w.contains("pause-after")),
+            "{a:?}"
+        );
     }
 
     #[test]
