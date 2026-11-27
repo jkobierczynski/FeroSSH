@@ -472,7 +472,18 @@ struct Restoring {
     buffer: Vec<u8>,
     state: PaneState,
     normal: Vec<Vec<u8>>,
+    /// After a `%pause`: the pane's terminal already has a screen and
+    /// modes, reset first, and the state comes after the captures
+    /// ([`Tag::Resync`]), so its cursor matches them; the alternate
+    /// screen waits here for it.
+    resync: Option<Vec<Vec<u8>>>,
 }
+
+/// Before a paused pane's screen is drawn again: back to the normal
+/// screen and every mode the restore may set, off, so the redraw starts
+/// from what a new terminal has. Scrollback is kept.
+const RESYNC_RESET: &[u8] = b"\x1b[?1049l\x1b[r\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\
+\x1b[?1005l\x1b[?1006l\x1b[?6l\x1b[4l\x1b[?7h\x1b[?25h";
 
 #[derive(Debug)]
 struct Pane {
@@ -1141,6 +1152,9 @@ impl Tmux {
                 }
                 self.ask_clients(out);
             }
+            // Before the guard: a pane tmux paused stays paused until it
+            // is let go, restoring or not.
+            Notification::Pause { pane } => self.on_pause(pane, out),
             _ if self.restoring => {}
             Notification::WindowAdd { window } => {
                 if !self.windows.contains_key(&window) {
@@ -1154,27 +1168,46 @@ impl Tmux {
             Notification::LayoutChange { window, layout } => {
                 self.on_layout_change(ws, window, &layout, out);
             }
-            Notification::Pause { pane } => {
-                // tmux dropped the output it held back: carry on, and draw
-                // the pane's screen as it is now.
-                self.send(
-                    &format!("refresh-client -A '%{pane}:continue'"),
-                    Tag::Ignore,
-                    out,
-                );
-                if self.panes.get(&pane).is_some_and(|p| p.restoring.is_none()) {
-                    self.send(
-                        &format!("list-panes -t %{pane} -F {}", command::quote(PANE_FORMAT)),
-                        Tag::Resync(pane),
-                        out,
-                    );
-                }
-            }
             Notification::Exit { reason } if !reason.is_empty() => {
                 out.push(Action::Notice(format!("tmux: {reason}")));
             }
             _ => {}
         }
+    }
+
+    /// tmux paused `pane` and dropped the output it held back: carry on,
+    /// and draw the pane's screen as it is now. A pane being restored (or
+    /// not shown yet) gets its screen from that restore.
+    fn on_pause(&mut self, pane: PaneId, out: &mut Vec<Action>) {
+        self.send(
+            &format!("refresh-client -A '%{pane}:continue'"),
+            Tag::Ignore,
+            out,
+        );
+        let Some(p) = self.panes.get_mut(&pane).filter(|p| p.restoring.is_none()) else {
+            return;
+        };
+        p.restoring = Some(Restoring {
+            resync: Some(Vec::new()),
+            ..Restoring::default()
+        });
+        // The screen only: the history before the pause is still in the
+        // native scrollback. The state after, for a cursor that matches.
+        self.send(
+            &format!("capture-pane -p -e -q -t %{pane}"),
+            Tag::Capture(pane),
+            out,
+        );
+        self.send(
+            &format!("capture-pane -p -e -q -a -t %{pane}"),
+            Tag::CaptureAlternate(pane),
+            out,
+        );
+        self.send(
+            &format!("list-panes -t %{pane} -F {}", command::quote(PANE_FORMAT)),
+            Tag::Resync(pane),
+            out,
+        );
     }
 
     fn on_output(&mut self, pane: PaneId, data: Vec<u8>, out: &mut Vec<Action>) {
@@ -1554,32 +1587,39 @@ impl Tmux {
                     .filter_map(|l| parse_pane_line(l))
                     .find(|l| l.pane == p)
                     .map(|l| l.state);
-                if ok
-                    && let Some(state) = state
-                    && let Some(pane) = self.panes.get_mut(&p)
-                    && pane.restoring.is_none()
+                if let Some(pane) = self.panes.get_mut(&p)
+                    && pane.restoring.as_ref().is_some_and(|r| r.resync.is_some())
+                    && let Some(r) = pane.restoring.take()
                 {
-                    pane.restoring = Some(Restoring {
-                        buffer: Vec::new(),
-                        state,
-                        normal: Vec::new(),
-                    });
-                    // The screen only: the history before the pause is
-                    // still in the native scrollback.
-                    self.send(
-                        &format!("capture-pane -p -e -q -t %{p}"),
-                        Tag::Capture(p),
-                        out,
-                    );
-                    self.send(
-                        &format!("capture-pane -p -e -q -a -t %{p}"),
-                        Tag::CaptureAlternate(p),
-                        out,
-                    );
+                    let alternate = r.resync.unwrap_or_default();
+                    let mut bytes = Vec::new();
+                    // Without the state the screen is not drawn: what
+                    // came since still is.
+                    if let Some(state) = state.filter(|_| ok) {
+                        bytes.extend_from_slice(RESYNC_RESET);
+                        bytes.extend(restore_bytes(&state, &r.normal, &alternate));
+                    }
+                    bytes.extend_from_slice(&r.buffer);
+                    if !bytes.is_empty() {
+                        out.push(Action::Feed {
+                            native: pane.native,
+                            bytes,
+                        });
+                    }
                 }
             }
             Tag::CaptureAlternate(p) => {
-                if let Some(pane) = self.panes.get_mut(&p)
+                // After a pause the state comes next and finishes it.
+                if let Some(Pane {
+                    restoring:
+                        Some(Restoring {
+                            resync: Some(alt), ..
+                        }),
+                    ..
+                }) = self.panes.get_mut(&p)
+                {
+                    *alt = if ok { lines } else { Vec::new() };
+                } else if let Some(pane) = self.panes.get_mut(&p)
                     && let Some(r) = pane.restoring.take()
                 {
                     let alternate = if ok { lines } else { Vec::new() };
@@ -2029,6 +2069,7 @@ impl Tmux {
                         buffer,
                         state: line.state.clone(),
                         normal: Vec::new(),
+                        resync: None,
                     }),
                 },
             );
@@ -3597,34 +3638,48 @@ mod tests {
             writes(&a),
             [
                 "refresh-client -A '%5:continue'".to_owned(),
+                "capture-pane -p -e -q -t %5".to_owned(),
+                "capture-pane -p -e -q -a -t %5".to_owned(),
                 format!("list-panes -t %5 -F {}", command::quote(PANE_FORMAT)),
             ]
         );
-        // A second pause before the redraw asks for nothing more.
-        let a = t.feed(&mut ws, b"%begin 9 7 1\n%end 9 7 1\n");
-        assert!(writes(&a).is_empty());
-        let a = t.feed(
-            &mut ws,
-            &reply(8, &[pane_line(5, 1, 80, 24, "b25f,80x24,0,0,5")]),
-        );
-        assert_eq!(
-            writes(&a),
-            [
-                "capture-pane -p -e -q -t %5",
-                "capture-pane -p -e -q -a -t %5"
-            ]
-        );
+        // A second pause before the redraw only lets the pane go again.
         let a = t.feed(&mut ws, b"%pause %5\n");
         assert_eq!(writes(&a), ["refresh-client -A '%5:continue'"]);
-        t.feed(&mut ws, &reply(9, &["$ now".into()]));
-        let a = t.feed(&mut ws, &reply(10, &[]));
+        t.feed(&mut ws, b"%begin 9 7 1\n%end 9 7 1\n");
+        // Output before the capture is in it; after it, kept for later.
+        t.feed(&mut ws, b"%extended-output %5 0 : old\n");
+        t.feed(&mut ws, &reply(8, &["$ now".into()]));
+        t.feed(&mut ws, &reply(9, &[]));
+        let a = t.feed(&mut ws, b"%extended-output %5 0 : x\n");
+        assert!(a.is_empty(), "{a:?}");
+        // The state after the captures (cursor at 2,3) finishes it.
+        let a = t.feed(
+            &mut ws,
+            &reply(10, &[pane_line(5, 1, 80, 24, "b25f,80x24,0,0,5")]),
+        );
         let fed = a.iter().find_map(|a| match a {
             Action::Feed { native: n, bytes } if *n == native => {
                 Some(String::from_utf8_lossy(bytes).into_owned())
             }
             _ => None,
         });
-        assert!(fed.is_some_and(|f| f.starts_with("\x1b[0m\x1b[H\x1b[2J$ now")));
+        let fed = fed.unwrap();
+        assert!(fed.starts_with("\x1b[?1049l"), "{fed:?}");
+        assert!(fed.contains("\x1b[0m\x1b[H\x1b[2J$ now"), "{fed:?}");
+        assert!(
+            fed.ends_with("\x1b[4;3Hx") && !fed.contains("old"),
+            "{fed:?}"
+        );
+    }
+
+    #[test]
+    fn a_pause_while_restoring_still_lets_the_pane_go() {
+        let (mut ws, gateway) = Workspace::new();
+        let mut t = Tmux::new(gateway, Mode::Ferossh, 100);
+        t.feed(&mut ws, START);
+        let a = t.feed(&mut ws, b"%pause %3\n");
+        assert_eq!(writes(&a), ["refresh-client -A '%3:continue'"]);
     }
 
     #[test]

@@ -1787,8 +1787,9 @@ struct Window {
     tmux_login_pick: HashSet<PaneId>,
     /// Session > Send all keys to the host, turned on or off by hand for
     /// a pane's connection (by the pane with the session: a tmux pane's
-    /// gateway); the profile's `SendAllKeys` otherwise.
-    all_keys: HashMap<PaneId, bool>,
+    /// gateway), with the connection it was for; the profile's
+    /// `SendAllKeys` otherwise, and once the pane opens another one.
+    all_keys: HashMap<PaneId, (Option<String>, bool)>,
     /// What a workspace gave its panes besides their place: what they run
     /// once logged in, and that their logins may keep passwords.
     workspace_extra: HashMap<PaneId, WorkspaceExtra>,
@@ -4439,18 +4440,25 @@ impl Window {
     /// `SendAllKeys yes` in the connection's profile).
     fn sends_all_keys(&self, id: PaneId) -> bool {
         let host = self.host_pane(id);
-        if let Some(on) = self.all_keys.get(&host) {
+        let alias = self.all_keys_alias(host);
+        if let Some((was, on)) = self.all_keys.get(&host)
+            && *was == alias
+        {
             return *on;
         }
-        let alias = match self.panes.get(&host).map(|p| &p.host) {
-            Some(Host::Ssh(s)) => Some(s.target.alias.as_str()),
-            Some(Host::Telnet(s)) => Some(s.target.alias.as_str()),
-            Some(Host::Serial { session, .. }) => session.as_deref(),
-            _ => None,
-        };
         alias
-            .and_then(|a| self.settings.profile(a))
+            .and_then(|a| self.settings.profile(&a))
             .is_some_and(|p| p.send_all_keys)
+    }
+
+    /// The connection pane `host` shows, for [`Self::sends_all_keys`].
+    fn all_keys_alias(&self, host: PaneId) -> Option<String> {
+        match self.panes.get(&host).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => Some(s.target.alias.clone()),
+            Some(Host::Telnet(s)) => Some(s.target.alias.clone()),
+            Some(Host::Serial { session, .. }) => session.clone(),
+            _ => None,
+        }
     }
 
     /// A tmux pane in tmux layout, whose place tmux decides: it does not
@@ -16351,6 +16359,10 @@ impl Window {
         }
         if let Some(id) = self.shortcut_for(vk, mods) {
             drop_pending_char(self.hwnd);
+            // Held down, Send all keys to the host does not flip back.
+            if id == cmd::ALL_KEYS && held {
+                return KeyOutcome::Handled;
+            }
             return KeyOutcome::Run(Command::Id(id));
         }
         if self.side.focused {
@@ -22935,7 +22947,11 @@ impl Window {
                 // owns it. The menu's tick shows it.
                 let host = self.host_pane(pane);
                 let on = !self.sends_all_keys(pane);
-                self.all_keys.insert(host, on);
+                let alias = self.all_keys_alias(host);
+                self.all_keys.insert(host, (alias, on));
+                // A tmux prefix pressed before does not carry over.
+                self.tmux_armed = None;
+                self.tmux_repeat = None;
             }
             cmd::CLEAR_SCROLLBACK => {
                 self.panes.get_mut(&pane)?.term.clear_scrollback();
