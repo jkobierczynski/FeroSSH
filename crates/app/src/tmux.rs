@@ -45,6 +45,9 @@ const PAUSE_AFTER: u32 = 10;
 const MAX_ORPHANS: usize = 64;
 /// Windows FeroSSH shows; more are left to tmux.
 const MAX_WINDOWS: usize = 256;
+/// Bracketed-paste markers around a paste for a tmux pane ([`Tmux::input`]).
+pub const PASTE_START: &[u8] = b"\x1b[200~";
+pub const PASTE_END: &[u8] = b"\x1b[201~";
 /// History lines brought back per pane, at most.
 pub const MAX_HISTORY: usize = 10_000;
 
@@ -416,9 +419,32 @@ fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
     })
 }
 
-/// The bytes that redraw a pane as tmux has it: its history and screen
-/// (`capture-pane`), the alternate screen, the modes and the cursor.
-fn restore_bytes(state: &PaneState, normal: &[Vec<u8>], alternate: &[Vec<u8>]) -> Vec<u8> {
+/// The bytes that redraw a pane as tmux has it: its history and screens,
+/// the modes and the cursor.
+///
+/// `current` is plain `capture-pane`: what the pane shows now, after any
+/// history asked for. `saved` is `capture-pane -a`: the screen tmux keeps
+/// aside while a program (vim, less, mc) has the alternate screen on,
+/// which is the *normal* screen, the shell's; it is empty otherwise. So
+/// with the alternate screen on, the history and `saved` go to the normal
+/// screen and the last `height` lines of `current` to the alternate one.
+fn restore_bytes(state: &PaneState, current: &[Vec<u8>], saved: &[Vec<u8>]) -> Vec<u8> {
+    let (normal, alternate): (Vec<Vec<u8>>, &[Vec<u8>]) = if state.alternate {
+        let split = current.len().saturating_sub(usize::from(state.height));
+        let (history, shown) = current.split_at(split);
+        // The shell's screen up to its last line that holds something:
+        // the shell's cursor was below it when the program started, so
+        // that is where its prompt comes back once the program quits.
+        let used = saved
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map_or(0, |i| i + 1);
+        let mut normal = history.to_vec();
+        normal.extend(saved.iter().take(used).cloned());
+        (normal, shown)
+    } else {
+        (current.to_vec(), &[])
+    };
     let mut out = b"\x1b[0m\x1b[H\x1b[2J".to_vec();
     let join = |out: &mut Vec<u8>, lines: &[Vec<u8>]| {
         for (i, line) in lines.iter().enumerate() {
@@ -429,8 +455,11 @@ fn restore_bytes(state: &PaneState, normal: &[Vec<u8>], alternate: &[Vec<u8>]) -
         }
         out.extend_from_slice(b"\x1b[0m");
     };
-    join(&mut out, normal);
+    join(&mut out, &normal);
     if state.alternate {
+        if !normal.is_empty() {
+            out.extend_from_slice(b"\r\n");
+        }
         out.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
         join(&mut out, alternate);
     }
@@ -2071,8 +2100,13 @@ impl Tmux {
             );
             let history = self.history;
             let p = line.pane;
+            // Lines that only wrapped come back whole (-J), so they wrap
+            // again in the native pane and copy as one line. Not while the
+            // alternate screen is on: its screen is then the last `height`
+            // lines of this capture, which joining would miscount.
+            let join = if line.state.alternate { "" } else { " -J" };
             self.send(
-                &format!("capture-pane -p -e -q -t %{p} -S -{history}"),
+                &format!("capture-pane -p -e -q{join} -t %{p} -S -{history}"),
                 Tag::Capture(p),
                 out,
             );
@@ -2327,6 +2361,27 @@ impl Tmux {
             return out;
         }
         if let Some(p) = self.pane_of(native) {
+            // A paste goes through tmux's paste buffer, which brackets it
+            // only if the program in the pane asked for that: tmux knows,
+            // while the native terminal may not (after a reattach it
+            // cannot learn it). The window brackets every paste for a tmux
+            // pane so that it is told apart from typing here. What comes
+            // before it (an SSH escape character held back) is typed.
+            if let Some(start) = bytes
+                .windows(PASTE_START.len())
+                .position(|w| w == PASTE_START)
+                && let Some((typed, rest)) = bytes.split_at_checked(start)
+                && let Some(text) = rest
+                    .strip_prefix(PASTE_START)
+                    .and_then(|b| b.strip_suffix(PASTE_END))
+            {
+                let mut lines = command::send_keys(p, typed);
+                lines.extend(command::paste(p, text));
+                for line in lines {
+                    self.send(&line, Tag::Ignore, &mut out);
+                }
+                return out;
+            }
             for line in command::send_keys(p, bytes) {
                 self.send(&line, Tag::Ignore, &mut out);
             }
@@ -3434,7 +3489,7 @@ mod tests {
     fn restores_screens_and_modes() {
         let state = PaneState {
             width: 80,
-            height: 24,
+            height: 3,
             cursor_x: 4,
             cursor_y: 1,
             alternate: true,
@@ -3442,16 +3497,28 @@ mod tests {
             keypad_cursor: true,
             mouse_sgr: true,
             wrap: true,
-            region: (0, 23),
+            region: (0, 2),
             ..PaneState::default()
         };
-        let bytes = restore_bytes(&state, &[b"a".to_vec(), b"b".to_vec()], &[b"vim".to_vec()]);
-        let text = String::from_utf8(bytes).unwrap();
+        // With vim open, plain capture-pane is the history and then vim's
+        // screen; -a is the shell's screen, kept aside meanwhile.
+        let lines = |l: &[&str]| l.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
+        let current = lines(&["old", "vim 1", "vim 2", "~"]);
+        let saved = lines(&["$ ls", "$ vim x", "", ""]);
+        let text = String::from_utf8(restore_bytes(&state, &current, &saved)).unwrap();
         assert_eq!(
             text,
-            "\x1b[0m\x1b[H\x1b[2Ja\r\nb\x1b[0m\x1b[?1049h\x1b[H\x1b[2Jvim\x1b[0m\
+            "\x1b[0m\x1b[H\x1b[2Jold\r\n$ ls\r\n$ vim x\x1b[0m\r\n\
+             \x1b[?1049h\x1b[H\x1b[2Jvim 1\r\nvim 2\r\n~\x1b[0m\
              \x1b[?1h\x1b[?1006h\x1b[?25l\x1b[2;5H"
         );
+        // Without the alternate screen, -a is empty and the capture is all.
+        let normal = PaneState {
+            alternate: false,
+            ..state
+        };
+        let text = String::from_utf8(restore_bytes(&normal, &current, &[])).unwrap();
+        assert!(text.starts_with("\x1b[0m\x1b[H\x1b[2Jold\r\nvim 1\r\nvim 2\r\n~\x1b[0m\x1b[?1h"));
     }
 
     #[test]
@@ -3542,7 +3609,7 @@ mod tests {
         assert_eq!(created[0].1.theme.as_deref(), Some("Dracula"));
         let w = writes(&actions);
         assert!(w.contains(&"set-option -q @ferossh-mode ferossh".to_owned()));
-        assert!(w.contains(&"capture-pane -p -e -q -t %3 -S -100".to_owned()));
+        assert!(w.contains(&"capture-pane -p -e -q -J -t %3 -S -100".to_owned()));
         assert_eq!(t.mode(), Mode::Ferossh);
     }
 
@@ -4401,5 +4468,28 @@ mod tests {
             ["send-keys -t %7 -H 6c 73 0d"]
         );
         assert!(t.input(999, b"x").is_empty());
+    }
+
+    #[test]
+    fn pastes_go_through_tmux_so_it_brackets_them() {
+        let panes = [pane_line(7, 0, 80, 24, "b25f,80x24,0,0,7")];
+        let (mut t, _ws, _) = attached(None, None, &panes);
+        let n = t.native_of(7).unwrap();
+        assert_eq!(
+            writes(&t.input(n, b"\x1b[200~a;b\r\x1b[201~")),
+            [
+                r#"set-buffer -b ferossh-paste "a\073b\015""#,
+                "paste-buffer -p -r -d -b ferossh-paste -t %7",
+            ]
+        );
+        // An escape character held back before the paste is typed first.
+        assert_eq!(
+            writes(&t.input(n, b"~\x1b[200~x\x1b[201~")),
+            [
+                "send-keys -t %7 -H 7e",
+                r#"set-buffer -b ferossh-paste "x""#,
+                "paste-buffer -p -r -d -b ferossh-paste -t %7",
+            ]
+        );
     }
 }

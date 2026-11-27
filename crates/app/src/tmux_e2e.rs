@@ -92,6 +92,24 @@ fn tmux() -> Command {
     }
 }
 
+/// Whether the host tmux runs on (the container, if any) has `program`.
+fn has_program(program: &str) -> bool {
+    let check = format!("command -v {program}");
+    let mut c = match std::env::var("FEROSSH_TMUX_CONTAINER") {
+        Ok(id) if !id.is_empty() => {
+            let mut c = Command::new("docker");
+            c.args(["exec", &id, "sh", "-c", &check]);
+            c
+        }
+        _ => {
+            let mut c = Command::new("sh");
+            c.args(["-c", &check]);
+            c
+        }
+    };
+    c.output().is_ok_and(|o| o.status.success())
+}
+
 fn tmux_available() -> bool {
     let found = tmux().arg("-V").output().is_ok_and(|o| o.status.success());
     if !found {
@@ -1048,4 +1066,133 @@ fn real_tmux_watcher_sees_but_changes_nothing() {
     let screen = tmux_cmd(&server, &["capture-pane", "-p", "-t", "e2e"]);
     assert!(!screen.contains("nope-42"), "{screen}");
     assert!(screen.contains("shared-42"), "{screen}");
+}
+
+/// A program on the alternate screen (vim, less, mc, htop, top) when
+/// another PC attaches: its screen shows, and the shell's comes back once
+/// it quits. A paste is bracketed as the program asked, which tmux knows
+/// though the native terminal cannot after a reattach.
+#[test]
+fn real_tmux_reattach_with_a_full_screen_program() {
+    if !tmux_available() || version() < MIN_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-alt-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Tmux);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    // Like vim: the alternate screen and bracketed paste on, then it
+    // reads 14 bytes (a bracketed "hi") and shows them, ESC as E.
+    let actions = a.tmux.input(
+        first,
+        b"printf 'SHELL\\055MARK\\n'; printf '\\033[?1049h\\033[HFULL\\055MARK\\033[?2004h'; \
+          stty raw -echo; dd bs=1 count=14 2>/dev/null | tr '\\033' E; sleep 600\r",
+    );
+    a.apply(actions);
+    a.until("the alternate screen", |_| {
+        tmux_cmd(
+            &server,
+            &["display-message", "-p", "-t", "e2e", "#{alternate_on}"],
+        ) == "1"
+    });
+    drop(a);
+
+    let mut b = Harness::attach(&server, Mode::Tmux);
+    b.until("the restored pane", |h| {
+        h.panes.len() == 1 && h.panes.values().all(|p| !p.1.is_empty())
+    });
+    let pane = *b.panes.keys().next().unwrap();
+    let mut term = ferossh_term::Terminal::new(80, 24, &ferossh_term::Settings::default());
+    term.feed(b.text(pane).as_bytes());
+    let screen = term.screen_text().join("\n");
+    assert!(screen.contains("FULL-MARK"), "{screen}");
+    assert!(!screen.contains("SHELL-MARK"), "{screen}");
+    // The program quits: the shell's screen is back, without its screen.
+    term.feed(b"\x1b[?1049l");
+    let screen = term.screen_text().join("\n");
+    assert!(screen.contains("SHELL-MARK"), "{screen}");
+    assert!(!screen.contains("FULL-MARK"), "{screen}");
+
+    // This native terminal never saw bracketed paste turned on, yet the
+    // program gets the paste bracketed.
+    let actions = b.tmux.input(pane, b"\x1b[200~hi\x1b[201~");
+    b.apply(actions);
+    b.until("the bracketed paste", |_| {
+        tmux_cmd(&server, &["capture-pane", "-p", "-t", "e2e"]).contains("E[200~hiE[201~")
+    });
+}
+
+/// A real `top` (on the normal screen: procps top does not use the
+/// alternate one), where the host has it: its screen comes back on
+/// attach and after FeroSSH resizes the pane.
+#[test]
+fn real_tmux_reattach_shows_top() {
+    if !tmux_available() || version() < MIN_VERSION || !has_program("top") {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-top-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Tmux);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    let actions = a.tmux.input(first, b"clear; top -d 600\r");
+    a.apply(actions);
+    a.until("top", |_| {
+        tmux_cmd(&server, &["capture-pane", "-p", "-t", "e2e"]).contains("Tasks:")
+    });
+    drop(a);
+
+    let mut b = Harness::attach(&server, Mode::Ferossh);
+    b.until("the restored pane", |h| {
+        h.panes.len() == 1 && h.panes.values().all(|p| !p.1.is_empty())
+    });
+    let pane = *b.panes.keys().next().unwrap();
+    // Another size: top draws itself again for it.
+    b.sizes(|_| (100, 30));
+    b.until("top drawn again", |h| {
+        h.text(pane).matches("Tasks:").count() >= 2
+    });
+    let mut term = ferossh_term::Terminal::new(100, 30, &ferossh_term::Settings::default());
+    term.feed(b.text(pane).as_bytes());
+    let screen = term.screen_text().join("\n");
+    assert!(screen.contains("Tasks:"), "{screen}");
+}
+
+/// A real `nano` (on the alternate screen), where the host has it: its
+/// screen comes back on attach, not the shell's.
+#[test]
+fn real_tmux_reattach_shows_nano() {
+    if !tmux_available() || version() < MIN_VERSION || !has_program("nano") {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-nano-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Tmux);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    let actions = a.tmux.input(first, b"echo SHELL; nano\r");
+    a.apply(actions);
+    a.until("nano on the alternate screen", |_| {
+        tmux_cmd(
+            &server,
+            &["display-message", "-p", "-t", "e2e", "#{alternate_on}"],
+        ) == "1"
+            && tmux_cmd(&server, &["capture-pane", "-p", "-t", "e2e"]).contains("GNU nano")
+    });
+    drop(a);
+
+    let mut b = Harness::attach(&server, Mode::Tmux);
+    b.until("the restored pane", |h| {
+        h.panes.len() == 1 && h.panes.values().all(|p| !p.1.is_empty())
+    });
+    let pane = *b.panes.keys().next().unwrap();
+    let mut term = ferossh_term::Terminal::new(80, 24, &ferossh_term::Settings::default());
+    term.feed(b.text(pane).as_bytes());
+    let screen = term.screen_text().join("\n");
+    assert!(screen.contains("GNU nano"), "{screen}");
+    assert!(!screen.contains("SHELL"), "{screen}");
 }

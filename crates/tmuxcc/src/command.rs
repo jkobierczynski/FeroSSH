@@ -35,6 +35,46 @@ pub fn send_keys(pane: PaneId, bytes: &[u8]) -> Vec<String> {
 
 /// A session name tmux accepts and that is safe on a command line:
 /// letters, digits, `-` and `_` (tmux itself refuses `:` and `.`).
+/// The paste buffer FeroSSH pastes through; [`paste`] deletes it after.
+pub const PASTE_BUFFER: &str = "ferossh-paste";
+
+/// Bytes of a paste per `set-buffer` command.
+pub const PASTE_PER_COMMAND: usize = 256;
+
+/// Commands that paste `text` (no bracketed-paste markers) into pane
+/// `pane` the way tmux pastes a buffer: bracketed only if the program in
+/// the pane asked for it (`paste-buffer -p`), which tmux knows even when
+/// the native terminal does not, as after a reattach. Every byte other
+/// than a letter, digit or space goes as an octal escape inside double
+/// quotes, so nothing in the text (`$`, `~`, `#{`, quotes, `;`, line
+/// breaks) is read as tmux syntax. `-r` leaves line breaks as they are.
+pub fn paste(pane: PaneId, text: &[u8]) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = text
+        .chunks(PASTE_PER_COMMAND)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let append = if i == 0 { "" } else { " -a" };
+            let mut line = format!("set-buffer{append} -b {PASTE_BUFFER} \"");
+            for &b in chunk {
+                if b.is_ascii_alphanumeric() || b == b' ' {
+                    line.push(char::from(b));
+                } else {
+                    let _ = write!(line, "\\{b:03o}");
+                }
+            }
+            line.push('"');
+            line
+        })
+        .collect();
+    lines.push(format!(
+        "paste-buffer -p -r -d -b {PASTE_BUFFER} -t %{pane}"
+    ));
+    lines
+}
+
 pub fn session_name(text: &str) -> String {
     let name: String = text
         .trim()
@@ -172,6 +212,21 @@ pub fn join_line(owner: Option<&str>, session: Option<&str>, can_type: bool) -> 
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pastes_through_a_buffer_with_every_symbol_escaped() {
+        assert_eq!(
+            paste(3, "a $~\"'é\r;#{".as_bytes()),
+            [
+                r#"set-buffer -b ferossh-paste "a \044\176\042\047\303\251\015\073\043\173""#,
+                "paste-buffer -p -r -d -b ferossh-paste -t %3",
+            ]
+        );
+        assert!(paste(3, b"").is_empty());
+        let long = paste(1, &[b'x'; PASTE_PER_COMMAND + 1]);
+        assert_eq!(long.len(), 3);
+        assert!(long[1].starts_with("set-buffer -a -b ferossh-paste \"x\""));
+    }
 
     #[test]
     fn quotes() {

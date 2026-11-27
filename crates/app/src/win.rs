@@ -1204,6 +1204,20 @@ struct Ghost {
 }
 
 impl Pane {
+    /// A paste for this pane's host, as its terminal prepares it. A tmux
+    /// pane's always carries bracketed-paste markers: [`Tmux::input`]
+    /// takes it apart and has tmux paste it, bracketed only if the program
+    /// in the pane asked, which tmux knows and the native terminal may not
+    /// (after a reattach). Whether it asks to confirm a multi-line paste
+    /// still follows the native terminal.
+    fn paste(&self, text: &str) -> ferossh_term::Paste {
+        let mut paste = self.term.paste(text);
+        if matches!(self.host, Host::Tmux { .. }) && !paste.bracketed {
+            paste.bytes = ferossh_term::prepare_paste(text, true).bytes;
+        }
+        paste
+    }
+
     /// Top-left corner of cell (0, 0).
     fn origin(&self, dpi: u32) -> (i32, i32) {
         let pad = padding(dpi);
@@ -11984,7 +11998,7 @@ impl Window {
                 Typed::Key(key, mods) => p.term.key(*key, *mods),
                 Typed::Ctrl(key, code, mods) => Some(p.term.ctrl_key(*key, *code, *mods)),
                 Typed::Bytes(b) => Some(b.clone()),
-                Typed::Paste(text) => Some(p.term.paste(text).bytes),
+                Typed::Paste(text) => Some(p.paste(text).bytes),
             };
             if let Some(bytes) = bytes {
                 self.input(id, bytes);
@@ -14474,7 +14488,7 @@ impl Window {
                     p.theme.name == "Production",
                     self.link_of(*id),
                     self.scripts.get(id).is_some_and(|r| r.runner.prompting()),
-                    p.term.paste(text).bytes,
+                    p.paste(text).bytes,
                 ))
             })
             .collect()
@@ -25486,7 +25500,7 @@ impl Window {
                 .panes
                 .get(&batch.pane)
                 .filter(|_| same)
-                .map(|p| p.term.paste(&text));
+                .map(|p| p.paste(&text));
             match paste {
                 Some(paste) => self.input(batch.pane, paste.bytes),
                 None => {
@@ -29359,8 +29373,7 @@ fn run_command(hwnd: HWND, command: Command) {
             if with_window(|w| w.paste_local(id, &text)) != Some(false) {
                 return;
             }
-            let Some(paste) =
-                with_window(|w| w.panes.get(&id).map(|p| p.term.paste(&text))).flatten()
+            let Some(paste) = with_window(|w| w.panes.get(&id).map(|p| p.paste(&text))).flatten()
             else {
                 return;
             };
