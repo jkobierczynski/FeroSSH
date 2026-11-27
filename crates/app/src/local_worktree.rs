@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::worktree::{Added, Removal, Worktree, valid_branch};
+use crate::worktree::{Added, Listed, Removal, Worktree, valid_branch};
 
 /// Branches tried at most, as on a server.
 const TRIES: u32 = 99;
@@ -175,6 +175,35 @@ pub fn add(program: &Path, dir: &Path, base: &str) -> Added {
         Some(r) if r.ok => Added::Made(Worktree { branch, path: text }),
         Some(r) => Added::Failed(said(&r.err)),
         None => Added::NoGit,
+    }
+}
+
+/// The worktrees of the repository folder `dir` is in, other than its
+/// main one, with git `program` (Start <agent> in an existing worktree).
+pub fn list(program: &Path, dir: &Path) -> Listed {
+    let git = Git { program };
+    if git.run(Path::new("."), &["--version"]).is_none() {
+        return Listed::NoGit;
+    }
+    if !dir.is_dir() {
+        return Listed::NoDir;
+    }
+    if git.toplevel(dir).is_none() {
+        return Listed::NoRepo;
+    }
+    match git.run(dir, &["worktree", "list", "--porcelain"]) {
+        Some(r) if r.ok => Listed::Found(
+            crate::worktree::porcelain(&r.out)
+                .into_iter()
+                .map(|(branch, path)| (branch, native(&path).to_string_lossy().into_owned()))
+                .filter(|(b, p)| {
+                    valid_branch(b) && !p.chars().any(char::is_control) && p.len() <= 4096
+                })
+                .map(|(branch, path)| Worktree { branch, path })
+                .collect(),
+        ),
+        Some(r) => Listed::Failed(said(&r.err)),
+        None => Listed::NoGit,
     }
 }
 
@@ -354,6 +383,12 @@ mod tests {
         assert_eq!(Path::new(&w2.path), root.join("my app-claude-2"));
         assert_eq!(add(&git, &root.join("none"), "claude"), Added::NoDir);
         assert_eq!(add(&git, &root, "claude"), Added::NoRepo);
+        // Both are listed for Start in an existing worktree, not the main.
+        assert_eq!(
+            list(&git, &repo.join("src")),
+            Listed::Found(vec![w1.clone(), w2.clone()])
+        );
+        assert_eq!(list(&git, &root), Listed::NoRepo);
         // Untracked work is kept.
         std::fs::write(Path::new(&w1.path).join("new"), "x").unwrap();
         assert!(matches!(remove(&git, &w1), Removal::Kept(_)));

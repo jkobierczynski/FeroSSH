@@ -707,6 +707,8 @@ Two agents in one folder edit the same files. Session > Coding agents > Start cl
 
 The Agent dashboard shows *branch claude-2* in front of the agent's details, and you can search for the branch after `is:agent`. Show what changed here, from the agent's pane, shows the worktree's changes with *On branch claude-2* in the heading.
 
+To start an agent in a worktree that is already there (its window was closed, tmux restarted, or you made the worktree yourself), use Session > Coding agents > Start claude in an existing worktree... from a pane in any folder of the repository. FeroSSH lists the repository's worktrees (not its main folder, nor one with no branch checked out) in a menu, and the agent starts in the one you pick, marked with its branch and folder just as if FeroSSH had made it.
+
 When you are done, merge or push the branch as usual. Then Session > Coding agents > Remove this agent's worktree, from the agent's pane, asks and runs `git worktree remove`. git keeps a worktree that has uncommitted or untracked changes, and FeroSSH then tells you and changes nothing. Files git ignores (build output, `node_modules`, a local `.env`) do not stop it and are deleted with the folder. Once the folder is gone, the agent's tmux window closes (the agent stops), and the branch is deleted only if it is merged (`git branch -d`). An unmerged branch stays with the agent's commits, for you to merge or delete with `git branch -D`. FeroSSH never removes the repository's main folder.
 
 git runs over the pane's own SSH connection, with `sh`, so the server needs both. The folder and the branch go to git on its input, never in the command. Branch names are only letters, digits, `.`, `_` and `-`, made from the agent's name.
