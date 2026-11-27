@@ -45,6 +45,8 @@ struct Git<'a> {
 struct Ran {
     ok: bool,
     out: String,
+    /// `out` as git wrote it.
+    raw: Vec<u8>,
     err: Vec<u8>,
 }
 
@@ -72,6 +74,7 @@ impl Git<'_> {
         Some(Ran {
             ok: output.status.success(),
             out: String::from_utf8_lossy(&output.stdout).into_owned(),
+            raw: output.stdout,
             err: output.stderr,
         })
     }
@@ -191,9 +194,15 @@ pub fn list(program: &Path, dir: &Path) -> Listed {
     if git.toplevel(dir).is_none() {
         return Listed::NoRepo;
     }
-    match git.run(dir, &["worktree", "list", "--porcelain"]) {
+    // -z (git 2.36 and later) keeps a folder name with a newline in it
+    // whole, so it is left out rather than cut short.
+    let (ran, nul) = match git.run(dir, &["worktree", "list", "--porcelain", "-z"]) {
+        Some(r) if r.ok => (Some(r), true),
+        _ => (git.run(dir, &["worktree", "list", "--porcelain"]), false),
+    };
+    match ran {
         Some(r) if r.ok => Listed::Found(
-            crate::worktree::porcelain(&r.out)
+            crate::worktree::porcelain(&r.raw, nul)
                 .into_iter()
                 .map(|(branch, path)| (branch, native(&path).to_string_lossy().into_owned()))
                 .filter(|(b, p)| {

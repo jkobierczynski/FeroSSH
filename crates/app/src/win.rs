@@ -2006,6 +2006,8 @@ struct WorktreeJob {
     kind: WorktreeKind,
     out: Vec<u8>,
     err: Vec<u8>,
+    /// A listing said more than [`Self::on_worktree`] keeps.
+    too_long: bool,
 }
 
 /// A worktree job run on this PC (in WSL, or with Windows' git) on a
@@ -2048,8 +2050,9 @@ struct WorktreeAsk {
 enum WorktreeKind {
     /// Making one, to start agent `command` in.
     Add { command: String },
-    /// Listing the repository's, to pick one to start agent `command` in.
-    List { command: String },
+    /// Listing the repository's, to pick one to start agent `command` in,
+    /// from the pane's host as it was at [`Pane::host_gen`] `host_gen`.
+    List { command: String, host_gen: u64 },
     /// Removing this one.
     Remove(crate::worktree::Worktree),
 }
@@ -13452,6 +13455,7 @@ impl Window {
     /// repository folder `dir` (on pane `id`'s server, or in its WSL
     /// distro) is in, for [`Self::worktree_done`] to offer.
     fn list_worktrees(&mut self, id: PaneId, dir: Vec<u8>, command: String) -> Option<Command> {
+        let host_gen = self.panes.get(&id).map_or(0, |p| p.host_gen);
         let Some(input) = crate::worktree::list_input(&dir) else {
             return Some(Command::Notice(
                 "FeroSSH cannot ask git about this folder: its name is not on one line.".into(),
@@ -13462,7 +13466,7 @@ impl Window {
                 Self::wsl_worktree_job(distro, crate::worktree::list_command(), input, |o, e| {
                     WorktreeOutcome::Listed(crate::worktree::parse_list(o, e))
                 });
-            self.run_local_worktree(id, WorktreeKind::List { command }, job);
+            self.run_local_worktree(id, WorktreeKind::List { command, host_gen }, job);
             return None;
         }
         let Some(connection) = self.pane_connection(id) else {
@@ -13477,7 +13481,7 @@ impl Window {
             id,
             crate::worktree::list_command(),
             input,
-            WorktreeKind::List { command },
+            WorktreeKind::List { command, host_gen },
         );
         None
     }
@@ -13489,11 +13493,18 @@ impl Window {
     fn start_in_worktree(
         &mut self,
         id: PaneId,
+        host_gen: u64,
         command: &str,
         w: &crate::worktree::Worktree,
     ) -> Option<Command> {
-        if !self.panes.contains_key(&id) {
-            return None;
+        // While the menu was open the pane may have moved on to another
+        // host, where that folder means something else.
+        if self.panes.get(&id)?.host_gen != host_gen {
+            return Some(Command::Notice(
+                "No agent started: the pane the worktree was picked for runs something else \
+                 now."
+                    .into(),
+            ));
         }
         if let Some(refused) = self.agent_refused(id) {
             return Some(refused);
@@ -13515,7 +13526,9 @@ impl Window {
             ));
         };
         let dir = std::path::PathBuf::from(dir);
-        self.run_local_worktree(id, WorktreeKind::List { command }, move || {
+        let host_gen = self.panes.get(&id).map_or(0, |p| p.host_gen);
+        let kind = WorktreeKind::List { command, host_gen };
+        self.run_local_worktree(id, kind, move || {
             WorktreeOutcome::Listed(crate::local_worktree::list(&git, &dir))
         });
         None
@@ -13613,6 +13626,7 @@ impl Window {
                 kind,
                 out: Vec::new(),
                 err: Vec::new(),
+                too_long: false,
             },
         );
     }
@@ -13622,6 +13636,8 @@ impl Window {
     fn on_worktree(&mut self, channel: ChannelId, msg: Message) {
         /// More is never needed: the answer is on the last lines.
         const KEEP: usize = 16 * 1024;
+        /// A listing is kept whole, up to this (some thousand worktrees).
+        const LIST_KEEP: usize = 4 * 1024 * 1024;
         let Some(j) = self.worktree_jobs.get_mut(&channel) else {
             return;
         };
@@ -13633,6 +13649,14 @@ impl Window {
             }
         };
         let reason = match msg {
+            Message::Data { bytes, .. } if matches!(j.kind, WorktreeKind::List { .. }) => {
+                if j.out.len() + bytes.len() > LIST_KEEP {
+                    j.too_long = true;
+                } else if !j.too_long {
+                    j.out.extend_from_slice(&bytes);
+                }
+                return;
+            }
             Message::Data { bytes, .. } => {
                 keep(&mut j.out, &bytes);
                 return;
@@ -13656,6 +13680,9 @@ impl Window {
             WorktreeKind::Remove(_) => {
                 WorktreeOutcome::Removed(crate::worktree::parse_remove(&j.out, &j.err))
             }
+            WorktreeKind::List { .. } if j.too_long => WorktreeOutcome::Listed(
+                crate::worktree::Listed::Failed("git listed too many worktrees".into()),
+            ),
             WorktreeKind::List { .. } => {
                 WorktreeOutcome::Listed(crate::worktree::parse_list(&j.out, &j.err))
             }
@@ -13833,8 +13860,19 @@ impl Window {
                     }
                 }
             }
-            (WorktreeKind::List { command }, WorktreeOutcome::Listed(listed)) => {
+            (WorktreeKind::List { command, host_gen }, WorktreeOutcome::Listed(listed)) => {
                 use crate::worktree::Listed;
+                let Some(now) = self.panes.get(&pane).map(|p| p.host_gen) else {
+                    return;
+                };
+                if now != host_gen {
+                    self.queued.push(Command::Notice(
+                        "No worktree was offered: the pane they were listed from runs \
+                         something else now. Ask again from the pane you want the agent in."
+                            .into(),
+                    ));
+                    return;
+                }
                 match listed {
                     Listed::Found(list) if list.is_empty() => format!(
                         "This repository on {host} has no worktree besides its main folder \
@@ -13842,13 +13880,12 @@ impl Window {
                          in a new git worktree makes one."
                     ),
                     Listed::Found(list) => {
-                        if self.panes.contains_key(&pane) {
-                            self.queued.push(Command::PickWorktree {
-                                pane,
-                                command,
-                                list,
-                            });
-                        }
+                        self.queued.push(Command::PickWorktree {
+                            pane,
+                            command,
+                            host_gen,
+                            list,
+                        });
                         return;
                     }
                     Listed::NoGit => format!("{host} has no git command."),
@@ -25895,6 +25932,8 @@ enum Command {
     PickWorktree {
         pane: PaneId,
         command: String,
+        /// The pane's [`Pane::host_gen`] when they were listed.
+        host_gen: u64,
         list: Vec<crate::worktree::Worktree>,
     },
     /// Session > Coding agents > Remove this agent's worktree: asks first.
@@ -29919,11 +29958,12 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::PickWorktree {
             pane,
             command,
+            host_gen,
             list,
         } => {
             if let Some(w) = pick_worktree(hwnd, &command, &list)
                 && let Some(next) =
-                    with_window(|win| win.start_in_worktree(pane, &command, &w)).flatten()
+                    with_window(|win| win.start_in_worktree(pane, host_gen, &command, &w)).flatten()
             {
                 run_command(hwnd, next);
             }

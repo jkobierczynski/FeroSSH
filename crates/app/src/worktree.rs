@@ -297,8 +297,10 @@ pub fn parse_add(out: &[u8], err: &[u8]) -> Added {
 
 /// The command that lists the worktrees of the repository the folder on
 /// its standard input is in, for Session > Coding agents > Start <agent>
-/// in an existing worktree: `git worktree list --porcelain` after the
-/// answer line. Like [`add_command`], one line for `sh`.
+/// in an existing worktree: `git worktree list --porcelain -z` (or,
+/// with a git older than 2.36, without `-z`) after the answer line. The
+/// answer is only given once git has listed them; when it cannot, its
+/// error goes to standard error. Like [`add_command`], one line for `sh`.
 pub fn list_command() -> Vec<u8> {
     let script = [
         "IFS= read -r d || exit 2".to_owned(),
@@ -306,6 +308,14 @@ pub fn list_command() -> Vec<u8> {
         format!("cd -- \"$d\" 2>/dev/null || {{ echo {MARK} nodir; exit 0; }}"),
         format!(
             "git rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo {MARK} norepo; exit 0; }}"
+        ),
+        format!(
+            "git worktree list --porcelain -z >/dev/null 2>&1 && \
+             {{ echo {MARK} listz; exec git worktree list --porcelain -z; }}"
+        ),
+        format!(
+            "git worktree list --porcelain >/dev/null 2>&1 || \
+             {{ echo {MARK} failed; exec git worktree list --porcelain >&2; }}"
         ),
         format!("echo {MARK} list"),
         "exec git worktree list --porcelain".to_owned(),
@@ -337,29 +347,66 @@ pub enum Listed {
     Failed(String),
 }
 
-/// The worktrees in `git worktree list --porcelain` output `text`, as
-/// branch and folder: not the first (the main worktree), nor one that is
-/// bare, has no branch checked out (detached) or whose folder is gone
-/// (prunable). Folders are as git printed them.
-pub fn porcelain(text: &str) -> Vec<(String, String)> {
+/// The worktrees in `git worktree list --porcelain` output `data` (with
+/// `-z` when `nul`), as branch and folder: not the first (the main
+/// worktree), nor one that is bare, has no branch checked out (detached)
+/// or whose folder is gone (prunable). Folders are as git printed them;
+/// one that is not UTF-8, or that git quoted (without `-z`, for a name
+/// with a newline or such in it), is left out rather than changed.
+pub fn porcelain(data: &[u8], nul: bool) -> Vec<(String, String)> {
+    let sep = if nul { 0 } else { b'\n' };
     let mut found = Vec::new();
-    for (i, block) in text.replace("\r\n", "\n").split("\n\n").enumerate() {
-        let mut path = None;
-        let mut branch = None;
-        let mut skip = i == 0;
-        for line in block.lines() {
-            if let Some(p) = line.strip_prefix("worktree ") {
-                path = Some(p.to_owned());
-            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
-                branch = Some(b.to_owned());
-            } else if line == "bare" || line == "detached" || line.starts_with("prunable") {
+    let mut first = true;
+    let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut skip = false;
+    let mut end = |path: &mut Option<String>,
+                   branch: &mut Option<String>,
+                   skip: &mut bool,
+                   first: &mut bool| {
+        if let (false, false, Some(p), Some(b)) = (*first, *skip, path.take(), branch.take()) {
+            found.push((b, p));
+        }
+        *path = None;
+        *branch = None;
+        *skip = false;
+        *first = false;
+    };
+    for field in data.split(|&b| b == sep) {
+        let field = if nul {
+            field
+        } else {
+            field.strip_suffix(b"\r").unwrap_or(field)
+        };
+        if field.is_empty() {
+            // A blank line ends an entry; so does the end of the output.
+            if path.is_some() || skip || branch.is_some() {
+                end(&mut path, &mut branch, &mut skip, &mut first);
+            }
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(field) else {
+            if field.starts_with(b"worktree ") || field.starts_with(b"branch ") {
                 skip = true;
             }
-        }
-        if let (false, Some(path), Some(branch)) = (skip, path, branch) {
-            found.push((branch, path));
+            continue;
+        };
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if path.is_some() {
+                // No blank line between them: a new entry all the same.
+                end(&mut path, &mut branch, &mut skip, &mut first);
+            }
+            if !nul && p.starts_with('"') {
+                skip = true;
+            }
+            path = Some(p.to_owned());
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            branch = Some(b.to_owned());
+        } else if line == "bare" || line == "detached" || line.starts_with("prunable") {
+            skip = true;
         }
     }
+    end(&mut path, &mut branch, &mut skip, &mut first);
     found
 }
 
@@ -367,26 +414,35 @@ pub fn porcelain(text: &str) -> Vec<(String, String)> {
 /// `err` mean. Only worktrees whose branch and folder FeroSSH can carry
 /// (see [`OPTION`]) are kept.
 pub fn parse_list(out: &[u8], err: &[u8]) -> Listed {
-    let text = String::from_utf8_lossy(out);
     let mark = format!("{MARK} ");
-    let Some(at) = text.lines().position(|l| l.starts_with(&mark)) else {
+    let mut answer = None;
+    let mut at = 0;
+    for line in out.split(|&b| b == b'\n') {
+        at += line.len() + 1;
+        if let Some(a) = line.strip_prefix(mark.as_bytes()) {
+            answer = Some(a.strip_suffix(b"\r").unwrap_or(a));
+            break;
+        }
+    }
+    let Some(answer) = answer else {
         return Listed::Failed(last_said(err));
     };
-    let answer = text.lines().nth(at).and_then(|l| l.strip_prefix(&mark));
-    match answer.map(|a| a.trim_end_matches('\r')) {
-        Some("nogit") => Listed::NoGit,
-        Some("nodir") => Listed::NoDir,
-        Some("norepo") => Listed::NoRepo,
-        Some("list") => {
-            let rest: Vec<&str> = text.lines().skip(at + 1).collect();
-            Listed::Found(
-                porcelain(&rest.join("\n"))
-                    .into_iter()
-                    .filter(|(b, p)| valid_branch(b) && valid_path(p))
-                    .map(|(branch, path)| Worktree { branch, path })
-                    .collect(),
-            )
-        }
+    let rest = out.get(at..).unwrap_or_default();
+    let found = |nul| {
+        Listed::Found(
+            porcelain(rest, nul)
+                .into_iter()
+                .filter(|(b, p)| valid_branch(b) && valid_path(p))
+                .map(|(branch, path)| Worktree { branch, path })
+                .collect(),
+        )
+    };
+    match answer {
+        b"nogit" => Listed::NoGit,
+        b"nodir" => Listed::NoDir,
+        b"norepo" => Listed::NoRepo,
+        b"listz" => found(true),
+        b"list" => found(false),
         _ => Listed::Failed(last_said(err)),
     }
 }
@@ -521,7 +577,7 @@ mod tests {
                     worktree /srv/app-d\nHEAD 4\ndetached\n\n\
                     worktree /srv/gone\nHEAD 5\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location\n";
         assert_eq!(
-            porcelain(text),
+            porcelain(text.as_bytes(), false),
             [
                 ("claude".to_owned(), "/srv/app-claude".to_owned()),
                 ("feature/x".to_owned(), "/srv/my app".to_owned())
@@ -553,6 +609,38 @@ mod tests {
             parse_list(b"", b"sh: 1: boom\n"),
             Listed::Failed("sh: 1: boom".into())
         );
+        // git failed after all: its error, not an empty list.
+        assert_eq!(
+            parse_list(
+                b"@ferossh-worktree failed\n",
+                b"fatal: not a git repository\n"
+            ),
+            Listed::Failed("fatal: not a git repository".into())
+        );
+        // With -z: a folder with a newline in it is whole, so left out;
+        // one with spaces stays; one that is not UTF-8 is left out, not
+        // changed.
+        let z = b"worktree /srv/app\0HEAD 1\0branch refs/heads/main\0\0\
+                  worktree /srv/a\nb\0HEAD 2\0branch refs/heads/nl\0\0\
+                  worktree /srv/my app\0HEAD 3\0branch refs/heads/sp\0\0\
+                  worktree /srv/\xff\0HEAD 4\0branch refs/heads/bad\0\0";
+        let mut out = b"@ferossh-worktree listz\n".to_vec();
+        out.extend_from_slice(z);
+        assert_eq!(
+            parse_list(&out, b""),
+            Listed::Found(vec![Worktree {
+                branch: "sp".into(),
+                path: "/srv/my app".into()
+            }])
+        );
+        // Without -z, a name git had to quote is left out too.
+        let mut out = b"@ferossh-worktree list\n".to_vec();
+        out.extend_from_slice(
+            b"worktree /srv/app\nbranch refs/heads/main\n\n\
+              worktree \"/srv/a\\nb\"\nbranch refs/heads/nl\n\n\
+              worktree /srv/\xff\nbranch refs/heads/bad\n",
+        );
+        assert_eq!(parse_list(&out, b""), Listed::Found(Vec::new()));
         assert_eq!(list_input(b"/a\nb"), None);
         assert_eq!(list_input(b"/a b").unwrap(), b"/a b\n");
     }
@@ -675,6 +763,12 @@ mod tests {
             .arg(String::from_utf8(command).unwrap())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -700,6 +794,12 @@ mod tests {
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .output()
             .unwrap();
         assert!(
@@ -785,10 +885,17 @@ mod tests {
             );
             parse_list(&out, &err)
         };
+        // One whose folder has a newline in it is left out.
+        let nl = root.join("nl\nhere");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "nl", nl.to_str().unwrap()],
+        );
         assert_eq!(
             list(&repo.join("src")),
             Listed::Found(vec![first.clone(), second.clone()])
         );
+        git(&repo, &["worktree", "remove", nl.to_str().unwrap()]);
         assert_eq!(list(&root), Listed::NoRepo);
         assert_eq!(list(&root.join("nope")), Listed::NoDir);
         // Not a repository, not a folder.

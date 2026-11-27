@@ -393,8 +393,21 @@ mod e2e {
         let repo = std::env::temp_dir().join(format!("ferossh-wsl-diff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(&repo).unwrap();
+        // Another repository's, from a git hook say: not this one's.
+        const GIT_LOCATION_VARS: [&str; 6] = [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ];
         let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            let mut git = std::process::Command::new("git");
+            for name in GIT_LOCATION_VARS {
+                git.env_remove(name);
+            }
+            let ok = git
                 .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
                 .arg(&repo)
                 .args(args)
@@ -413,8 +426,15 @@ mod e2e {
         let args = script_args("", &command);
         let at = args.iter().position(|a| a == "-e").unwrap();
         let input = crate::diff::input(repo.to_str().unwrap().as_bytes()).unwrap();
+        // `env -u` for each, then sh as wsl.exe would start it.
+        let mut env_args: Vec<String> = GIT_LOCATION_VARS
+            .iter()
+            .flat_map(|v| ["-u".to_owned(), (*v).to_owned()])
+            .collect();
+        env_args.push("/bin/sh".into());
+        env_args.extend(args[at + 2..].iter().cloned());
         let (out, err, code) =
-            crate::pipes::run_once_status(Path::new("/bin/sh"), &args[at + 2..], &input).unwrap();
+            crate::pipes::run_once_status(Path::new("/usr/bin/env"), &env_args, &input).unwrap();
         assert_eq!(code, Some(0), "{}", String::from_utf8_lossy(&err));
         match crate::diff::parse(&out) {
             crate::diff::Outcome::Changes(d) => {
