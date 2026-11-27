@@ -1778,6 +1778,10 @@ struct Window {
     workspace_waiting: workspaces::Waiting,
     /// A workspace's panes that open a tmux session once logged in.
     workspace_tmux: HashMap<PaneId, WorkspaceTmux>,
+    /// Gateway panes that attached tmux by themselves after a login,
+    /// from the host's profile: their list of other sessions is offered
+    /// only while you look at them, never popped up over other work.
+    tmux_login_pick: HashSet<PaneId>,
     /// What a workspace gave its panes besides their place: what they run
     /// once logged in, and that their logins may keep passwords.
     workspace_extra: HashMap<PaneId, WorkspaceExtra>,
@@ -3283,6 +3287,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 run_login: HashSet::new(),
                 workspace_waiting: workspaces::Waiting::default(),
                 workspace_tmux: HashMap::new(),
+                tmux_login_pick: HashSet::new(),
                 workspace_extra: HashMap::new(),
                 layout_owner: claim_last_layout(),
                 workspace_after: HashMap::new(),
@@ -4631,6 +4636,13 @@ impl Window {
                 | tmux::Action::ShowGateway
                 | tmux::Action::Structure => structure = true,
                 tmux::Action::Picker(names) => {
+                    if self.tmux_login_pick.remove(&gateway) {
+                        // SAFETY: plain query.
+                        let front = unsafe { GetForegroundWindow() } == self.hwnd;
+                        if !front || self.host_pane(self.focused_id()) != gateway {
+                            continue;
+                        }
+                    }
                     self.queued.push(Command::TmuxPicker { gateway, names });
                 }
                 tmux::Action::Crowded {
@@ -4915,6 +4927,10 @@ impl Window {
             self.workspace_tmux.remove(&id);
         }
         let mut shared = false;
+        // Only a first attach from the host's profile offers the host's
+        // other sessions: after a dropped connection or from a workspace
+        // the session to show is known.
+        let mut pick = false;
         let (name, rebuild) = match self.reattach.remove(&id) {
             Some((k, Some((name, on_shared)))) if k == key => {
                 shared = on_shared;
@@ -4924,7 +4940,10 @@ impl Window {
             _ => match self.workspace_tmux.get(&id) {
                 Some(w) => (w.name.clone(), w.rebuild.clone()),
                 None => match profile {
-                    Some(name) => (name, None),
+                    Some(name) => {
+                        pick = true;
+                        (name, None)
+                    }
                     None => return false,
                 },
             },
@@ -4960,7 +4979,11 @@ impl Window {
                 t.reattach_on_shared(&name);
             }
         }
-        self.attach_tmux(id, &name, false)
+        let pick = pick && !shared;
+        if pick {
+            self.tmux_login_pick.insert(id);
+        }
+        self.attach_tmux(id, &name, pick)
     }
 
     /// Types the `cd` to the directory of the pane a new tab or pane was
@@ -21025,6 +21048,7 @@ impl Window {
         }
         self.reattach.remove(&id);
         self.workspace_tmux.remove(&id);
+        self.tmux_login_pick.remove(&id);
         self.workspace_extra.remove(&id);
         self.workspace_after.remove(&id);
         self.workspace_waiting.forget(id);
