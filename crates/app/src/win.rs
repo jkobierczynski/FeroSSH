@@ -4451,6 +4451,22 @@ impl Window {
             .is_some_and(|p| p.send_all_keys)
     }
 
+    /// Drops a Send all keys toggle that pane `id` holds for another
+    /// connection, once it opens a new one: going back to the old one
+    /// later starts from that connection's profile again. A reconnect to
+    /// the same connection keeps it.
+    fn forget_other_all_keys(&mut self, id: PaneId) {
+        let host = self.host_pane(id);
+        let (identity, _) = self.all_keys_identity(host);
+        if self
+            .all_keys
+            .get(&host)
+            .is_some_and(|(was, _)| *was != identity)
+        {
+            self.all_keys.remove(&host);
+        }
+    }
+
     /// What pane `host` shows, for [`Self::sends_all_keys`]: its kind and
     /// connection (a toggle by hand holds only while that stays, across
     /// reconnects), and the profile it reads `SendAllKeys` from.
@@ -5457,6 +5473,7 @@ impl Window {
                 self.show(id, &text);
             }
         }
+        self.forget_other_all_keys(id);
         self.update_title();
         self.refresh(id);
     }
@@ -8790,6 +8807,7 @@ impl Window {
                 session: session.map(str::to_owned),
             };
         }
+        self.forget_other_all_keys(id);
         self.show(id, &text);
         self.start_log(id);
         if is_open && !self.start_script(id, &alias, false) {
@@ -9011,6 +9029,7 @@ impl Window {
         };
         p.host = Host::Ssh(Box::new(session));
         self.apply(id, effects);
+        self.forget_other_all_keys(id);
         self.update_title();
         self.refresh_chrome();
         self.refresh(id);
@@ -9052,6 +9071,7 @@ impl Window {
         let effects = session.start(clamp16(p.term.cols()), clamp16(p.term.rows()));
         p.host = Host::Telnet(Box::new(session));
         self.apply(id, effects);
+        self.forget_other_all_keys(id);
         self.update_title();
         self.refresh_chrome();
         self.refresh(id);
@@ -9135,6 +9155,7 @@ impl Window {
         };
         p.host = Host::Winrm(Box::new(session));
         self.apply(id, effects);
+        self.forget_other_all_keys(id);
         self.update_title();
         self.refresh_chrome();
         self.refresh(id);
