@@ -187,6 +187,10 @@ fn free(dir: &Path) -> Result<bool, PathBuf> {
     let mut probe = dir.as_os_str().to_owned();
     probe.push(".ferossh-in-use-check");
     let probe = PathBuf::from(probe);
+    // Gone already: `remove` says so.
+    if !dir.is_dir() {
+        return Ok(true);
+    }
     if probe.exists() || std::fs::rename(dir, &probe).is_err() {
         return Ok(false);
     }
@@ -201,8 +205,8 @@ fn free(dir: &Path) -> Result<bool, PathBuf> {
 
 /// [`remove`], once the programs of an agent that was just stopped let go
 /// of its folder (Windows does not wait for them, and cannot delete a
-/// folder one still works in), waiting at most `wait`. After that, git
-/// tries anyway and says why it could not.
+/// folder one still works in), waiting at most `wait`. When they still
+/// hold it then, git does not run (it would delete part of the folder).
 pub fn remove_when_free(program: &Path, w: &Worktree, wait: std::time::Duration) -> Removal {
     #[cfg(windows)]
     {
@@ -213,7 +217,14 @@ pub fn remove_when_free(program: &Path, w: &Worktree, wait: std::time::Duration)
                 Ok(false) if start.elapsed() < wait => {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
-                Ok(false) => break,
+                // git would delete what it can and stop half way.
+                Ok(false) => {
+                    return Removal::Failed(
+                        "a program still works in the folder or has a file in it open, so \
+                         nothing was removed; close it and try again"
+                            .to_owned(),
+                    );
+                }
                 Err(left) => {
                     return Removal::Failed(format!(
                         "Windows did not let FeroSSH give the folder its name back, so it \
@@ -392,5 +403,43 @@ mod tests {
             path: "/tmp".into(),
         };
         assert_eq!(remove(missing, &w), Removal::NoGit);
+    }
+}
+
+#[cfg(all(test, windows))]
+#[allow(clippy::unwrap_used)]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_is_free_only_once_nothing_holds_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("ferossh-free-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("held.txt"), b"x").unwrap();
+        // As a program working in it holds it: a handle to the folder
+        // that does not share delete (FILE_SHARE_READ | FILE_SHARE_WRITE,
+        // FILE_FLAG_BACKUP_SEMANTICS to open a folder).
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .custom_flags(0x0200_0000)
+            .open(&dir)
+            .unwrap();
+        assert_eq!(free(&dir), Ok(false));
+        assert!(dir.is_dir());
+        // Held past the wait: nothing runs, and the folder stays.
+        let w = Worktree {
+            branch: "claude".into(),
+            path: dir.to_string_lossy().into_owned(),
+        };
+        let got = remove_when_free(Path::new("git"), &w, std::time::Duration::from_millis(300));
+        assert!(matches!(got, Removal::Failed(_)), "{got:?}");
+        assert!(dir.join("held.txt").is_file());
+        drop(held);
+        assert_eq!(free(&dir), Ok(true));
+        assert!(dir.join("held.txt").is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
