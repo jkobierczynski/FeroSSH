@@ -595,6 +595,9 @@ mod cmd {
     pub const SAVE_SNIPPET: u32 = 506;
     pub const RECORD_SNIPPET: u32 = 507;
     pub const HIGHLIGHT: u32 = 508;
+    /// Session > Send all keys to the host: for the focused pane's
+    /// connection, until it closes (`SendAllKeys` in its profile).
+    pub const ALL_KEYS: u32 = 530;
     pub const STOP_AT: u32 = 509;
     pub const SCROLL_PAGE_UP: u32 = 510;
     pub const SCROLL_PAGE_DOWN: u32 = 511;
@@ -1782,6 +1785,10 @@ struct Window {
     /// from the host's profile: their list of other sessions is offered
     /// only while you look at them, never popped up over other work.
     tmux_login_pick: HashSet<PaneId>,
+    /// Session > Send all keys to the host, turned on or off by hand for
+    /// a pane's connection (by the pane with the session: a tmux pane's
+    /// gateway); the profile's `SendAllKeys` otherwise.
+    all_keys: HashMap<PaneId, bool>,
     /// What a workspace gave its panes besides their place: what they run
     /// once logged in, and that their logins may keep passwords.
     workspace_extra: HashMap<PaneId, WorkspaceExtra>,
@@ -3288,6 +3295,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 workspace_waiting: workspaces::Waiting::default(),
                 workspace_tmux: HashMap::new(),
                 tmux_login_pick: HashSet::new(),
+                all_keys: HashMap::new(),
                 workspace_extra: HashMap::new(),
                 layout_owner: claim_last_layout(),
                 workspace_after: HashMap::new(),
@@ -3766,6 +3774,7 @@ fn build_menu() -> Result<HMENU> {
             "Show i&mages the host prints (Sixel, kitty, iTerm2)",
         )?;
         item(session, cmd::HIGHLIGHT, "Hi&ghlight keywords")?;
+        item(session, cmd::ALL_KEYS, "Send all keys to the hos&t")?;
         separator(session)?;
         item(
             session,
@@ -4423,6 +4432,25 @@ impl Window {
     /// pane, else the pane itself.
     fn host_pane(&self, id: PaneId) -> PaneId {
         self.panes.get(&id).and_then(Pane::gateway).unwrap_or(id)
+    }
+
+    /// Whether every key typed in pane `id` goes to the host, FeroSSH's
+    /// shortcuts too (Session > Send all keys to the host, or
+    /// `SendAllKeys yes` in the connection's profile).
+    fn sends_all_keys(&self, id: PaneId) -> bool {
+        let host = self.host_pane(id);
+        if let Some(on) = self.all_keys.get(&host) {
+            return *on;
+        }
+        let alias = match self.panes.get(&host).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => Some(s.target.alias.as_str()),
+            Some(Host::Telnet(s)) => Some(s.target.alias.as_str()),
+            Some(Host::Serial { session, .. }) => session.as_deref(),
+            _ => None,
+        };
+        alias
+            .and_then(|a| self.settings.profile(a))
+            .is_some_and(|p| p.send_all_keys)
     }
 
     /// A tmux pane in tmux layout, whose place tmux decides: it does not
@@ -15991,7 +16019,7 @@ impl Window {
     }
 
     fn tmux_keys_of(&self, id: PaneId) -> Option<tmux_keys::Keys> {
-        if !self.settings.tmux_keys {
+        if !self.settings.tmux_keys || self.sends_all_keys(id) {
             return None;
         }
         let p = self.panes.get(&id)?;
@@ -16256,6 +16284,26 @@ impl Window {
         if mods.alt && vk == VK_F4 {
             return KeyOutcome::Default;
         }
+        // Send all keys to the host: none of FeroSSH's shortcuts but the
+        // one that turns it off, for programs that use them (Zellij's
+        // Alt+arrows, tmux run by hand). The menus still work.
+        if !self.side.focused
+            && self.sends_all_keys(self.focused_id())
+            && self
+                .panes
+                .get(&self.focused_id())
+                .is_some_and(|p| !p.term.search_active())
+        {
+            if self.shortcut_for(vk, mods) == Some(cmd::ALL_KEYS) {
+                drop_pending_char(self.hwnd);
+                return if held {
+                    KeyOutcome::Handled
+                } else {
+                    KeyOutcome::Run(Command::Id(cmd::ALL_KEYS))
+                };
+            }
+            return self.key_to_host(vk, mods);
+        }
         // F11: full screen, before the tmux prefix and the panes, so it
         // works in a side pane, the search bar and a remote desktop too.
         // Held down, it does not flip back and forth.
@@ -16336,6 +16384,14 @@ impl Window {
             drop_pending_char(self.hwnd);
             return KeyOutcome::Handled;
         }
+        self.key_to_host(vk, mods)
+    }
+
+    /// A key that no shortcut took, for the focused pane: the terminal's
+    /// keys and control codes go to the host (and broadcast); anything
+    /// else comes as a character (WM_CHAR).
+    fn key_to_host(&mut self, vk: VIRTUAL_KEY, mods: Mods) -> KeyOutcome {
+        let id = self.focused_id();
         if let Some(key) = terminal_key(vk) {
             drop_pending_char(self.hwnd);
             let typed = match key {
@@ -21049,6 +21105,7 @@ impl Window {
         self.reattach.remove(&id);
         self.workspace_tmux.remove(&id);
         self.tmux_login_pick.remove(&id);
+        self.all_keys.remove(&id);
         self.workspace_extra.remove(&id);
         self.workspace_after.remove(&id);
         self.workspace_waiting.forget(id);
@@ -22819,6 +22876,13 @@ impl Window {
                 self.refresh(pane);
             }
             cmd::HIGHLIGHT => self.toggle_highlight(),
+            cmd::ALL_KEYS => {
+                // Nothing is written into the pane: a full-screen program
+                // owns it. The menu's tick shows it.
+                let host = self.host_pane(pane);
+                let on = !self.sends_all_keys(pane);
+                self.all_keys.insert(host, on);
+            }
             cmd::CLEAR_SCROLLBACK => {
                 self.panes.get_mut(&pane)?.term.clear_scrollback();
                 self.refresh(pane);
@@ -23799,6 +23863,7 @@ impl Window {
                 (cmd::AGENT_AUDIT, s.agent_audit),
                 (cmd::ANSWER_TOASTS, s.answer_from_notification),
                 (cmd::HIGHLIGHT, s.highlight),
+                (cmd::ALL_KEYS, self.sends_all_keys(self.focused_id())),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
                 (cmd::TOOLS_RAIL, s.tools_rail),

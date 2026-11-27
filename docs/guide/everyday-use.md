@@ -572,6 +572,10 @@ Ctrl+Shift+A (Tools > Command palette) opens a search box over every menu item, 
 
 Settings > Key bindings lists every action with its shortcuts and its default ones. Select one and press Change (or Enter), then the keys you want; Add key gives it a second one, No shortcut takes them away, Reset to default puts its own back, and Reset all every action's. A key another action has moves after asking, keys that would stop typing are refused, and keys that programs in the terminal use (Ctrl+C, Alt+B, the tmux prefix) need a yes first. Details are in the [menu reference](menus.md#key-bindings).
 
+### Sending every key to the host
+
+Tab and pane keys only work once there is more than one tab or pane, so with one pane a program gets Alt+arrows and Ctrl+Tab anyway. When the program in a split pane needs them too, such as Zellij (whose own keys are Alt+arrows, Ctrl+P, Ctrl+T and the like) or tmux and screen started by hand, tick Session > Send all keys to the host. Every key you type in that connection's panes then goes to the host: FeroSSH's shortcuts, F11 full screen, script hotkeys, suggestion keys and FeroSSH's tmux keybindings all stand aside. The menus still work with the mouse, and so does the key you give Send all keys to the host in Settings > Key bindings (it has none until you do), which turns it off again. It holds for the connection until its tab closes. To have it on every time, switch **All keys** on in the connection form's Look section, or put `SendAllKeys yes` in the profile.
+
 ## Broadcast input
 
 Window > Broadcast input to this tab's panes (Ctrl+Shift+B) sends what you type and paste in the focused pane to the other panes of the tab too; Broadcast input to all tabs reaches every pane. Each pane receiving it is framed in amber and the window title says broadcast is on. Window > Leave this pane out of broadcast keeps one pane to itself.

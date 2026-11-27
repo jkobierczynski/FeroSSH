@@ -93,6 +93,8 @@
 //!     WinrmHttps yes
 //! Profile db1
 //!     SystemInfo yes
+//! Profile zellij-box
+//!     SendAllKeys yes
 //! Profile laptop-roaming
 //!     Type mosh
 //!     MoshServer ~/bin/mosh-server
@@ -248,6 +250,10 @@ pub struct Profile {
     /// After an SSH login, read the server's OS and kernel (`uname`,
     /// `/etc/os-release`) for the inventory (`SystemInfo yes`).
     pub system_info: bool,
+    /// Every key goes to the host, FeroSSH's own shortcuts too (`SendAllKeys
+    /// yes`): for Zellij, or tmux and screen run by hand, whose keys
+    /// FeroSSH would otherwise take (Alt+arrows, Ctrl+Tab).
+    pub send_all_keys: bool,
     /// The connection's own tags (`Tags prod web eu`), on top of the one
     /// ssh_config's `Tag` may give it: searched for in the connection
     /// manager and matched by the colour theme rules. See [`parse_tags`].
@@ -675,6 +681,7 @@ impl Profile {
             && !self.winrm_https
             && !self.winrm_ntlm
             && !self.system_info
+            && !self.send_all_keys
             && self.tags.is_empty()
             && self.credential.is_none()
     }
@@ -1964,6 +1971,10 @@ impl Settings {
                                 p.system_info =
                                     first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
                             }
+                            "sendallkeys" => {
+                                p.send_all_keys =
+                                    first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+                            }
                             "winrmhttps" => {
                                 p.winrm_https =
                                     first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
@@ -2445,6 +2456,9 @@ impl Settings {
             }
             if p.system_info {
                 let _ = writeln!(out, "    SystemInfo yes");
+            }
+            if p.send_all_keys {
+                let _ = writeln!(out, "    SendAllKeys yes");
             }
             let tags: Vec<&str> = p
                 .tags
@@ -3060,6 +3074,15 @@ Profile lab
         let back = Settings::parse(&s.to_text());
         assert_eq!(back.profile("web").unwrap().tags, web.tags);
         assert!(s.to_text().contains("    Tags prod web eu de\n"));
+    }
+
+    #[test]
+    fn send_all_keys_round_trips() {
+        let s = Settings::parse("Profile z\n    SendAllKeys yes\nProfile y\n    SendAllKeys no\n");
+        assert!(s.profile("z").unwrap().send_all_keys);
+        assert!(s.profile("y").is_none_or(|p| !p.send_all_keys));
+        assert!(s.to_text().contains("    SendAllKeys yes\n"));
+        assert!(Settings::parse(&s.to_text()).profile("z").unwrap().send_all_keys);
     }
 
     #[test]
