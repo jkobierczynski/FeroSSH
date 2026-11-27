@@ -1196,3 +1196,193 @@ fn real_tmux_reattach_shows_nano() {
     assert!(screen.contains("GNU nano"), "{screen}");
     assert!(!screen.contains("SHELL"), "{screen}");
 }
+
+/// A window linked into another session too: closing its pane here takes
+/// it out of this session only. A client of a grouped session counts as
+/// another client, since a window closed there closes for it too.
+#[test]
+fn real_tmux_linked_windows_and_session_groups() {
+    if !tmux_available() || version() < MIN_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-linked-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Tmux);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    a.until("the first count", |h| !h.tmux.maybe_shared());
+    let first = a.ws.all_panes()[0];
+    let actions = a.tmux.new_tab(first);
+    a.apply(actions);
+    a.until("the second tab", |h| h.shown() == 2);
+    let second = a.ws.focused();
+    let window = tmux_cmd(
+        &server,
+        &["display-message", "-p", "-t", "e2e:1", "#{window_id}"],
+    );
+    tmux_cmd(&server, &["new-session", "-d", "-s", "other"]);
+    tmux_cmd(&server, &["link-window", "-s", &window, "-t", "other:"]);
+
+    let actions = a.tmux.close(second);
+    a.apply(actions);
+    a.until("the pane gone here", |h| h.shown() == 1);
+    let others = tmux_cmd(
+        &server,
+        &["list-windows", "-t", "other", "-F", "#{window_id}"],
+    );
+    assert!(others.lines().any(|l| l == window), "{others}");
+    let ours = tmux_cmd(
+        &server,
+        &["list-windows", "-t", "e2e", "-F", "#{window_id}"],
+    );
+    assert!(!ours.lines().any(|l| l == window), "{ours}");
+
+    // Our first window linked into "other" and taken out of it there:
+    // tmux tells this client %window-close, yet the pane stays here.
+    let kept = tmux_cmd(
+        &server,
+        &["display-message", "-p", "-t", "e2e:0", "#{window_id}"],
+    );
+    tmux_cmd(&server, &["link-window", "-s", &kept, "-t", "other:"]);
+    tmux_cmd(&server, &["unlink-window", "-t", &format!("other:{kept}")]);
+    let start = Instant::now();
+    a.until("a moment", |_| start.elapsed() > Duration::from_millis(500));
+    assert_eq!(a.shown(), 1);
+    assert!(a.panes.contains_key(&first));
+
+    // Another client on a session grouped with this one.
+    tmux_cmd(
+        &server,
+        &["new-session", "-d", "-s", "grouped", "-t", "e2e"],
+    );
+    let mut b = Harness::start(
+        &server,
+        Mode::Tmux,
+        &["attach-session", "-t", "grouped"],
+        |_| {},
+    );
+    b.until("the grouped client's pane", |h| !h.panes.is_empty());
+    a.until("the grouped client counted", |h| {
+        h.tmux.others_attached() == 1
+    });
+}
+
+/// A zoom made in another client shows here and stays: the next layout
+/// sync leaves it. Prefix `z` zooms in tmux, and moving to another pane
+/// ends the zoom there too.
+#[test]
+fn real_tmux_zoom_is_followed_not_undone() {
+    if !tmux_available() || version() < MIN_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-zoom-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Tmux);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    let actions = a.tmux.split(first, Dir::Right);
+    a.apply(actions);
+    a.until("the split", |h| h.shown() == 2);
+    let zoomed = |s: &Server| {
+        tmux_cmd(
+            s,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "e2e",
+                "#{window_zoomed_flag}",
+            ],
+        ) == "1"
+    };
+
+    // Another client zooms the first pane.
+    let target = format!("%{}", a.tmux.pane_of(first).unwrap());
+    tmux_cmd(&server, &["resize-pane", "-Z", "-t", &target]);
+    a.until("the zoom here", |h| h.ws.is_zoomed(first));
+    let cells = |n: Native| if n == first { (80, 24) } else { (40, 24) };
+    a.sizes(cells);
+    a.sizes(cells);
+    let start = Instant::now();
+    a.until("a moment", |_| start.elapsed() > Duration::from_millis(300));
+    assert!(zoomed(&server), "a layout sync undid the zoom");
+
+    // Unzoomed there: here too.
+    tmux_cmd(&server, &["resize-pane", "-Z", "-t", &target]);
+    a.until("the zoom ended here", |h| !h.ws.is_zoomed(first));
+
+    // Prefix z zooms in tmux, and the tab follows.
+    let actions = a.tmux.zoom(first);
+    a.apply(actions);
+    a.until("z", |h| h.ws.is_zoomed(first));
+    assert!(zoomed(&server));
+    // Another pane gets the focus: the zoom ends in tmux too.
+    let other = a.ws.all_panes().into_iter().find(|p| *p != first).unwrap();
+    assert!(a.ws.focus(other));
+    a.sizes(|n| if n == other { (40, 24) } else { (39, 24) });
+    a.until("the zoom ended in tmux", |_| !zoomed(&server));
+}
+
+#[test]
+fn real_tmux_two_ferossh_clients_share_the_splits() {
+    // Following another client's layout needs `refresh-client -B` (3.2)
+    // and FeroSSH's layout (3.3).
+    if !tmux_available() || version() < WINDOW_SIZES_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-follow-{}", std::process::id()),
+    };
+    let layout = || {
+        tmux_cmd(
+            &server,
+            &["show-options", "-v", "-t", "e2e", "@ferossh-layout"],
+        )
+    };
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("a's pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    a.save(|_| Look::default());
+    let mut b = Harness::attach(&server, Mode::Ferossh);
+    b.until("b's pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    b.save(|_| Look::default());
+
+    // A splits: B shows the new window beside the first, not as a tab.
+    let first = a.ws.focused();
+    let actions = a.tmux.split(first, Dir::Right);
+    a.apply(actions);
+    a.until("a's split", |h| h.shown() == 2);
+    a.save(|_| Look::default());
+    let written = layout();
+    b.until("the split in b", |h| h.shown() == 2 && h.ws.tabs.len() == 1);
+    b.save(|_| Look::default());
+    assert_eq!(layout(), written, "b wrote its own view over a's");
+
+    // B splits the other way: A follows.
+    let actions = b.tmux.split(b.ws.focused(), Dir::Down);
+    b.apply(actions);
+    b.until("b's split", |h| h.shown() == 3);
+    b.save(|_| Look::default());
+    a.until("the split in a", |h| h.shown() == 3 && h.ws.tabs.len() == 1);
+    a.save(|_| Look::default());
+    let settled = layout();
+    // Neither writes again: they do not take turns.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(2500) {
+        for h in [&mut a, &mut b] {
+            let tick = Instant::now();
+            h.until("a moment", |_| tick.elapsed() > Duration::from_millis(200));
+            h.save(|_| Look::default());
+        }
+    }
+    assert_eq!(layout(), settled);
+    assert_eq!(a.ws.tabs.len(), 1);
+    assert_eq!(b.ws.tabs.len(), 1);
+
+    // A new tab in A stays a tab in B.
+    let actions = a.tmux.new_tab(a.ws.focused());
+    a.apply(actions);
+    a.until("a's tab", |h| h.ws.tabs.len() == 2);
+    a.save(|_| Look::default());
+    b.until("the tab in b", |h| h.shown() == 4 && h.ws.tabs.len() == 2);
+}

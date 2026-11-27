@@ -4411,12 +4411,16 @@ impl Window {
     }
 
     /// The panes of the active tab, in layout order.
+    /// The panes of the active tab that show (only the zoomed one while
+    /// a pane is zoomed), in layout order.
     fn visible_ids(&self) -> Vec<PaneId> {
-        self.ws.tab().map(|t| t.root.panes()).unwrap_or_default()
+        self.ws.tab().map(|t| self.ws.shown(t)).unwrap_or_default()
     }
 
     fn is_visible(&self, id: PaneId) -> bool {
-        self.ws.tab().is_some_and(|t| t.root.contains(id))
+        self.ws
+            .tab()
+            .is_some_and(|t| self.ws.shown(t).contains(&id))
     }
 
     /// Whether `id` shows a focused cursor.
@@ -11978,7 +11982,8 @@ impl Window {
         broadcast::targets(
             self.broadcast,
             id,
-            &self.visible_ids(),
+            // A zoomed tab's unseen panes still get it, as in tmux.
+            &self.ws.tab().map(|t| t.root.panes()).unwrap_or_default(),
             &self.ws.all_panes(),
             |p| self.panes.get(&p).is_none_or(|p| p.no_broadcast),
             |p| self.takes_broadcast(p),
@@ -15651,7 +15656,7 @@ impl Window {
             .ws
             .tabs
             .iter()
-            .flat_map(|t| t.root.layout(self.areas.panes, g))
+            .flat_map(|t| self.ws.placed(t, self.areas.panes, g))
             .collect();
         for (id, rect) in placed {
             let Some(p) = self.panes.get_mut(&id) else {
@@ -15756,10 +15761,10 @@ impl Window {
         let Some(tab) = self.ws.tab() else {
             return out;
         };
-        for d in tab.root.dividers(self.areas.panes, g) {
+        for d in self.ws.dividers(tab, self.areas.panes, g) {
             out.push((pixel(d.rect), line));
         }
-        let split = tab.root.panes().len() > 1;
+        let split = self.ws.shown(tab).len() > 1;
         let receivers = self.broadcast_targets(tab.focus);
         if !receivers.is_empty() {
             // Every pane that gets the typing, the focused one too, is
@@ -16123,6 +16128,23 @@ impl Window {
 
     /// Whether pane `id` is a pane of an open tmux session (not a local
     /// shell using the tmux keybindings).
+    /// tmux's prefix `z`: pane `id` fills its tab, or the tab's zoom ends.
+    /// In tmux layout tmux zooms it (its windows are the tabs) and the tab
+    /// follows; elsewhere the window zooms the pane on its own.
+    fn zoom_pane(&mut self, id: PaneId) {
+        if let Some(g) = self.panes.get(&id).and_then(Pane::gateway)
+            && let Some(t) = self.tmux.get_mut(&g).filter(|t| t.zooms_in_tmux())
+        {
+            let actions = t.zoom(id);
+            self.run_tmux(g, actions);
+            return;
+        }
+        let on = !self.ws.is_zoomed(id);
+        if self.ws.set_zoom(id, on) {
+            self.after_structure_change();
+        }
+    }
+
     fn in_tmux(&self, id: PaneId) -> bool {
         self.panes
             .get(&id)
@@ -16256,6 +16278,10 @@ impl Window {
                 })
             }
             TmuxKey::BreakPane => run(cmd::PANE_TO_TAB),
+            TmuxKey::Zoom => {
+                self.zoom_pane(id);
+                None
+            }
             // Outside tmux there is no session to leave or pick.
             TmuxKey::Detach | TmuxKey::ChooseSession if !self.in_tmux(id) => None,
             TmuxKey::Detach => run(cmd::TMUX_DETACH),
@@ -17164,7 +17190,7 @@ impl Window {
                 };
                 let g = gap(self.dpi);
                 let to = self.ws.tabs.get(t).and_then(|tab| {
-                    layout::neighbour(&tab.root.layout(self.areas.panes, g), from, dir)
+                    layout::neighbour(&self.ws.placed(tab, self.areas.panes, g), from, dir)
                 });
                 (to, format!("there is no pane {d} of this one"))
             }
@@ -21370,7 +21396,7 @@ impl Window {
             return Spot::Strip(col);
         }
         if let Some(tab) = self.ws.tab() {
-            for d in tab.root.dividers(self.areas.panes, gap(self.dpi)) {
+            for d in self.ws.dividers(tab, self.areas.panes, gap(self.dpi)) {
                 let hit = match d.axis {
                     Axis::Row => {
                         Rect::new(d.rect.x - grab, d.rect.y, d.rect.w + 2 * grab, d.rect.h)
@@ -21383,7 +21409,7 @@ impl Window {
                     return Spot::Divider(d);
                 }
             }
-            for id in tab.root.panes() {
+            for id in self.ws.shown(tab) {
                 if self.panes.get(&id).is_some_and(|p| p.rect.contains(x, y)) {
                     return Spot::Pane(id);
                 }
@@ -22630,7 +22656,7 @@ impl Window {
                 let dir = DIRS.get((id - cmd::FOCUS) as usize).copied()?;
                 let g = gap(self.dpi);
                 let next = self.ws.tab().and_then(|t| {
-                    layout::neighbour(&t.root.layout(self.areas.panes, g), t.focus, dir)
+                    layout::neighbour(&self.ws.placed(t, self.areas.panes, g), t.focus, dir)
                 });
                 if let Some(next) = next {
                     self.focus_pane(next);
