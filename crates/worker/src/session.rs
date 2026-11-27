@@ -54,6 +54,15 @@ use crate::zmodem::{self, Zmodem, sleep_until};
 /// Password and keyboard-interactive rounds, like `NumberOfPasswordPrompts`.
 const MAX_ATTEMPTS: usize = 3;
 const TERM: &str = "xterm-256color";
+
+/// `COLORTERM=truecolor`, sent with a terminal so programs on the host use
+/// 24-bit colour instead of falling back to 256 colours. sshd passes it on
+/// only when its `AcceptEnv` allows `COLORTERM` (Debian's default
+/// `AcceptEnv LANG LC_*` does not); otherwise it is ignored like any other
+/// variable. A `SetEnv COLORTERM=...` of the user's own wins.
+fn colorterm(pty: bool, env: &[(String, String)]) -> Option<(&'static str, &'static str)> {
+    (pty && !env.iter().any(|(name, _)| name == "COLORTERM")).then_some(("COLORTERM", "truecolor"))
+}
 const CLIENT_ID: &str = "SSH-2.0-FeroSSH";
 const TERRAPIN: &str = "The server has no strict key exchange, so its ChaCha20-Poly1305 and EtM \
      MACs are open to the Terrapin attack, and it offers nothing else FeroSSH allows. Update \
@@ -1778,6 +1787,9 @@ async fn pump(
             .set_env(false, name.as_str(), value.as_str())
             .await?;
     }
+    if let Some((name, value)) = colorterm(ctx.options.pty, &ctx.options.env) {
+        channel.set_env(false, name, value).await?;
+    }
     if ctx.options.agent
         && let Some(f) = &ctx.forwards
     {
@@ -2462,5 +2474,15 @@ mod tests {
         assert_eq!(data.get(..2), Some(&b"ab"[..]));
         assert_eq!(data.len(), 2 + 4 + sig.len());
         assert_eq!(sig_algorithm(b"\0\0\0\x09short"), None);
+    }
+
+    #[test]
+    fn colorterm_only_with_a_terminal_and_not_over_the_users_own() {
+        assert_eq!(colorterm(true, &[]), Some(("COLORTERM", "truecolor")));
+        assert_eq!(colorterm(false, &[]), None);
+        let own = vec![("COLORTERM".to_owned(), "24bit".to_owned())];
+        assert_eq!(colorterm(true, &own), None);
+        let other = vec![("LANG".to_owned(), "C".to_owned())];
+        assert!(colorterm(true, &other).is_some());
     }
 }
