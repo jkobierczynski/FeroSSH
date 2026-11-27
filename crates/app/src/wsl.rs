@@ -65,6 +65,24 @@ pub fn shell_command(distro: &str) -> String {
     }
 }
 
+/// [`shell_command`] in Linux folder `dir`, when it is a full path that
+/// fits in a Windows command line in quotes; in the home folder otherwise.
+pub fn shell_command_in(distro: &str, dir: Option<&str>) -> String {
+    let base = shell_command(distro);
+    let Some(dir) = dir.filter(|d| {
+        d.starts_with('/')
+            && !d.ends_with('\\')
+            && !d.contains('"')
+            && !d.chars().any(char::is_control)
+    }) else {
+        return base;
+    };
+    match base.strip_suffix(" --cd ~") {
+        Some(start) => format!("{start} --cd \"{dir}\""),
+        None => base,
+    }
+}
+
 /// The label of a WSL pane, its tmux panes and its agents' host.
 pub fn label(distro: &str) -> String {
     if distro.is_empty() {
@@ -289,6 +307,18 @@ mod tests {
     fn shell_commands() {
         assert_eq!(shell_command("Ubuntu"), "wsl.exe -d Ubuntu --cd ~");
         assert_eq!(shell_command(""), "wsl.exe --cd ~");
+        assert_eq!(
+            shell_command_in("Ubuntu", Some("/home/me/my project")),
+            "wsl.exe -d Ubuntu --cd \"/home/me/my project\""
+        );
+        assert_eq!(shell_command_in("", Some("/srv")), "wsl.exe --cd \"/srv\"");
+        for odd in ["project", "/a\"b", "/a\\", "/a\nb"] {
+            assert_eq!(
+                shell_command_in("Ubuntu", Some(odd)),
+                "wsl.exe -d Ubuntu --cd ~"
+            );
+        }
+        assert_eq!(shell_command_in("Ubuntu", None), "wsl.exe -d Ubuntu --cd ~");
         assert_eq!(shell_command("a b"), "wsl.exe --cd ~");
         assert_eq!(label("Ubuntu"), "WSL Ubuntu");
         assert_eq!(label(""), "WSL");
@@ -358,7 +388,10 @@ mod e2e {
     /// runs it in the distro.
     fn spawn(socket: &str, before: Option<&str>) -> PipeChild {
         let script = gateway_script(before, "agents");
-        let wrapped = format!("export TMUX_TMPDIR={socket}; unset TMUX; {script}");
+        let wrapped = format!(
+            "export TMUX_TMPDIR={}; unset TMUX; {script}",
+            sh_quote(socket)
+        );
         PipeChild::spawn(Path::new("/bin/sh"), &["-c".into(), wrapped], || {}).unwrap()
     }
 

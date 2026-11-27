@@ -28,6 +28,16 @@ fn said(err: &[u8]) -> String {
         .collect()
 }
 
+/// Environment variables that tell git which repository to use.
+const GIT_LOCATION_VARS: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
 struct Git<'a> {
     program: &'a Path,
 }
@@ -47,6 +57,11 @@ impl Git<'_> {
             .args(args)
             .stdin(Stdio::null())
             .env("GIT_TERMINAL_PROMPT", "0");
+        // A FeroSSH started from a git hook or a shell that set these
+        // would point git at another repository than `dir`.
+        for name in GIT_LOCATION_VARS {
+            command.env_remove(name);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -163,6 +178,58 @@ pub fn add(program: &Path, dir: &Path, base: &str) -> Added {
     }
 }
 
+/// Whether no program works in folder `dir` or has a file in it open, so
+/// Windows lets it be deleted: renaming it fails while one does. It is
+/// renamed next to itself and straight back. `Err` with where it is when
+/// it could not be renamed back.
+#[cfg(windows)]
+fn free(dir: &Path) -> Result<bool, PathBuf> {
+    let mut probe = dir.as_os_str().to_owned();
+    probe.push(".ferossh-in-use-check");
+    let probe = PathBuf::from(probe);
+    if probe.exists() || std::fs::rename(dir, &probe).is_err() {
+        return Ok(false);
+    }
+    for _ in 0..50 {
+        if std::fs::rename(&probe, dir).is_ok() {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(probe)
+}
+
+/// [`remove`], once the programs of an agent that was just stopped let go
+/// of its folder (Windows does not wait for them, and cannot delete a
+/// folder one still works in), waiting at most `wait`. After that, git
+/// tries anyway and says why it could not.
+pub fn remove_when_free(program: &Path, w: &Worktree, wait: std::time::Duration) -> Removal {
+    #[cfg(windows)]
+    {
+        let start = std::time::Instant::now();
+        loop {
+            match free(Path::new(&w.path)) {
+                Ok(true) => break,
+                Ok(false) if start.elapsed() < wait => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Ok(false) => break,
+                Err(left) => {
+                    return Removal::Failed(format!(
+                        "Windows did not let FeroSSH give the folder its name back, so it \
+                         is now {}: rename it back to {}",
+                        crate::ssh::sanitize_line(&left.to_string_lossy()),
+                        crate::ssh::sanitize_line(&w.path)
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = wait;
+    remove(program, w)
+}
+
 /// Removes agent worktree `w` with git `program`, as [`crate::worktree::
 /// remove_command`] does on a server.
 pub fn remove(program: &Path, w: &Worktree) -> Removal {
@@ -231,7 +298,11 @@ mod tests {
     }
 
     fn sh(dir: &Path, script: &str) {
-        let s = Command::new("sh")
+        let mut command = Command::new("sh");
+        for name in GIT_LOCATION_VARS {
+            command.env_remove(name);
+        }
+        let s = command
             .arg("-c")
             .arg(script)
             .current_dir(dir)
