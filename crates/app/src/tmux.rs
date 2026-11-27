@@ -2027,7 +2027,8 @@ impl Tmux {
                 // An empty name may come without its space.
                 let (auto, name) = reply.split_once(' ').unwrap_or((reply.as_str(), ""));
                 let name = match auto {
-                    "0" if ok && !name.is_empty() => Some(name.to_owned()),
+                    // `rename-window ''`: no name, and none from tmux either.
+                    "0" if ok => (!name.is_empty()).then(|| name.to_owned()),
                     "1" if ok => None,
                     _ => return,
                 };
@@ -4315,6 +4316,16 @@ mod tests {
         // Named after its program again: the tab's own title.
         t.feed(&mut ws, b"%window-renamed @1 bash\n");
         let a = t.feed(&mut ws, &reply(8, &["1 bash".into()]));
+        assert_eq!(
+            a,
+            [Action::Named {
+                natives: vec![native],
+                name: None
+            }]
+        );
+        // An empty name given clears the tab's name too.
+        t.feed(&mut ws, b"%window-renamed @1 \n");
+        let a = t.feed(&mut ws, &reply(9, &["0 ".into()]));
         assert_eq!(
             a,
             [Action::Named {
