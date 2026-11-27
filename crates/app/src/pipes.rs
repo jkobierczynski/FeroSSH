@@ -167,6 +167,15 @@ pub fn run_once(
     args: &[String],
     input: &[u8],
 ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    run_once_status(program, args, input).map(|(out, err, _)| (out, err))
+}
+
+/// [`run_once`], with the exit code too (when the program had one).
+pub fn run_once_status(
+    program: &Path,
+    args: &[String],
+    input: &[u8],
+) -> std::io::Result<(Vec<u8>, Vec<u8>, Option<i32>)> {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -184,7 +193,7 @@ pub fn run_once(
         let _ = stdin.write_all(input);
     }
     let out = child.wait_with_output()?;
-    Ok((out.stdout, out.stderr))
+    Ok((out.stdout, out.stderr, out.status.code()))
 }
 
 fn spawn_reader(
