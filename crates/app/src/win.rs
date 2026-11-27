@@ -823,6 +823,10 @@ struct WslGateway {
     session: String,
     /// `wsl.exe` running tmux; `None` once it ended.
     child: Option<crate::pipes::PipeChild>,
+    /// The folder and script it was started with to run before tmux (an
+    /// agent's start), until tmux ran: Enter runs them again then, as when
+    /// tmux was not installed yet.
+    pending: Option<(Option<String>, String)>,
 }
 
 enum Host {
@@ -1114,6 +1118,8 @@ struct Pane {
     /// The coding agent a local tab was opened for (Session > Coding
     /// agents from a local shell), by name; tmux panes keep theirs in tmux.
     local_agent: Option<String>,
+    /// The git worktree of its own that a local agent tab was opened in.
+    local_worktree: Option<crate::worktree::Worktree>,
     /// Session > Coding agents > Keep an audit trail turned this pane's
     /// logging on, and started its recording: both end with the agent's
     /// connection, while what the user turned on stays.
@@ -1123,6 +1129,9 @@ struct Pane {
     /// local agent tab finished), and when; later commands in its
     /// PowerShell do not change it.
     agent_end: Option<(bool, Instant)>,
+    /// Counts the hosts this pane had: a job started for one host does not
+    /// act on the next.
+    host_gen: u64,
     /// Spaces out this pane's Windows notifications.
     throttle: crate::attention::Throttle,
     /// The remote working directory the shell last reported (OSC 7), or
@@ -1606,6 +1615,8 @@ struct Window {
     /// git worktree scripts of Session > Coding agents running, by their
     /// exec channel.
     worktree_jobs: HashMap<ChannelId, WorktreeJob>,
+    /// Worktree jobs on this PC (WSL, Windows' git).
+    local_worktree_jobs: Vec<LocalWorktreeJob>,
     /// Agents to start in a new worktree, by the tmux pane whose folder
     /// tmux was asked for, in the order asked (tmux answers in order).
     worktree_asks: crate::worktree::Asks<PaneId>,
@@ -1974,6 +1985,23 @@ struct WorktreeJob {
     kind: WorktreeKind,
     out: Vec<u8>,
     err: Vec<u8>,
+}
+
+/// A worktree job run on this PC (in WSL, or with Windows' git) on a
+/// thread of its own; its outcome arrives on `rx`.
+struct LocalWorktreeJob {
+    pane: PaneId,
+    /// The pane's [`Pane::host_gen`] and host's name when it started.
+    host_gen: u64,
+    host: String,
+    kind: WorktreeKind,
+    rx: std::sync::mpsc::Receiver<WorktreeOutcome>,
+}
+
+/// What a worktree job did.
+enum WorktreeOutcome {
+    Added(crate::worktree::Added),
+    Removed(crate::worktree::Removal),
 }
 
 enum WorktreeKind {
@@ -3158,6 +3186,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
                 worktree_jobs: HashMap::new(),
+                local_worktree_jobs: Vec::new(),
                 worktree_asks: crate::worktree::Asks::default(),
                 system_reads: HashMap::new(),
                 inventory_renames: HashMap::new(),
@@ -3426,9 +3455,11 @@ fn new_pane(
         attention_since: None,
         quiet: None,
         local_agent: None,
+        local_worktree: None,
         audit_log: false,
         audit_cast: false,
         agent_end: None,
+        host_gen: 0,
         throttle: crate::attention::Throttle::default(),
         cwd: None,
         cwd_host: None,
@@ -5178,7 +5209,9 @@ impl Window {
             p.local_cwd = None;
             p.hl_host = None;
             p.local_agent = None;
+            p.local_worktree = None;
             p.agent_end = None;
+            p.host_gen = p.host_gen.wrapping_add(1);
         }
         // A host's rules leave with it; the pane's own stop pattern stays.
         self.apply_highlight(id, false);
@@ -5191,7 +5224,20 @@ impl Window {
     fn start_shell(&mut self, id: PaneId) {
         let command = self.local_command(id);
         let wsl = self.local_wsl(id);
-        self.start_local(id, &command, None, wsl, None);
+        // An agent's tab on this PC whose worktree git kept: PowerShell in
+        // that worktree, and Remove this agent's worktree still works there.
+        let kept = self
+            .panes
+            .get(&id)
+            .and_then(|p| p.local_worktree.clone().map(|w| (w, p.local_agent.clone())));
+        let dir = kept.as_ref().map(|(w, _)| w.path.clone());
+        self.start_local(id, &command, dir.as_deref(), wsl, None);
+        if let Some((w, agent)) = kept
+            && let Some(p) = self.panes.get_mut(&id)
+        {
+            p.local_worktree = Some(w);
+            p.local_agent = agent;
+        }
     }
 
     /// The command local pane `id` runs, or the local shell's.
@@ -11125,7 +11171,14 @@ impl Window {
             Host::Wsl(g) => {
                 if enter && g.child.is_none() {
                     let (distro, session) = (g.distro.clone(), g.session.clone());
-                    if let Err(e) = self.start_wsl_gateway(id, &distro, None, None, &session) {
+                    let (dir, before) = g.pending.clone().unzip();
+                    if let Err(e) = self.start_wsl_gateway(
+                        id,
+                        &distro,
+                        dir.flatten().as_deref(),
+                        before.as_deref(),
+                        &session,
+                    ) {
                         self.show(id, &format!("\x1b[0;31m{e}\x1b[0m\r\n"));
                     }
                 }
@@ -11884,6 +11937,8 @@ impl Window {
                 }
             }
         }
+        // Worktree jobs on this PC.
+        self.poll_local_worktrees();
         // The WSL gateways: tmux in control mode.
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {
@@ -11902,6 +11957,13 @@ impl Window {
                     crate::pipes::Output::Data(data) => {
                         fed += data.len();
                         self.host_output(id, &data);
+                        // tmux runs, so its start script did: Enter only
+                        // attaches again from now on.
+                        if self.tmux.get(&id).is_some_and(tmux::Tmux::active)
+                            && let Some(Host::Wsl(g)) = self.panes.get_mut(&id).map(|p| &mut p.host)
+                        {
+                            g.pending = None;
+                        }
                     }
                     crate::pipes::Output::Exited(code) => self.wsl_gateway_ended(id, code),
                 }
@@ -12972,7 +13034,7 @@ impl Window {
                 return self.start_wsl_agent(id, &d, command, worktree);
             }
             Some(Host::Local { wsl: None, .. }) => {
-                return self.start_local_agent(id, command, worktree.map(|w| w.path.as_str()));
+                return self.start_local_agent(id, command, worktree);
             }
             _ => {}
         }
@@ -13076,11 +13138,28 @@ impl Window {
                 return None;
             }
         }
+        // A Windows shell: Windows' own git, in the folder its prompt shows.
+        if let Some(p) = self.panes.get(&id)
+            && let Host::Local { wsl: None, .. } = p.host
+        {
+            let Some(dir) = p.local_cwd.clone() else {
+                return Some(Command::Notice(
+                    "FeroSSH does not know which folder this shell is in: it reads it from \
+                     the prompt (C:\\...> or PS C:\\...>). cd into the project's folder \
+                     first."
+                        .into(),
+                ));
+            };
+            return self.make_local_worktree(id, &dir, command.to_owned());
+        }
+        // In WSL the script starts in the home folder, so a folder a prompt
+        // showed as `~/...` (kept without its `~/`) does too.
+        let wsl = self.wsl_of(id).is_some();
         let Some(dir) = self
             .panes
             .get(&id)
             .and_then(|p| p.cwd.clone())
-            .filter(|d| d.starts_with(b"/"))
+            .filter(|d| d.starts_with(b"/") || (wsl && !d.is_empty()))
         else {
             return Some(Command::Notice(
                 "FeroSSH does not know which folder this pane is in: its shell has not \
@@ -13092,11 +13171,151 @@ impl Window {
         self.make_worktree(id, dir, command.to_owned())
     }
 
+    /// The WSL distro pane `id` works in: a WSL shell's, a WSL gateway's,
+    /// or that of the gateway of a tmux pane.
+    fn wsl_of(&self, id: PaneId) -> Option<String> {
+        let host = self.host_pane(id);
+        match self.panes.get(&host).map(|p| &p.host) {
+            Some(Host::Local { wsl: Some(d), .. }) => Some(d.clone()),
+            Some(Host::Wsl(g)) => Some(g.distro.clone()),
+            _ => None,
+        }
+    }
+
+    /// Runs `job` on a thread for pane `pane`; its outcome comes back to
+    /// [`Self::worktree_done`] through [`Self::poll_local_worktrees`].
+    fn run_local_worktree(
+        &mut self,
+        pane: PaneId,
+        kind: WorktreeKind,
+        job: impl FnOnce() -> WorktreeOutcome + Send + 'static,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let notify = self.notifier();
+        std::thread::spawn(move || {
+            if tx.send(job()).is_ok() {
+                notify();
+            }
+        });
+        let (host_gen, host) = self
+            .panes
+            .get(&pane)
+            .map(|p| {
+                let host = if matches!(p.host, Host::Local { wsl: None, .. }) {
+                    "this PC".to_owned()
+                } else {
+                    crate::ssh::sanitize(&p.host_label())
+                };
+                (p.host_gen, host)
+            })
+            .unwrap_or_default();
+        self.local_worktree_jobs.push(LocalWorktreeJob {
+            pane,
+            host_gen,
+            host,
+            kind,
+            rx,
+        });
+    }
+
+    /// The worktree jobs on this PC that finished.
+    fn poll_local_worktrees(&mut self) {
+        let mut i = 0;
+        while i < self.local_worktree_jobs.len() {
+            let got = self.local_worktree_jobs.get(i).map(|j| j.rx.try_recv());
+            match got {
+                Some(Ok(outcome)) => {
+                    let j = self.local_worktree_jobs.remove(i);
+                    // The pane now shows another host (WSL where Windows'
+                    // git ran, say): its agent does not start there.
+                    let moved = self
+                        .panes
+                        .get(&j.pane)
+                        .is_some_and(|p| p.host_gen != j.host_gen);
+                    if moved
+                        && let (
+                            WorktreeKind::Add { .. },
+                            WorktreeOutcome::Added(crate::worktree::Added::Made(w)),
+                        ) = (&j.kind, &outcome)
+                    {
+                        self.queued.push(Command::Notice(format!(
+                            "Made worktree {} on branch {} on {}, but no agent started there: \
+                             the pane it was asked from runs something else now. Start one in \
+                             it yourself, or remove it with git worktree remove and git \
+                             branch -d.",
+                            crate::ssh::sanitize_line(&w.path),
+                            w.branch,
+                            j.host
+                        )));
+                        continue;
+                    }
+                    self.worktree_done(j.pane, j.kind, outcome, "");
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.local_worktree_jobs.remove(i);
+                }
+                _ => i += 1,
+            }
+        }
+    }
+
+    /// A worktree script for WSL distro `distro`, run there with `input`.
+    fn wsl_worktree_job(
+        distro: String,
+        command: Vec<u8>,
+        input: Vec<u8>,
+        add: bool,
+    ) -> impl FnOnce() -> WorktreeOutcome + Send + 'static {
+        move || {
+            let ran = crate::program::locate("wsl.exe").and_then(|wsl| {
+                let args = crate::wsl::script_args(&distro, &String::from_utf8_lossy(&command));
+                crate::pipes::run_once(&wsl, &args, &input)
+            });
+            let (out, err) = ran.unwrap_or_else(|e| (Vec::new(), e.to_string().into_bytes()));
+            if add {
+                WorktreeOutcome::Added(crate::worktree::parse_add(&out, &err))
+            } else {
+                WorktreeOutcome::Removed(crate::worktree::parse_remove(&out, &err))
+            }
+        }
+    }
+
+    /// Start <agent> in a new git worktree from a Windows shell in `dir`:
+    /// Windows' git makes it, then the agent's tab opens there.
+    fn make_local_worktree(&mut self, id: PaneId, dir: &str, command: String) -> Option<Command> {
+        let Ok(git) = crate::program::locate("git.exe") else {
+            return Some(Command::Notice(
+                "git is not installed on this PC (FeroSSH looks for git.exe in the Windows \
+                 folders and on PATH), so no worktree was made."
+                    .into(),
+            ));
+        };
+        let base = crate::worktree::branch_base(&crate::tmux::agent_name(&command));
+        let dir = std::path::PathBuf::from(dir);
+        self.run_local_worktree(id, WorktreeKind::Add { command }, move || {
+            WorktreeOutcome::Added(crate::local_worktree::add(&git, &dir, &base))
+        });
+        None
+    }
+
     /// Runs [`crate::worktree::add_command`] for the repository folder
     /// `dir` is in, on pane `id`'s connection; agent `command` starts in
     /// the worktree once it is made.
     fn make_worktree(&mut self, id: PaneId, dir: Vec<u8>, command: String) -> Option<Command> {
         let base = crate::worktree::branch_base(&crate::tmux::agent_name(&command));
+        // In WSL: the same script, run there.
+        if let Some(distro) = self.wsl_of(id) {
+            let Some(input) = crate::worktree::add_input(&dir, &base) else {
+                return Some(Command::Notice(
+                    "FeroSSH cannot make a worktree from this folder: its name is not on \
+                     one line."
+                        .into(),
+                ));
+            };
+            let job = Self::wsl_worktree_job(distro, crate::worktree::add_command(), input, true);
+            self.run_local_worktree(id, WorktreeKind::Add { command }, job);
+            return None;
+        }
         let (Some(connection), Some(input)) = (
             self.pane_connection(id),
             crate::worktree::add_input(&dir, &base),
@@ -13186,27 +13405,61 @@ impl Window {
         };
         // Its connection may have had nothing else keeping it.
         self.prune_workers();
+        let outcome = match &j.kind {
+            WorktreeKind::Add { .. } => {
+                WorktreeOutcome::Added(crate::worktree::parse_add(&j.out, &j.err))
+            }
+            WorktreeKind::Remove(_) => {
+                WorktreeOutcome::Removed(crate::worktree::parse_remove(&j.out, &j.err))
+            }
+        };
+        self.worktree_done(j.pane, j.kind, outcome, &reason);
+    }
+
+    /// A worktree job for pane `pane` ended with `outcome` (`reason`: why
+    /// its channel closed, when it ran on a server): the agent starts in
+    /// the new worktree, or the user is told what happened.
+    fn worktree_done(
+        &mut self,
+        pane: PaneId,
+        kind: WorktreeKind,
+        outcome: WorktreeOutcome,
+        reason: &str,
+    ) {
+        let local = matches!(
+            self.panes.get(&pane).map(|p| &p.host),
+            Some(Host::Local { wsl: None, .. })
+        ) || self
+            .panes
+            .get(&pane)
+            .is_some_and(|p| p.local_worktree.is_some());
         let host = self
             .panes
-            .get(&j.pane)
+            .get(&pane)
             .map(Pane::host_label)
             .unwrap_or_default();
-        let host = crate::ssh::sanitize(&host);
+        let host = if local {
+            "this PC".to_owned()
+        } else {
+            crate::ssh::sanitize(&host)
+        };
         let why = |said: &str| {
-            if said.is_empty() {
+            if said.is_empty() && reason.is_empty() {
+                "no answer from git".to_owned()
+            } else if said.is_empty() {
                 format!(
                     "no answer from the server ({}). It needs sh and git, as Linux and macOS \
                      servers have",
-                    crate::ssh::sanitize(&reason)
+                    crate::ssh::sanitize(reason)
                 )
             } else {
                 format!("git said: {said}")
             }
         };
-        let text = match j.kind {
-            WorktreeKind::Add { command } => {
+        let text = match (kind, outcome) {
+            (WorktreeKind::Add { command }, WorktreeOutcome::Added(added)) => {
                 use crate::worktree::Added;
-                match crate::worktree::parse_add(&j.out, &j.err) {
+                match added {
                     Added::Made(w) => {
                         // The worktree is there whatever happens next, so
                         // a refusal says where.
@@ -13218,18 +13471,18 @@ impl Window {
                         );
                         let undo = "Start one in it yourself, or remove it with git worktree \
                                     remove and git branch -d.";
-                        if !self.panes.contains_key(&j.pane) {
+                        if !self.panes.contains_key(&pane) {
                             format!("{made}: the pane it was asked from has closed. {undo}")
-                        } else if self.agent_would_join(j.pane) {
+                        } else if self.agent_would_join(pane) {
                             // Joined someone else's session while git ran.
                             format!("{made}: {JOINED_AGENT} {undo}")
-                        } else if self.agent_tmux(j.pane).is_some_and(tmux::Tmux::agents_full) {
+                        } else if self.agent_tmux(pane).is_some_and(tmux::Tmux::agents_full) {
                             format!(
                                 "{made}: tmux has not answered the last agent starts yet. \
                                  {undo}"
                             )
                         } else {
-                            match self.start_agent_at(j.pane, &command, Some(&w)) {
+                            match self.start_agent_at(pane, &command, Some(&w)) {
                                 None => return,
                                 Some(Command::Notice(why)) => format!("{made}: {why} {undo}"),
                                 Some(next) => {
@@ -13260,18 +13513,23 @@ impl Window {
                     }
                 }
             }
-            WorktreeKind::Remove(w) => {
+            (WorktreeKind::Remove(w), WorktreeOutcome::Removed(removal)) => {
                 use crate::worktree::Removal;
                 let path = crate::ssh::sanitize_line(&w.path);
-                match crate::worktree::parse_remove(&j.out, &j.err) {
+                match removal {
                     Removal::Removed { branch_deleted } => {
+                        if let Some(p) = self.panes.get_mut(&pane)
+                            && p.local_worktree.as_ref() == Some(&w)
+                        {
+                            p.local_worktree = None;
+                        }
                         // The agent's window goes with its folder, if it
                         // is still the same agent's.
-                        if self.worktree_of(j.pane) == Some(&w)
-                            && let Some(g) = self.panes.get(&j.pane).and_then(Pane::gateway)
+                        if self.worktree_of(pane) == Some(&w)
+                            && let Some(g) = self.panes.get(&pane).and_then(Pane::gateway)
                             && let Some(t) = self.tmux.get_mut(&g)
                         {
-                            let actions = t.close_agent_window(j.pane);
+                            let actions = t.close_agent_window(pane);
                             self.run_tmux(g, actions);
                         }
                         if branch_deleted {
@@ -13289,8 +13547,17 @@ impl Window {
                         }
                     }
                     Removal::Kept(said) => format!(
-                        "git kept worktree {path} on {host}, and the agent runs on: {}. \
-                         Commit or throw away its changes first.",
+                        "git kept worktree {path} on {host}, and {}: {}. Commit or throw \
+                         away its changes first.",
+                        if self
+                            .panes
+                            .get(&pane)
+                            .is_some_and(|p| p.local_worktree.as_ref() == Some(&w))
+                        {
+                            "the agent stays stopped (Enter in its tab starts PowerShell there)"
+                        } else {
+                            "the agent runs on"
+                        },
                         if said.is_empty() {
                             "it has uncommitted or untracked changes, or is locked".to_owned()
                         } else {
@@ -13319,6 +13586,8 @@ impl Window {
                     }
                 }
             }
+            // A job's outcome always matches its kind.
+            _ => return,
         };
         self.queued.push(Command::Notice(text));
     }
@@ -13353,11 +13622,16 @@ impl Window {
             .get(&id)
             .map(Pane::host_label)
             .unwrap_or_default();
+        let windows = self
+            .panes
+            .get(&id)
+            .is_some_and(|p| p.local_worktree.is_some());
         Some(Command::RemoveWorktree {
             pane: id,
             worktree: w,
             agent,
             host,
+            windows,
         })
     }
 
@@ -13371,6 +13645,50 @@ impl Window {
                 "That agent's window has closed or changed meanwhile, so nothing was removed."
                     .into(),
             ));
+        }
+        // On Windows: a folder a process works in cannot be deleted, so the
+        // agent's tab stops first, then Windows' git removes it.
+        if self
+            .panes
+            .get(&id)
+            .is_some_and(|p| p.local_worktree.is_some())
+        {
+            let Ok(git) = crate::program::locate("git.exe") else {
+                return Some(Command::Notice("git is not installed on this PC.".into()));
+            };
+            if let Some(p) = self.panes.get_mut(&id)
+                && let Host::Local { shell, exited, .. } = &mut p.host
+            {
+                *shell = None;
+                *exited = true;
+            }
+            self.stop_log(id);
+            self.show(
+                id,
+                "\r\n\x1b[0;90m[The agent was stopped to remove its worktree.]\x1b[0m\r\n",
+            );
+            let w2 = w.clone();
+            self.run_local_worktree(id, WorktreeKind::Remove(w.clone()), move || {
+                // Once the stopped programs let go of the folder.
+                WorktreeOutcome::Removed(crate::local_worktree::remove_when_free(
+                    &git,
+                    &w2,
+                    std::time::Duration::from_secs(15),
+                ))
+            });
+            return None;
+        }
+        // In WSL: the same script, run there.
+        if let Some(distro) = self.wsl_of(id) {
+            let Some(input) = crate::worktree::remove_input(w) else {
+                return Some(Command::Notice(
+                    "That is not a worktree FeroSSH made, so nothing was removed.".into(),
+                ));
+            };
+            let job =
+                Self::wsl_worktree_job(distro, crate::worktree::remove_command(), input, false);
+            self.run_local_worktree(id, WorktreeKind::Remove(w.clone()), job);
+            return None;
         }
         let (Some(connection), Some(input)) =
             (self.pane_connection(id), crate::worktree::remove_input(w))
@@ -13392,7 +13710,11 @@ impl Window {
     /// The worktree of its own that coding agent pane `id` was started in,
     /// if it was started in one.
     fn worktree_of(&self, id: PaneId) -> Option<&crate::worktree::Worktree> {
-        let g = self.panes.get(&id).and_then(Pane::gateway)?;
+        let p = self.panes.get(&id)?;
+        if let Some(w) = &p.local_worktree {
+            return Some(w);
+        }
+        let g = p.gateway()?;
         self.tmux.get(&g)?.worktree_of(id)
     }
 
@@ -13406,9 +13728,9 @@ impl Window {
         &mut self,
         id: PaneId,
         command: &str,
-        folder: Option<&str>,
+        worktree: Option<&crate::worktree::Worktree>,
     ) -> Option<Command> {
-        let dir = folder.map(str::to_owned).or_else(|| {
+        let dir = worktree.map(|w| w.path.clone()).or_else(|| {
             self.panes.get(&id).and_then(|p| match p.host {
                 Host::Local {
                     exited: false,
@@ -13431,10 +13753,13 @@ impl Window {
         let name = crate::tmux::agent_name(command);
         let p = self.panes.get_mut(&tab)?;
         if !matches!(p.host, Host::Local { shell: Some(_), .. }) {
-            // It did not start; the pane says why.
-            return None;
+            // It did not start; the pane says why, and a worktree made for
+            // it is told of.
+            return worktree
+                .map(|_| Command::Notice("PowerShell did not start (its tab says why).".into()));
         }
         p.local_agent = Some(name.clone());
+        p.local_worktree = worktree.cloned();
         p.name = live::clean_name(&name);
         if p.quiet.is_none() {
             p.quiet = Some(crate::attention::Watch::new());
@@ -13469,6 +13794,7 @@ impl Window {
         let wsl = crate::program::locate("wsl.exe")
             .map_err(|e| format!("WSL is not installed on this PC: {e}"))?;
         let args = crate::wsl::gateway_args(distro, dir, before, session);
+        let pending = before.map(|b| (dir.map(str::to_owned), b.to_owned()));
         let was_gateway = matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Wsl(_)));
         self.end_host(id);
         let notify = self.notifier();
@@ -13481,6 +13807,7 @@ impl Window {
                         distro: distro.to_owned(),
                         session: session.to_owned(),
                         child: None,
+                        pending: pending.clone(),
                     }));
                 }
                 return Err(format!("Could not start wsl.exe: {e}"));
@@ -13492,6 +13819,7 @@ impl Window {
                 distro: distro.to_owned(),
                 session: session.to_owned(),
                 child: Some(child),
+                pending,
             }));
         }
         self.show(
@@ -13514,6 +13842,11 @@ impl Window {
             return;
         };
         g.child = None;
+        let again = if g.pending.is_some() {
+            "start the agent"
+        } else {
+            "attach"
+        };
         let label = crate::wsl::label(&g.distro);
         let code = code
             .filter(|c| *c != 0)
@@ -13521,7 +13854,7 @@ impl Window {
         self.show(
             id,
             &format!(
-                "\r\n\x1b[0;90m[tmux in {label} ended{code}. Press Enter to attach again.]\x1b[0m\r\n"
+                "\r\n\x1b[0;90m[tmux in {label} ended{code}. Press Enter to {again} again.]\x1b[0m\r\n"
             ),
         );
         self.after_structure_change();
@@ -13563,6 +13896,11 @@ impl Window {
         if let Some(g) = shown {
             let next_to = self.tmux.get(&g).and_then(|t| t.natives().first().copied());
             let actions = match (self.tmux.get_mut(&g), next_to) {
+                // A folder the prompt showed under `~`, or else the home
+                // folder, as a new gateway starts in: never another pane's.
+                (Some(t), Some(n)) if worktree.is_none() && dir.is_none() => {
+                    t.start_agent_in_home(n, command, in_home.as_deref().unwrap_or("."))
+                }
                 (Some(t), Some(n)) => t.start_agent(n, command, dir.as_deref(), worktree),
                 _ => {
                     return Some(Command::Notice(
@@ -20270,9 +20608,19 @@ impl Window {
             Like::Telnet(target) => self.connect_telnet(id, target),
             Like::Winrm(target) => self.connect_winrm(id, target),
             // A WSL shell's folder is a Linux one, which Windows cannot
-            // start a process in: its split starts in the home folder.
+            // start a process in: wsl.exe is told it instead (the home
+            // folder when it is not known, or not a full path).
             Like::Local(command, Some(wsl)) => {
-                self.start_local(id, &command, None, Some(wsl), None);
+                let dir = cwd.as_deref().and_then(|d| std::str::from_utf8(d).ok());
+                let launched = crate::wsl::shell_command_in(&wsl, dir);
+                let launched = (launched != command).then(|| {
+                    if self.settings.local_shell_integration {
+                        crate::shell_hook::with_hook(&launched)
+                    } else {
+                        launched
+                    }
+                });
+                self.start_local(id, &command, None, Some(wsl), launched);
             }
             Like::Local(command, None) => {
                 self.start_command_in(id, &command, local_cwd.as_deref());
@@ -25261,6 +25609,8 @@ enum Command {
         worktree: crate::worktree::Worktree,
         agent: String,
         host: String,
+        /// An agent tab on this PC, which stops before git looks.
+        windows: bool,
     },
     /// A snippet is about to go to a pane with the Production theme: asks
     /// first.
@@ -29239,17 +29589,28 @@ fn run_command(hwnd: HWND, command: Command) {
             worktree,
             agent,
             host,
+            windows,
         } => {
-            let text = format!(
-                "Remove the worktree of {agent} on {host}?\n\n\
-                 Folder: {}\nBranch: {}\n\n\
-                 git removes the folder only when everything in it is committed: \
+            let how = if windows {
+                "Windows cannot delete a folder a program works in, so the agent's \
+                 tab stops first, whatever git does next. git then removes the \
+                 folder only when everything in it is committed: uncommitted or \
+                 untracked changes keep it, and the agent stays stopped (Enter in \
+                 its tab starts PowerShell there). Files git ignores (build output, \
+                 node_modules, a local .env) are deleted with the folder. The branch \
+                 is deleted only if it is merged, so the agent's commits stay."
+            } else {
+                "git removes the folder only when everything in it is committed: \
                  uncommitted or untracked changes keep it, and nothing else happens. \
                  Files git ignores (build output, node_modules, a local .env) are \
                  deleted with the folder. \
                  Once it is gone, the agent's tmux window closes (the agent stops), \
                  and the branch is deleted only if it is merged, so the agent's \
-                 commits stay.",
+                 commits stay."
+            };
+            let text = format!(
+                "Remove the worktree of {agent} on {host}?\n\n\
+                 Folder: {}\nBranch: {}\n\n{how}",
                 crate::ssh::sanitize_line(&worktree.path),
                 worktree.branch,
             );

@@ -35,6 +35,21 @@ pub fn tmux_cwd(dir: &str) -> String {
     format!(" -c '{}'", dir.replace('#', "##").replace('\'', "'\\''"))
 }
 
+/// The tmux `-c` option for folder `rel` of the home folder of the user
+/// tmux runs as (`.` or empty: the home folder itself), as a prompt showed
+/// `~/rel`: tmux expands the `~` that starts a word, and joins the quoted
+/// rest to it. Empty when `rel` cannot be quoted for tmux safely.
+pub fn tmux_home_cwd(rel: &str) -> String {
+    let rel = rel.trim_end_matches(['\r', '\n']);
+    if rel.chars().any(char::is_control) {
+        return String::new();
+    }
+    if rel.is_empty() || rel == "." {
+        return " -c ~".to_owned();
+    }
+    format!(" -c ~/'{}'", rel.replace('#', "##").replace('\'', "'\\''"))
+}
+
 /// The folder in a cmd (`C:\Users\me>`) or PowerShell
 /// (`PS C:\Users\me> `) prompt at the cursor, for local shells, which
 /// report no directory. Only absolute paths (a drive or a UNC share).
@@ -56,6 +71,15 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn home_folders_for_tmux() {
+        assert_eq!(tmux_home_cwd("."), " -c ~");
+        assert_eq!(tmux_home_cwd(""), " -c ~");
+        assert_eq!(tmux_home_cwd("FeroSNMP"), " -c ~/'FeroSNMP'");
+        assert_eq!(tmux_home_cwd("a b/c#d'e"), " -c ~/'a b/c##d'\\''e'");
+        assert_eq!(tmux_home_cwd("a\x1bb"), "");
+    }
 
     #[test]
     fn quotes_the_directory() {
