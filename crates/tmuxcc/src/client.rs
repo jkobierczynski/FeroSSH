@@ -46,6 +46,9 @@ struct Block<T> {
     /// `None` for a block that answers no command of ours (the attach
     /// command's own, or another client's).
     tag: Option<T>,
+    /// Commands after this one on the same line: tmux skips them if
+    /// this one fails.
+    rest: usize,
     lines: Vec<Vec<u8>>,
     bytes: usize,
 }
@@ -65,7 +68,9 @@ pub struct Client<T> {
     /// tmux.
     first_line: bool,
     block: Option<Block<T>>,
-    pending: VecDeque<T>,
+    /// Tags waiting for a reply, each with how many commands after it
+    /// were sent on the same line.
+    pending: VecDeque<(T, usize)>,
 }
 
 impl<T: Clone> Default for Client<T> {
@@ -112,25 +117,27 @@ impl<T: Clone> Client<T> {
         }
         let mut out: Vec<u8> = line.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
         out.push(b'\n');
-        self.pending.push_back(tag);
+        self.pending.push_back((tag, 0));
         Some(out)
     }
 
     /// Sends `lines` as one line, `a ; b ; c`, each with its tag: tmux
     /// runs them back to back, with no pane output read between them
-    /// (each still has its own reply). `None` outside control mode or
-    /// for no lines.
+    /// (each still has its own reply). If one fails tmux skips the rest,
+    /// which then come back as failed replies with no lines. `None`
+    /// outside control mode or for no lines.
     pub fn commands(&mut self, lines: Vec<(&str, T)>) -> Option<Vec<u8>> {
         if !self.control || lines.is_empty() {
             return None;
         }
         let mut out: Vec<u8> = Vec::new();
+        let n = lines.len();
         for (i, (line, tag)) in lines.into_iter().enumerate() {
             if i > 0 {
                 out.extend_from_slice(b" ; ");
             }
             out.extend(line.bytes().filter(|&b| b != b'\n' && b != b'\r'));
-            self.pending.push_back(tag);
+            self.pending.push_back((tag, n - 1 - i));
         }
         out.push(b'\n');
         Some(out)
@@ -228,6 +235,19 @@ impl<T: Clone> Client<T> {
                             ok,
                             lines: block.lines,
                         });
+                        // tmux skipped the commands after a failed one
+                        // on its line: they get no block of their own.
+                        if !ok {
+                            for _ in 0..block.rest {
+                                if let Some((tag, _)) = self.pending.pop_front() {
+                                    events.push(Event::Reply {
+                                        tag,
+                                        ok: false,
+                                        lines: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 // Nobody receives an untagged block's lines.
@@ -242,17 +262,19 @@ impl<T: Clone> Client<T> {
         }
         match parse_boundary(&line) {
             Some(Boundary::Begin(guard)) => {
-                let tag = if guard.flags & 1 == 1 {
+                let entry = if guard.flags & 1 == 1 {
                     self.pending.pop_front()
                 } else {
                     None
                 };
+                let (tag, rest) = entry.map_or((None, 0), |(tag, rest)| (Some(tag), rest));
                 if let Some(t) = &tag {
                     events.push(Event::ReplyStarted(t.clone()));
                 }
                 self.block = Some(Block {
                     guard,
                     tag,
+                    rest,
                     lines: Vec::new(),
                     bytes: 0,
                 });
@@ -383,6 +405,61 @@ mod tests {
             ]
         );
         assert!(c.is_control());
+    }
+
+    #[test]
+    fn a_failed_command_skips_the_rest_of_its_line() {
+        let mut c = Client::new();
+        c.feed(b"\x1bP1000p%begin 1 1 0\n%end 1 1 0\n");
+        assert_eq!(
+            c.commands(vec![
+                ("capture-pane -p -t %99", 1),
+                ("display -p a", 2),
+                ("display -p b", 3)
+            ])
+            .unwrap(),
+            b"capture-pane -p -t %99 ; display -p a ; display -p b\n"
+        );
+        c.command("display -p c", 4);
+        // What tmux 3.4 writes: one error, nothing for the other two.
+        let events = c.feed(
+            b"%begin 1 274 1\ncan't find pane: %99\n%error 1 274 1\n\
+              %begin 1 275 1\nc\n%end 1 275 1\n",
+        );
+        let failed = |tag| Event::Reply {
+            tag,
+            ok: false,
+            lines: Vec::new(),
+        };
+        assert_eq!(
+            events,
+            vec![
+                Event::ReplyStarted(1),
+                Event::Reply {
+                    tag: 1,
+                    ok: false,
+                    lines: vec![b"can't find pane: %99".to_vec()]
+                },
+                failed(2),
+                failed(3),
+                Event::ReplyStarted(4),
+                Event::Reply {
+                    tag: 4,
+                    ok: true,
+                    lines: vec![b"c".to_vec()]
+                },
+            ]
+        );
+        assert_eq!(c.pending(), 0);
+        // One that fails last on its line skips nothing.
+        c.commands(vec![("display -p a", 5), ("bogus", 6)]);
+        c.command("display -p c", 7);
+        let events = c.feed(
+            b"%begin 1 1 1\na\n%end 1 1 1\n%begin 1 2 1\n%error 1 2 1\n\
+              %begin 1 3 1\nc\n%end 1 3 1\n",
+        );
+        assert_eq!(events.len(), 6);
+        assert_eq!(c.pending(), 0);
     }
 
     #[test]

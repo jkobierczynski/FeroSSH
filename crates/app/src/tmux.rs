@@ -3672,6 +3672,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_gone_before_the_redraw_after_a_pause_lets_go() {
+        let panes = [pane_line(5, 1, 80, 24, "b25f,80x24,0,0,5")];
+        let (mut t, mut ws, _) = attached(Some("tmux"), None, &panes);
+        let native = t.native_of(5).unwrap();
+        t.feed(&mut ws, &reply(5, &[]));
+        t.feed(&mut ws, &reply(6, &[]));
+        t.feed(&mut ws, b"%pause %5\n");
+        t.feed(&mut ws, b"%begin 9 7 1\n%end 9 7 1\n");
+        // The first capture fails: tmux skips the other two on its line.
+        let a = t.feed(
+            &mut ws,
+            b"%begin 9 8 1\ncan't find pane: %5\n%error 9 8 1\n%extended-output %5 0 : y\n",
+        );
+        assert!(
+            a.contains(&Action::Feed {
+                native,
+                bytes: b"y".to_vec()
+            }),
+            "{a:?}"
+        );
+        assert_eq!(t.client.pending(), 0);
+    }
+
+    #[test]
     fn a_pause_while_restoring_still_lets_the_pane_go() {
         let (mut ws, gateway) = Workspace::new();
         let mut t = Tmux::new(gateway, Mode::Ferossh, 100);
