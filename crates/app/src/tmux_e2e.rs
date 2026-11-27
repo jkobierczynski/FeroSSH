@@ -211,6 +211,14 @@ impl Harness {
                 Action::Remove { native } => {
                     self.panes.remove(&native);
                 }
+                Action::Named { natives, name } => {
+                    for n in natives {
+                        match &name {
+                            Some(name) => self.names.insert(n, name.clone()),
+                            None => self.names.remove(&n),
+                        };
+                    }
+                }
                 Action::ShowGateway => self.gateway_shown = true,
                 Action::Picker(names) => self.pickers.push(names),
                 Action::Notice(text) => self.notices.push(text),
@@ -1385,4 +1393,28 @@ fn real_tmux_two_ferossh_clients_share_the_splits() {
     a.until("a's tab", |h| h.ws.tabs.len() == 2);
     a.save(|_| Look::default());
     b.until("the tab in b", |h| h.shown() == 4 && h.ws.tabs.len() == 2);
+}
+
+#[test]
+fn real_tmux_window_names_given_elsewhere_name_the_tab() {
+    if !tmux_available() || version() < MIN_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-names-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("the pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    // Another client (or prefix ,) names the window.
+    tmux_cmd(&server, &["rename-window", "-t", "e2e:", "my db"]);
+    a.until("the name", |h| {
+        h.names.get(&first).map(String::as_str) == Some("my db")
+    });
+    // Back to tmux's automatic name: the tab's own title again.
+    tmux_cmd(
+        &server,
+        &["set-option", "-w", "-t", "e2e:", "automatic-rename", "on"],
+    );
+    a.until("the name gone", |h| !h.names.contains_key(&first));
 }
