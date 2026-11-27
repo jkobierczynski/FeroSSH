@@ -78,6 +78,12 @@ pub enum Notification {
     Exit {
         reason: String,
     },
+    /// A format this client subscribed to (`refresh-client -B`) has a
+    /// new value: `%subscription-changed name $s @w i %p ... : value`.
+    SubscriptionChanged {
+        name: String,
+        value: String,
+    },
     /// A line FeroSSH does not use.
     Other,
 }
@@ -172,6 +178,15 @@ pub fn parse_notification(line: &[u8]) -> Notification {
             window
                 .zip(pane)
                 .map(|(window, pane)| Notification::WindowPaneChanged { window, pane })
+        }
+        b"%subscription-changed" => {
+            let colon = rest.windows(3).position(|w| w == b" : ");
+            colon.and_then(|c| {
+                Some(Notification::SubscriptionChanged {
+                    name: next(),
+                    value: String::from_utf8_lossy(rest.get(c + 3..)?).into_owned(),
+                })
+            })
         }
         b"%pause" => id(&next(), '%').map(|pane| Notification::Pause { pane }),
         b"%exit" => Some(Notification::Exit { reason: text() }),
@@ -344,6 +359,24 @@ mod tests {
             Notification::Exit {
                 reason: String::new()
             }
+        );
+        assert_eq!(
+            parse_notification(b"%subscription-changed lay $0 - - - : x y : z"),
+            Notification::SubscriptionChanged {
+                name: "lay".into(),
+                value: "x y : z".into()
+            }
+        );
+        assert_eq!(
+            parse_notification(b"%subscription-changed lay $0 - - - : "),
+            Notification::SubscriptionChanged {
+                name: "lay".into(),
+                value: String::new()
+            }
+        );
+        assert_eq!(
+            parse_notification(b"%subscription-changed lay"),
+            Notification::Other
         );
         assert_eq!(parse_notification(b"%output x1 y"), Notification::Other);
         assert_eq!(parse_notification(b"%window-add 1"), Notification::Other);

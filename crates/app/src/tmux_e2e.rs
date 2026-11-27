@@ -1323,3 +1323,66 @@ fn real_tmux_zoom_is_followed_not_undone() {
     a.sizes(|n| if n == other { (40, 24) } else { (39, 24) });
     a.until("the zoom ended in tmux", |_| !zoomed(&server));
 }
+
+#[test]
+fn real_tmux_two_ferossh_clients_share_the_splits() {
+    // Following another client's layout needs `refresh-client -B` (3.2)
+    // and FeroSSH's layout (3.3).
+    if !tmux_available() || version() < WINDOW_SIZES_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-follow-{}", std::process::id()),
+    };
+    let layout = || {
+        tmux_cmd(
+            &server,
+            &["show-options", "-v", "-t", "e2e", "@ferossh-layout"],
+        )
+    };
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("a's pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    a.save(|_| Look::default());
+    let mut b = Harness::attach(&server, Mode::Ferossh);
+    b.until("b's pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    b.save(|_| Look::default());
+
+    // A splits: B shows the new window beside the first, not as a tab.
+    let first = a.ws.focused();
+    let actions = a.tmux.split(first, Dir::Right);
+    a.apply(actions);
+    a.until("a's split", |h| h.shown() == 2);
+    a.save(|_| Look::default());
+    let written = layout();
+    b.until("the split in b", |h| h.shown() == 2 && h.ws.tabs.len() == 1);
+    b.save(|_| Look::default());
+    assert_eq!(layout(), written, "b wrote its own view over a's");
+
+    // B splits the other way: A follows.
+    let actions = b.tmux.split(b.ws.focused(), Dir::Down);
+    b.apply(actions);
+    b.until("b's split", |h| h.shown() == 3);
+    b.save(|_| Look::default());
+    a.until("the split in a", |h| h.shown() == 3 && h.ws.tabs.len() == 1);
+    a.save(|_| Look::default());
+    let settled = layout();
+    // Neither writes again: they do not take turns.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(2500) {
+        for h in [&mut a, &mut b] {
+            let tick = Instant::now();
+            h.until("a moment", |_| tick.elapsed() > Duration::from_millis(200));
+            h.save(|_| Look::default());
+        }
+    }
+    assert_eq!(layout(), settled);
+    assert_eq!(a.ws.tabs.len(), 1);
+    assert_eq!(b.ws.tabs.len(), 1);
+
+    // A new tab in A stays a tab in B.
+    let actions = a.tmux.new_tab(a.ws.focused());
+    a.apply(actions);
+    a.until("a's tab", |h| h.ws.tabs.len() == 2);
+    a.save(|_| Look::default());
+    b.until("the tab in b", |h| h.shown() == 4 && h.ws.tabs.len() == 2);
+}

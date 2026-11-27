@@ -20,6 +20,7 @@
 //! with no window, against scripted tmux output and a real tmux.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use ferossh_tmuxcc::layout::{self as tl, Cell, Kind, Shape};
 use ferossh_tmuxcc::saved::{self, Look, Saved};
@@ -41,6 +42,11 @@ const MAX_BUFFER: usize = 4 << 20;
 /// Without it, tmux queues everything and drops the whole client once
 /// it is minutes behind.
 const PAUSE_AFTER: u32 = 10;
+/// The `refresh-client -B` subscription to the session's saved layout.
+const LAYOUT_SUBSCRIPTION: &str = "ferossh-layout";
+/// How long a window another client opened may wait for that client's
+/// layout before this client writes its own again.
+const FOREIGN_WAIT: Duration = Duration::from_secs(3);
 /// Panes whose output is kept before they are known.
 const MAX_ORPHANS: usize = 64;
 /// Windows FeroSSH shows; more are left to tmux.
@@ -594,6 +600,19 @@ pub struct Tmux {
     /// Counts asked for after a client came or went, not answered yet.
     clients_asked: u32,
     saved_text: Option<String>,
+    /// The layout another FeroSSH on the session wrote last (followed
+    /// with `refresh-client -B`): it places their windows here too.
+    remote: Option<Saved>,
+    /// Windows another client opened, and when: this client's own
+    /// view of them (a tab each) is not written until that client's
+    /// layout places them, or [`FOREIGN_WAIT`] passes (a plain tmux
+    /// client writes none).
+    foreign: BTreeMap<WindowId, Instant>,
+    /// The next layout written is taken as written without writing it:
+    /// another client's layout was just followed, and writing this
+    /// client's own back (another active tab, other looks) would only
+    /// make the two take turns.
+    adopt: bool,
     /// The session to attach again after a reconnect.
     pub reattach: Option<String>,
     /// Read the prefix keys on attach (Session > tmux > Use tmux keybindings).
@@ -757,6 +776,9 @@ impl Tmux {
             affected: BTreeSet::new(),
             clients_asked: 0,
             saved_text: None,
+            remote: None,
+            foreign: BTreeMap::new(),
+            adopt: false,
             reattach: None,
             keys_wanted: false,
             keys: None,
@@ -1210,6 +1232,9 @@ impl Tmux {
             // is let go, restoring or not.
             Notification::Pause { pane } => self.on_pause(pane, out),
             _ if self.restoring => {}
+            Notification::SubscriptionChanged { name, value } if name == LAYOUT_SUBSCRIPTION => {
+                self.on_remote_layout(ws, &value, out);
+            }
             Notification::WindowAdd { window } => {
                 if !self.windows.contains_key(&window) {
                     self.discover(window, out);
@@ -1345,6 +1370,9 @@ impl Tmux {
         self.clients = None;
         self.affected.clear();
         self.saved_text = None;
+        self.remote = None;
+        self.foreign.clear();
+        self.adopt = false;
         self.restoring = true;
         // With how many clients the session has, so closing can ask
         // first when others show it too.
@@ -1569,9 +1597,17 @@ impl Tmux {
                     .is_some_and(|w| w.len() > "links=".len());
                 // Flow control, for every client but one that only watches
                 // (it may not be let to continue a pane tmux paused).
+                // With it, follow the layout other FeroSSH clients of the
+                // session write (`-B`, 3.2 too; it follows a session
+                // switch by itself). Its first value comes while
+                // restoring, which reads the layout anyway.
                 if self.version.is_some_and(|v| v >= PAUSE_VERSION) && self.joined != Some(false) {
+                    let follow = format!("{LAYOUT_SUBSCRIPTION}::#{{{}}}", saved::OPTION);
                     self.send(
-                        &format!("refresh-client -f pause-after={PAUSE_AFTER}"),
+                        &format!(
+                            "refresh-client -f pause-after={PAUSE_AFTER} -B {}",
+                            command::quote(&follow)
+                        ),
                         Tag::Ignore,
                         out,
                     );
@@ -2313,7 +2349,15 @@ impl Tmux {
             .collect();
         // A new window looks like the pane it was split from.
         let placement = self.placements.remove(&w);
-        let look = Look::default();
+        // Not opened here: another client's, placed as its layout says
+        // (now, or when that client has written it).
+        let theirs = !known && placement.is_none() && self.mode == Mode::Ferossh;
+        let look = self
+            .remote
+            .as_ref()
+            .filter(|_| theirs)
+            .and_then(|r| r.looks.get(&w).cloned())
+            .unwrap_or_default();
         let Some(tree) = self.add_window(ws, w, &lines, &look, out) else {
             return;
         };
@@ -2350,8 +2394,109 @@ impl Tmux {
                 self.focus_next = Some(p);
             }
         }
+        if theirs {
+            let placed = self
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.tabs.iter().any(|t| t.root.windows().contains(&w)));
+            if placed {
+                self.adopt |= self.apply_remote(ws);
+            } else {
+                self.foreign.insert(w, Instant::now());
+            }
+        }
         self.zoom_from(ws, &lines, out);
         out.push(Action::Structure);
+    }
+
+    /// Another client wrote the session's layout: follow it.
+    fn on_remote_layout(&mut self, ws: &mut Workspace, value: &str, out: &mut Vec<Action>) {
+        if self.saved_text.as_deref() == Some(value) {
+            return;
+        }
+        let Some(saved) = Saved::parse(value) else {
+            return;
+        };
+        for w in saved.tabs.iter().flat_map(|t| t.root.windows()) {
+            self.foreign.remove(&w);
+        }
+        self.remote = Some(saved);
+        if self.mode != Mode::Ferossh {
+            return;
+        }
+        if self.apply_remote(ws) {
+            // What this client writes changed only by following.
+            self.adopt = true;
+            out.push(Action::Structure);
+        }
+    }
+
+    /// Lays this session's windows out in tabs as [`Tmux::remote`] has
+    /// them: the windows it has that show here (hidden ones stay
+    /// hidden), the others where they are. `true` if anything moved.
+    fn apply_remote(&self, ws: &mut Workspace) -> bool {
+        let Some(remote) = &self.remote else {
+            return false;
+        };
+        let window_of = |n: Native| {
+            self.pane_of(n)
+                .and_then(|p| self.panes.get(&p))
+                .map(|p| p.window)
+        };
+        let shows = |w: WindowId| {
+            let natives: Vec<Native> = self
+                .panes
+                .values()
+                .filter(|p| p.window == w)
+                .map(|p| p.native)
+                .collect();
+            self.windows.contains_key(&w)
+                && !natives.is_empty()
+                && natives.iter().all(|n| ws.tab_of(*n).is_some())
+        };
+        let mut used: BTreeSet<WindowId> = BTreeSet::new();
+        let wanted: Vec<saved::Node> = remote
+            .tabs
+            .iter()
+            .filter_map(|t| t.root.clone().retain(&mut |w| shows(w) && used.insert(w)))
+            .collect();
+        let now: Vec<saved::Node> = ws
+            .tabs
+            .iter()
+            .filter_map(|t| collapse(&t.root, &window_of))
+            .filter_map(|n| n.retain(&mut |w| used.contains(&w)))
+            .collect();
+        if wanted.is_empty() || now == wanted {
+            return false;
+        }
+        let trees: Option<Vec<Node>> = wanted.iter().map(|n| self.tree_of_saved(n)).collect();
+        let Some(trees) = trees else {
+            return false;
+        };
+        ws.regroup(trees);
+        true
+    }
+
+    /// The native tree of a saved tree of windows this client has.
+    fn tree_of_saved(&self, node: &saved::Node) -> Option<Node> {
+        match node {
+            saved::Node::Window(w) => {
+                let win = self.windows.get(w)?;
+                let panes = &self.panes;
+                native_tree(&win.layout, &|p| panes.get(&p).map(|x| x.native))
+            }
+            saved::Node::Split {
+                row,
+                ratio,
+                first,
+                second,
+            } => Some(Node::Split {
+                axis: if *row { Axis::Row } else { Axis::Column },
+                ratio: f32::from(*ratio) / 1000.0,
+                first: Box::new(self.tree_of_saved(first)?),
+                second: Box::new(self.tree_of_saved(second)?),
+            }),
+        }
     }
 
     /// The last tab holding a pane of this session.
@@ -3149,6 +3294,17 @@ impl Tmux {
                 .or_insert_with(|| look_of(p.native));
         }
         let text = saved.to_text();
+        if std::mem::take(&mut self.adopt) {
+            self.saved_text = Some(text);
+            return out;
+        }
+        // Another client's new window shows here as a tab of its own
+        // until that client's layout comes: writing that would undo it.
+        self.foreign
+            .retain(|_, since| since.elapsed() < FOREIGN_WAIT);
+        if !self.foreign.is_empty() {
+            return out;
+        }
         if self.saved_text.as_ref() != Some(&text) {
             let line = format!("set-option -q {} {}", saved::OPTION, command::quote(&text));
             self.saved_text = Some(text);
@@ -3469,7 +3625,11 @@ mod tests {
         t.feed(&mut ws, START);
         assert!(t.on_shared_server());
         let a = t.feed(&mut ws, &reply(1, &["3.4".into()]));
-        assert_eq!(writes(&a), ["refresh-client -f pause-after=10"], "{a:?}");
+        assert_eq!(
+            writes(&a),
+            ["refresh-client -f pause-after=10 -B 'ferossh-layout::#{@ferossh-layout}'"],
+            "{a:?}"
+        );
         // A later plain attach is the private server again.
         let _ = t.connection_lost(&mut ws);
         assert_eq!(
@@ -3903,6 +4063,36 @@ mod tests {
     }
 
     #[test]
+    fn another_clients_layout_is_followed_and_not_written_back() {
+        let panes = [
+            pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0"),
+            pane_line(1, 1, 80, 24, "b25f,80x24,0,0,1"),
+            pane_line(2, 2, 80, 24, "b25f,80x24,0,0,2"),
+        ];
+        let (mut t, mut ws, _) = attached(None, None, &panes);
+        let [n0, n1, n2] = [0, 1, 2].map(|p| t.native_of(p).unwrap());
+        assert_eq!(ws.tabs.len(), 3);
+        let look = |_| Look::default();
+        let _ = t.sync_saved(&ws, &look);
+        // Another FeroSSH has @0 and @2 split in one tab, @1 hidden.
+        let line = b"%subscription-changed ferossh-layout $0 - - - : \
+            ferossh1 active=1 tab=r300(@0,@2)/@2 hidden=@1\n";
+        let a = t.feed(&mut ws, line);
+        assert!(a.contains(&Action::Structure), "{a:?}");
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.tabs[0].root.panes(), [n0, n2]);
+        assert_eq!(ws.tabs[1].root.panes(), [n1], "shown here stays shown");
+        // Followed, not written back (another active tab, a hidden one).
+        assert!(writes(&t.sync_saved(&ws, &look)).is_empty());
+        // The same again changes nothing.
+        let a = t.feed(&mut ws, line);
+        assert!(!a.contains(&Action::Structure), "{a:?}");
+        // A change made here is written.
+        ws.cycle_tab(true);
+        assert_eq!(writes(&t.sync_saved(&ws, &look)).len(), 1);
+    }
+
+    #[test]
     fn a_hidden_pane_of_a_window_that_shows_stays_hidden() {
         let layout = "x,80x24,0,0{40x24,0,0,2,39x24,41,0,3}";
         let panes = [
@@ -3947,7 +4137,9 @@ mod tests {
     fn flow_control_is_on_from_tmux_3_2_and_a_pause_redraws_the_screen() {
         let panes = [pane_line(5, 1, 80, 24, "b25f,80x24,0,0,5")];
         let (mut t, mut ws, a) = attached(Some("tmux"), None, &panes);
-        assert!(writes(&a).contains(&"refresh-client -f pause-after=10".to_owned()));
+        assert!(writes(&a).contains(
+            &"refresh-client -f pause-after=10 -B 'ferossh-layout::#{@ferossh-layout}'".to_owned()
+        ));
         let native = t.native_of(5).unwrap();
         // The restore's two captures.
         t.feed(&mut ws, &reply(5, &[]));

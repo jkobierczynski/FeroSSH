@@ -674,6 +674,55 @@ impl Workspace {
         }
     }
 
+    /// Lays the panes of `tabs` out as those tabs instead of where they
+    /// are (another view of the same panes, such as another FeroSSH's):
+    /// they leave their tabs, emptied tabs close, and the new tabs open
+    /// where the first of those tabs was. Each keeps a focus it had, and
+    /// the focused pane stays focused. Nothing changes unless all of them
+    /// are in tabs (hidden panes stay hidden).
+    pub fn regroup(&mut self, tabs: Vec<Node>) {
+        let members: Vec<PaneId> = tabs.iter().flat_map(Node::panes).collect();
+        if members.is_empty() || members.iter().any(|m| self.tab_of(*m).is_none()) {
+            return;
+        }
+        let focused = self.focused();
+        let focuses: Vec<PaneId> = self.tabs.iter().map(|t| t.focus).collect();
+        let mut kept: Vec<Tab> = Vec::new();
+        let mut at = None;
+        for tab in std::mem::take(&mut self.tabs) {
+            if at.is_none() && members.iter().any(|m| tab.root.contains(*m)) {
+                at = Some(kept.len());
+            }
+            let mut root = Some(tab.root);
+            for m in &members {
+                root = root.and_then(|r| r.remove(*m));
+            }
+            if let Some(root) = root {
+                let focus = if root.contains(tab.focus) {
+                    tab.focus
+                } else {
+                    root.panes().first().copied().unwrap_or(0)
+                };
+                kept.push(Tab { root, focus });
+            }
+        }
+        let at = at.unwrap_or(kept.len()).min(kept.len());
+        for (k, root) in tabs.into_iter().enumerate() {
+            let focus = focuses
+                .iter()
+                .copied()
+                .find(|f| root.contains(*f))
+                .or_else(|| root.panes().first().copied())
+                .unwrap_or(0);
+            kept.insert(at + k, Tab { root, focus });
+        }
+        self.tabs = kept;
+        self.active = self
+            .tab_of(focused)
+            .unwrap_or(0)
+            .min(self.tabs.len().saturating_sub(1));
+    }
+
     /// Splits pane `target` with the tree `new` on side `side`.
     pub fn graft(&mut self, target: PaneId, new: Node, side: Dir) -> bool {
         let Some(tab) = self.tab_of(target).and_then(|i| self.tabs.get_mut(i)) else {
@@ -1065,6 +1114,33 @@ mod tests {
     use super::*;
 
     const AREA: Rect = Rect::new(0, 0, 1001, 601);
+
+    #[test]
+    fn regroup_moves_panes_into_the_given_tabs() {
+        // Tabs [1] [2] [3 | 4]: another view has 2 and 3 split in one tab.
+        let (mut ws, one) = Workspace::new();
+        let two = ws.new_tab();
+        let three = ws.new_tab();
+        let four = ws.split(Dir::Right).unwrap();
+        ws.focus(two);
+        let wanted = Node::Split {
+            axis: Axis::Column,
+            ratio: 0.3,
+            first: Box::new(Node::Leaf(two)),
+            second: Box::new(Node::Leaf(three)),
+        };
+        ws.regroup(vec![wanted.clone()]);
+        assert_eq!(ws.tabs.len(), 3);
+        assert_eq!(ws.tabs[0].root, Node::Leaf(one));
+        assert_eq!(ws.tabs[1].root, wanted, "where the first of them was");
+        assert_eq!(ws.tabs[2].root, Node::Leaf(four));
+        assert_eq!(ws.focused(), two, "the focus stays");
+        // A hidden pane is never pulled back in.
+        assert!(ws.hide(four));
+        ws.regroup(vec![Node::Leaf(four)]);
+        assert!(ws.is_hidden(four));
+        assert_eq!(ws.tabs.len(), 2);
+    }
 
     #[test]
     fn focus_trail_goes_back_and_forth_and_skips_closed_panes() {
