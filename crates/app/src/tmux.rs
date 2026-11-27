@@ -2412,7 +2412,29 @@ impl Tmux {
         dir: Option<&str>,
         worktree: Option<&Worktree>,
     ) -> Vec<Action> {
-        let dir = worktree.map(|w| w.path.as_str()).or(dir);
+        let cwd = worktree
+            .map(|w| w.path.as_str())
+            .or(dir)
+            .map(same_dir::tmux_cwd);
+        self.start_agent_with(native, command, cwd, worktree)
+    }
+
+    /// [`Self::start_agent`] in folder `rel` of the home folder of the
+    /// user tmux runs as (`.`: the home folder), as a prompt showed
+    /// `~/rel`.
+    pub fn start_agent_in_home(&mut self, native: Native, command: &str, rel: &str) -> Vec<Action> {
+        self.start_agent_with(native, command, Some(same_dir::tmux_home_cwd(rel)), None)
+    }
+
+    /// [`Self::start_agent`] with tmux `-c` option `cwd`, or in the
+    /// folder of pane `native` when `None`.
+    fn start_agent_with(
+        &mut self,
+        native: Native,
+        command: &str,
+        cwd: Option<String>,
+        worktree: Option<&Worktree>,
+    ) -> Vec<Action> {
         let mut out = Vec::new();
         if !self.active() || command.trim().is_empty() || self.refuse_joined(&mut out) {
             return out;
@@ -2436,11 +2458,10 @@ impl Tmux {
             ),
         );
         let split = Split::Agent(Placement::Tab { after: native }, n);
-        match dir {
+        match cwd {
             // The asking shell's directory, or tmux's default when it cannot
             // be given to tmux: never another pane's.
-            Some(dir) => {
-                let cwd = same_dir::tmux_cwd(dir);
+            Some(cwd) => {
                 self.open_split(split, &cwd, &mut out);
             }
             None => {

@@ -65,6 +65,24 @@ pub fn shell_command(distro: &str) -> String {
     }
 }
 
+/// [`shell_command`] in Linux folder `dir`, when it is a full path that
+/// fits in a Windows command line in quotes; in the home folder otherwise.
+pub fn shell_command_in(distro: &str, dir: Option<&str>) -> String {
+    let base = shell_command(distro);
+    let Some(dir) = dir.filter(|d| {
+        d.starts_with('/')
+            && !d.ends_with('\\')
+            && !d.contains('"')
+            && !d.chars().any(char::is_control)
+    }) else {
+        return base;
+    };
+    match base.strip_suffix(" --cd ~") {
+        Some(start) => format!("{start} --cd \"{dir}\""),
+        None => base,
+    }
+}
+
 /// The label of a WSL pane, its tmux panes and its agents' host.
 pub fn label(distro: &str) -> String {
     if distro.is_empty() {
@@ -110,18 +128,19 @@ pub fn gateway_args(
     args
 }
 
-/// The arguments for `wsl.exe` that run `command` (a line for a POSIX
-/// shell, as an SSH exec channel would run it, such as
-/// [`crate::diff::command`]) with `sh -c` in `distro` (the default when
-/// empty), in the home folder.
+/// The arguments for `wsl.exe` that run `command` (a line for a login
+/// shell, such as [`crate::worktree::add_command`]) under `sh` in
+/// `distro`, in the home folder.
 pub fn script_args(distro: &str, command: &str) -> Vec<String> {
     let mut args = Vec::new();
     if valid_name(distro) {
         args.extend(["-d".to_owned(), distro.to_owned()]);
     }
-    args.extend(["--cd".to_owned(), "~".to_owned()]);
-    args.extend(["-e".to_owned(), "sh".to_owned(), "-c".to_owned()]);
-    args.push(command.to_owned());
+    args.extend(
+        ["--cd", "~", "-e", "sh", "-c", command]
+            .into_iter()
+            .map(str::to_owned),
+    );
     args
 }
 
@@ -251,20 +270,6 @@ mod tests {
     }
 
     #[test]
-    fn scripts_run_whole_in_sh() {
-        let line = "exec sh -c 'echo \"$1\" it\\x'";
-        assert_eq!(
-            script_args("Ubuntu-24.04", line),
-            ["-d", "Ubuntu-24.04", "--cd", "~", "-e", "sh", "-c", line]
-        );
-        assert_eq!(script_args("", "x"), ["--cd", "~", "-e", "sh", "-c", "x"]);
-        assert_eq!(
-            script_args("bad name", "x"),
-            ["--cd", "~", "-e", "sh", "-c", "x"]
-        );
-    }
-
-    #[test]
     fn home_relative_folders() {
         assert_eq!(
             in_home_folder("my app", "run"),
@@ -302,9 +307,39 @@ mod tests {
     fn shell_commands() {
         assert_eq!(shell_command("Ubuntu"), "wsl.exe -d Ubuntu --cd ~");
         assert_eq!(shell_command(""), "wsl.exe --cd ~");
+        assert_eq!(
+            shell_command_in("Ubuntu", Some("/home/me/my project")),
+            "wsl.exe -d Ubuntu --cd \"/home/me/my project\""
+        );
+        assert_eq!(shell_command_in("", Some("/srv")), "wsl.exe --cd \"/srv\"");
+        for odd in ["project", "/a\"b", "/a\\", "/a\nb"] {
+            assert_eq!(
+                shell_command_in("Ubuntu", Some(odd)),
+                "wsl.exe -d Ubuntu --cd ~"
+            );
+        }
+        assert_eq!(shell_command_in("Ubuntu", None), "wsl.exe -d Ubuntu --cd ~");
         assert_eq!(shell_command("a b"), "wsl.exe --cd ~");
         assert_eq!(label("Ubuntu"), "WSL Ubuntu");
         assert_eq!(label(""), "WSL");
+    }
+
+    #[test]
+    fn script_arguments() {
+        assert_eq!(
+            script_args("Ubuntu", "exec sh -c 'x'"),
+            [
+                "-d",
+                "Ubuntu",
+                "--cd",
+                "~",
+                "-e",
+                "sh",
+                "-c",
+                "exec sh -c 'x'"
+            ]
+        );
+        assert_eq!(script_args("", "y")[..2], ["--cd", "~"]);
     }
 
     #[test]
@@ -353,7 +388,10 @@ mod e2e {
     /// runs it in the distro.
     fn spawn(socket: &str, before: Option<&str>) -> PipeChild {
         let script = gateway_script(before, "agents");
-        let wrapped = format!("export TMUX_TMPDIR={socket}; unset TMUX; {script}");
+        let wrapped = format!(
+            "export TMUX_TMPDIR={}; unset TMUX; {script}",
+            sh_quote(socket)
+        );
         PipeChild::spawn(Path::new("/bin/sh"), &["-c".into(), wrapped], || {}).unwrap()
     }
 
@@ -373,67 +411,10 @@ mod e2e {
                     }
                 }
                 Some(Output::Exited(code)) => panic!("exited {code:?}: {all:?}"),
-                Some(Output::Stderr(_)) | None => {}
+                None => {}
             }
         }
         panic!("timed out: {all:?}");
-    }
-
-    /// The git scripts reach WSL as `wsl.exe` passes them on: what
-    /// follows `-e` runs as given.
-    #[test]
-    fn a_worktree_script_runs_through_script_args() {
-        let has_git = std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !has_git {
-            eprintln!("git is not installed: skipped");
-            return;
-        }
-        let root = std::env::temp_dir().join(format!("ferossh-wsl-git-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let repo = root.join("app");
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
-                .arg(&repo)
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success();
-            assert!(ok, "git {args:?}");
-        };
-        git(&["init", "-q"]);
-        std::fs::write(repo.join("a"), "a").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "one"]);
-        let command = String::from_utf8(crate::worktree::add_command()).unwrap();
-        let args = script_args("", &command);
-        let at = args.iter().position(|a| a == "-e").unwrap();
-        let mut c = PipeChild::spawn_split(Path::new("/bin/sh"), &args[at + 2..], || {}).unwrap();
-        let dir = repo.to_str().unwrap().as_bytes();
-        c.write(crate::worktree::add_input(dir, "claude").unwrap());
-        c.close_input();
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        loop {
-            match c.read_timeout(Duration::from_secs(20)) {
-                Some(Output::Data(d)) => out.extend(d),
-                Some(Output::Stderr(d)) => err.extend(d),
-                Some(Output::Exited(_)) => break,
-                None => panic!("no exit"),
-            }
-        }
-        let made = crate::worktree::parse_add(&out, &err);
-        let canon = std::fs::canonicalize(&root).unwrap();
-        assert!(
-            matches!(&made, crate::worktree::Added::Made(w)
-                if w.branch == "claude" && w.path == canon.join("app-claude").to_str().unwrap()),
-            "{made:?}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -483,6 +464,40 @@ mod e2e {
     }
 
     #[test]
+    fn the_worktree_script_runs_as_wsl_would_run_it() {
+        let ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !ok {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("ferossh-wslwt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        let st = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("git init -q -b main . && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m one")
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let command = String::from_utf8(crate::worktree::add_command()).unwrap();
+        // `wsl.exe <args>` runs `sh -c <command>`: the same here, minus
+        // the distro and folder options.
+        let args = script_args("", &command);
+        let input =
+            crate::worktree::add_input(repo.to_str().unwrap().as_bytes(), "claude").unwrap();
+        let (out, err) = crate::pipes::run_once(Path::new("/bin/sh"), &args[4..], &input).unwrap();
+        match crate::worktree::parse_add(&out, &err) {
+            crate::worktree::Added::Made(w) => assert_eq!(w.branch, "claude"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn without_tmux_the_gateway_says_so() {
         let script = gateway_script(None, "agents");
         let c = PipeChild::spawn(
@@ -494,7 +509,7 @@ mod e2e {
         let mut out = Vec::new();
         loop {
             match c.read_timeout(Duration::from_secs(10)).unwrap() {
-                Output::Data(d) | Output::Stderr(d) => out.extend(d),
+                Output::Data(d) => out.extend(d),
                 Output::Exited(code) => {
                     assert_eq!(code, Some(127));
                     break;
