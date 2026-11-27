@@ -19,12 +19,53 @@ use crate::sessions::HostItem;
 pub enum BulkAction {
     /// Connect to each, a tab each.
     OpenAll(Vec<String>),
+    /// Connect to each as the panes of one new tab, in a grid; with
+    /// broadcast input to that tab turned on when `.1`.
+    GridAll(Vec<String>, bool),
     AddTag(Vec<String>, String),
     RemoveTag(Vec<String>, String),
     /// Into this folder (`None`: no folder); saved connections only.
     MoveTo(Vec<String>, Option<String>),
     /// One field set on many, as previewed.
     Edit(crate::bulk_edit::Plan),
+}
+
+/// The most connections Connect to all opens in one grid: four by four.
+pub const MAX_GRID: usize = 16;
+
+/// A grid of panes for connections `names` (2 to [`MAX_GRID`]): as many
+/// columns as rows or one more, rows of equal height and, in each row,
+/// panes of equal width; a last row with fewer panes widens them.
+pub fn grid(names: &[String]) -> Option<ferossh_config::workspace::Layout> {
+    use ferossh_config::workspace::{Layout, Open, PaneSpec};
+    // `items` in equal shares, side by side (`down` false) or stacked.
+    fn even(mut items: Vec<Layout>, down: bool) -> Option<Layout> {
+        let mut node = items.pop()?;
+        let mut k = 1;
+        // Built from the end: each split's first half is 1/k of its k.
+        while let Some(first) = items.pop() {
+            k += 1;
+            node = Layout::Split {
+                down,
+                ratio: 1.0 / k as f32,
+                first: Box::new(first),
+                second: Box::new(node),
+            };
+        }
+        Some(node)
+    }
+    let n = names.len();
+    if !(2..=MAX_GRID).contains(&n) {
+        return None;
+    }
+    // Columns: the smallest c with c * c >= n.
+    let cols = (1..=n).find(|c| c * c >= n)?;
+    let pane = |name: &String| Layout::Pane(PaneSpec::new(Open::Connection(name.clone())));
+    let rows: Vec<Layout> = names
+        .chunks(cols)
+        .map(|row| even(row.iter().map(pane).collect(), false))
+        .collect::<Option<_>>()?;
+    even(rows, true)
 }
 
 /// The most entries a submenu lists.
@@ -217,6 +258,63 @@ pub fn name_list(names: &[String]) -> String {
 mod tests {
     use super::*;
     use ferossh_config::settings::SessionKind;
+
+    #[test]
+    fn grids_are_square_or_one_column_wider() {
+        use ferossh_config::workspace::{Layout, Open};
+        // Rows (the splits down), and per row its panes.
+        fn shape(l: &Layout) -> Vec<usize> {
+            match l {
+                Layout::Split {
+                    down: true,
+                    first,
+                    second,
+                    ..
+                } => {
+                    let mut v = vec![first.panes().len()];
+                    v.extend(shape(second));
+                    v
+                }
+                other => vec![other.panes().len()],
+            }
+        }
+        let names = |n: usize| (0..n).map(|i| format!("h{i}")).collect::<Vec<_>>();
+        assert!(grid(&names(1)).is_none());
+        assert!(grid(&names(17)).is_none());
+        for (n, rows) in [
+            (2, vec![2]),
+            (3, vec![2, 1]),
+            (4, vec![2, 2]),
+            (5, vec![3, 2]),
+            (7, vec![3, 3, 1]),
+            (9, vec![3, 3, 3]),
+            (10, vec![4, 4, 2]),
+            (16, vec![4, 4, 4, 4]),
+        ] {
+            let g = grid(&names(n)).unwrap();
+            assert_eq!(shape(&g), rows, "{n}");
+            // In order, left to right and top to bottom.
+            let order: Vec<String> = g
+                .panes()
+                .iter()
+                .map(|p| match &p.open {
+                    Open::Connection(c) => c.clone(),
+                    _ => String::new(),
+                })
+                .collect();
+            assert_eq!(order, names(n));
+        }
+        // Equal shares: of three rows the first is 1/3, then 1/2.
+        let ratios = |l: &Layout| match l {
+            Layout::Split { ratio, second, .. } => match second.as_ref() {
+                Layout::Split { ratio: next, .. } => Some((*ratio, *next)),
+                Layout::Pane(_) => None,
+            },
+            Layout::Pane(_) => None,
+        };
+        let (first, next) = ratios(&grid(&names(9)).unwrap()).unwrap();
+        assert!((first - 1.0 / 3.0).abs() < 1e-6 && (next - 0.5).abs() < 1e-6);
+    }
 
     fn item(name: &str, tags: &[&str]) -> HostItem {
         HostItem {

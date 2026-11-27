@@ -55,7 +55,9 @@ pub enum Notification {
         window: WindowId,
         pane: PaneId,
     },
-    /// tmux paused output for a pane (flow control).
+    /// tmux paused output for a pane (flow control): what the pane
+    /// wrote since is dropped, and comes back only by asking for the
+    /// screen again.
     Pause {
         pane: PaneId,
     },
@@ -90,6 +92,21 @@ pub fn parse_notification(line: &[u8]) -> Notification {
             let pane = rest.iter().position(|&b| b == b' ').and_then(|i| {
                 let p = std::str::from_utf8(rest.get(..i)?).ok()?;
                 Some((id(p, '%')?, rest.get(i + 1..)?))
+            });
+            pane.map(|(pane, data)| Notification::Output {
+                pane,
+                data: unescape(data),
+            })
+        }
+        // With the `pause-after` flag on, tmux sends output this way:
+        // `%extended-output %3 1200 : data`, the age (milliseconds) and
+        // any words a later tmux adds before the ` : `.
+        b"%extended-output" => {
+            let pane = rest.iter().position(|&b| b == b' ').and_then(|i| {
+                let p = std::str::from_utf8(rest.get(..i)?).ok()?;
+                let after = rest.get(i..)?;
+                let colon = after.windows(3).position(|w| w == b" : ")?;
+                Some((id(p, '%')?, after.get(colon + 3..)?))
             });
             pane.map(|(pane, data)| Notification::Output {
                 pane,
@@ -215,6 +232,36 @@ mod tests {
         // Not an escape: kept as it is.
         assert_eq!(unescape(br"\9\07\777"), br"\9\07\777");
         assert_eq!(unescape("é".as_bytes()), "é".as_bytes());
+    }
+
+    #[test]
+    fn extended_output() {
+        assert_eq!(
+            parse_notification(br"%extended-output %7 1200 : a : b\015\012"),
+            Notification::Output {
+                pane: 7,
+                data: b"a : b\r\n".to_vec()
+            }
+        );
+        // Words a later tmux adds before the colon are skipped.
+        assert_eq!(
+            parse_notification(b"%extended-output %7 5 x y : z"),
+            Notification::Output {
+                pane: 7,
+                data: b"z".to_vec()
+            }
+        );
+        assert_eq!(
+            parse_notification(b"%extended-output %7 0 : "),
+            Notification::Output {
+                pane: 7,
+                data: Vec::new()
+            }
+        );
+        assert_eq!(
+            parse_notification(b"%extended-output %7 0"),
+            Notification::Other
+        );
     }
 
     #[test]

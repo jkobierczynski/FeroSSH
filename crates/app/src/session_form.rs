@@ -107,6 +107,8 @@ pub struct Values {
     pub legacy: bool,
     /// Read the server's OS and kernel after login (`SystemInfo yes`).
     pub system_info: bool,
+    /// Every key goes to the host (`SendAllKeys yes`).
+    pub all_keys: bool,
     /// WinRM over HTTPS (`WinrmHttps yes`).
     pub winrm_https: bool,
     /// WinRM over HTTP may log in with NTLM (`WinrmNtlm yes`).
@@ -258,6 +260,7 @@ impl Values {
             .unwrap_or_default();
         self.legacy = p.legacy_algorithms;
         self.system_info = p.system_info;
+        self.all_keys = p.send_all_keys;
         (self.password, self.password_command) = password_choice(&p.password);
         self.login_script = p.login_script.iter().map(ToString::to_string).collect();
         self.mosh_server = p.mosh_server.clone().unwrap_or_default();
@@ -313,6 +316,7 @@ enum Field {
     DeskClipboard,
     Legacy,
     SystemInfo,
+    AllKeys,
     WinrmHttps,
     ForwardAgent,
     Kerberos,
@@ -366,6 +370,7 @@ impl Field {
             Field::DeskClipboard => "Desk clip",
             Field::Legacy => "Old crypto",
             Field::SystemInfo => "Read OS",
+            Field::AllKeys => "All keys",
             Field::WinrmHttps => "Transport",
             Field::ForwardAgent => "Fwd agent",
             Field::Kerberos => "Kerberos",
@@ -394,6 +399,7 @@ impl Field {
                 | Field::TmuxLayout
                 | Field::Legacy
                 | Field::SystemInfo
+                | Field::AllKeys
                 | Field::WinrmHttps
                 | Field::ForwardAgent
                 | Field::Kerberos
@@ -742,6 +748,7 @@ impl SessionForm {
                         Field::Font,
                         Field::FontSize,
                         Field::Scrollback,
+                        Field::AllKeys,
                     ]
                     .map(Item::Field),
                 );
@@ -919,6 +926,7 @@ impl SessionForm {
             | Field::TmuxLayout
             | Field::Legacy
             | Field::SystemInfo
+            | Field::AllKeys
             | Field::WinrmHttps
             | Field::ForwardAgent
             | Field::Kerberos
@@ -975,6 +983,7 @@ impl SessionForm {
             | Field::TmuxLayout
             | Field::Legacy
             | Field::SystemInfo
+            | Field::AllKeys
             | Field::WinrmHttps
             | Field::ForwardAgent
             | Field::Kerberos
@@ -1074,6 +1083,12 @@ impl SessionForm {
                 "read OS and kernel"
             } else {
                 "off"
+            }
+            .to_owned(),
+            Field::AllKeys => if v.all_keys {
+                "to the host, FeroSSH's shortcuts too"
+            } else {
+                "FeroSSH's shortcuts work"
             }
             .to_owned(),
             Field::WinrmHttps => match (v.winrm_https, v.winrm_ntlm) {
@@ -1191,6 +1206,7 @@ impl SessionForm {
             }
             Field::Legacy => v.legacy = !v.legacy,
             Field::SystemInfo => v.system_info = !v.system_info,
+            Field::AllKeys => v.all_keys = !v.all_keys,
             // HTTP Kerberos only, HTTP with NTLM, HTTPS, and round.
             Field::WinrmHttps => {
                 const ORDER: [(bool, bool); 3] = [(false, false), (false, true), (true, false)];
@@ -1324,6 +1340,7 @@ impl SessionForm {
             | Field::TmuxLayout
             | Field::Legacy
             | Field::SystemInfo
+            | Field::AllKeys
             | Field::WinrmHttps
             | Field::ForwardAgent
             | Field::Kerberos
@@ -2298,6 +2315,7 @@ impl SessionForm {
             .filter(|d| *d != ferossh_config::settings::DesktopSize::Follow);
         p.legacy_algorithms = v.legacy;
         p.system_info = v.system_info;
+        p.send_all_keys = v.all_keys;
         p.password = match (v.kind, v.password) {
             (
                 SessionKind::Ssh

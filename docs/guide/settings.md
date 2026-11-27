@@ -124,6 +124,7 @@ Profile web1
 | `FontSize N` | Text size in points. |
 | `Theme NAME` | Colour theme, for example `Nord`, `Dracula` or `Production`. |
 | `Tags TAG...` | The connection's own tags (Tags in the connection form), separated by spaces: shown and searched in the connection manager and matched by theme rules, on top of ssh_config's `Tag`. Up to 16, each up to 32 letters, digits, `-`, `_`, `.`, `/` and `:`; others are left out. |
+| `SendAllKeys yes` | Every key typed in the connection's panes goes to the host, FeroSSH's shortcuts too (All keys in the connection form; Session > Send all keys to the host for one session). |
 | `SystemInfo yes` | After each SSH login, reads the server's OS and kernel for [Tools > Hosts](everyday-use.md#hosts) (Read OS in the connection form's Extras). |
 | `Credential NAME` | The named credential the connection uses (see [Credentials](#credentials)): its user, key file and password source win over the connection's own. |
 | `Scrollback N` | Lines of scrollback for this host's panes. |

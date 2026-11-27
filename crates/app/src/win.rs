@@ -595,6 +595,9 @@ mod cmd {
     pub const SAVE_SNIPPET: u32 = 506;
     pub const RECORD_SNIPPET: u32 = 507;
     pub const HIGHLIGHT: u32 = 508;
+    /// Session > Send all keys to the host: for the focused pane's
+    /// connection, until it closes (`SendAllKeys` in its profile).
+    pub const ALL_KEYS: u32 = 530;
     pub const STOP_AT: u32 = 509;
     pub const SCROLL_PAGE_UP: u32 = 510;
     pub const SCROLL_PAGE_DOWN: u32 = 511;
@@ -1778,6 +1781,15 @@ struct Window {
     workspace_waiting: workspaces::Waiting,
     /// A workspace's panes that open a tmux session once logged in.
     workspace_tmux: HashMap<PaneId, WorkspaceTmux>,
+    /// Gateway panes that attached tmux by themselves after a login,
+    /// from the host's profile: their list of other sessions is offered
+    /// only while you look at them, never popped up over other work.
+    tmux_login_pick: HashSet<PaneId>,
+    /// Session > Send all keys to the host, turned on or off by hand for
+    /// a pane's connection (by the pane with the session: a tmux pane's
+    /// gateway), with the connection it was for; the profile's
+    /// `SendAllKeys` otherwise, and once the pane opens another one.
+    all_keys: HashMap<PaneId, (String, bool)>,
     /// What a workspace gave its panes besides their place: what they run
     /// once logged in, and that their logins may keep passwords.
     workspace_extra: HashMap<PaneId, WorkspaceExtra>,
@@ -3283,6 +3295,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 run_login: HashSet::new(),
                 workspace_waiting: workspaces::Waiting::default(),
                 workspace_tmux: HashMap::new(),
+                tmux_login_pick: HashSet::new(),
+                all_keys: HashMap::new(),
                 workspace_extra: HashMap::new(),
                 layout_owner: claim_last_layout(),
                 workspace_after: HashMap::new(),
@@ -3761,6 +3775,7 @@ fn build_menu() -> Result<HMENU> {
             "Show i&mages the host prints (Sixel, kitty, iTerm2)",
         )?;
         item(session, cmd::HIGHLIGHT, "Hi&ghlight keywords")?;
+        item(session, cmd::ALL_KEYS, "Send all keys to the hos&t")?;
         separator(session)?;
         item(
             session,
@@ -4420,6 +4435,75 @@ impl Window {
         self.panes.get(&id).and_then(Pane::gateway).unwrap_or(id)
     }
 
+    /// Whether every key typed in pane `id` goes to the host, FeroSSH's
+    /// shortcuts too (Session > Send all keys to the host, or
+    /// `SendAllKeys yes` in the connection's profile).
+    fn sends_all_keys(&self, id: PaneId) -> bool {
+        let host = self.host_pane(id);
+        let (identity, profile) = self.all_keys_identity(host);
+        if let Some((was, on)) = self.all_keys.get(&host)
+            && *was == identity
+        {
+            return *on;
+        }
+        profile
+            .and_then(|a| self.settings.profile(&a))
+            .is_some_and(|p| p.send_all_keys)
+    }
+
+    /// Drops a Send all keys toggle that pane `id` holds for another
+    /// connection, once it opens a new one: going back to the old one
+    /// later starts from that connection's profile again. A reconnect to
+    /// the same connection keeps it.
+    fn forget_other_all_keys(&mut self, id: PaneId) {
+        let host = self.host_pane(id);
+        let (identity, _) = self.all_keys_identity(host);
+        if self
+            .all_keys
+            .get(&host)
+            .is_some_and(|(was, _)| *was != identity)
+        {
+            self.all_keys.remove(&host);
+        }
+    }
+
+    /// What pane `host` shows, for [`Self::sends_all_keys`]: its kind and
+    /// connection (a toggle by hand holds only while that stays, across
+    /// reconnects), and the profile it reads `SendAllKeys` from.
+    fn all_keys_identity(&self, host: PaneId) -> (String, Option<String>) {
+        match self.panes.get(&host).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => (
+                format!("ssh {}", s.target.alias),
+                Some(s.target.alias.clone()),
+            ),
+            Some(Host::Telnet(s)) => (
+                format!("telnet {}", s.target.alias),
+                Some(s.target.alias.clone()),
+            ),
+            Some(Host::Winrm(s)) => (
+                format!("winrm {}", s.target.alias),
+                Some(s.target.alias.clone()),
+            ),
+            Some(Host::Serial {
+                session, target, ..
+            }) => (
+                format!(
+                    "serial {} {}",
+                    target.port,
+                    session.as_deref().unwrap_or_default()
+                ),
+                session.clone(),
+            ),
+            Some(Host::Local { command, wsl, .. }) => (
+                format!("local {command} {}", wsl.as_deref().unwrap_or("-")),
+                None,
+            ),
+            Some(Host::Ask(_)) => ("ask".to_owned(), None),
+            Some(_) => (format!("other {}", host), None),
+            None => (String::new(), None),
+        }
+    }
+
     /// A tmux pane in tmux layout, whose place tmux decides: it does not
     /// move between tabs natively.
     fn locked(&self, id: PaneId) -> bool {
@@ -4631,6 +4715,13 @@ impl Window {
                 | tmux::Action::ShowGateway
                 | tmux::Action::Structure => structure = true,
                 tmux::Action::Picker(names) => {
+                    if self.tmux_login_pick.remove(&gateway) {
+                        // SAFETY: plain query.
+                        let front = unsafe { GetForegroundWindow() } == self.hwnd;
+                        if !front || self.host_pane(self.focused_id()) != gateway {
+                            continue;
+                        }
+                    }
                     self.queued.push(Command::TmuxPicker { gateway, names });
                 }
                 tmux::Action::Crowded {
@@ -4915,6 +5006,10 @@ impl Window {
             self.workspace_tmux.remove(&id);
         }
         let mut shared = false;
+        // Only a first attach from the host's profile offers the host's
+        // other sessions: after a dropped connection or from a workspace
+        // the session to show is known.
+        let mut pick = false;
         let (name, rebuild) = match self.reattach.remove(&id) {
             Some((k, Some((name, on_shared)))) if k == key => {
                 shared = on_shared;
@@ -4924,7 +5019,10 @@ impl Window {
             _ => match self.workspace_tmux.get(&id) {
                 Some(w) => (w.name.clone(), w.rebuild.clone()),
                 None => match profile {
-                    Some(name) => (name, None),
+                    Some(name) => {
+                        pick = true;
+                        (name, None)
+                    }
                     None => return false,
                 },
             },
@@ -4960,7 +5058,11 @@ impl Window {
                 t.reattach_on_shared(&name);
             }
         }
-        self.attach_tmux(id, &name, false)
+        let pick = pick && !shared;
+        if pick {
+            self.tmux_login_pick.insert(id);
+        }
+        self.attach_tmux(id, &name, pick)
     }
 
     /// Types the `cd` to the directory of the pane a new tab or pane was
@@ -5371,6 +5473,7 @@ impl Window {
                 self.show(id, &text);
             }
         }
+        self.forget_other_all_keys(id);
         self.update_title();
         self.refresh(id);
     }
@@ -8704,6 +8807,7 @@ impl Window {
                 session: session.map(str::to_owned),
             };
         }
+        self.forget_other_all_keys(id);
         self.show(id, &text);
         self.start_log(id);
         if is_open && !self.start_script(id, &alias, false) {
@@ -8925,6 +9029,7 @@ impl Window {
         };
         p.host = Host::Ssh(Box::new(session));
         self.apply(id, effects);
+        self.forget_other_all_keys(id);
         self.update_title();
         self.refresh_chrome();
         self.refresh(id);
@@ -8966,6 +9071,7 @@ impl Window {
         let effects = session.start(clamp16(p.term.cols()), clamp16(p.term.rows()));
         p.host = Host::Telnet(Box::new(session));
         self.apply(id, effects);
+        self.forget_other_all_keys(id);
         self.update_title();
         self.refresh_chrome();
         self.refresh(id);
@@ -9049,6 +9155,7 @@ impl Window {
         };
         p.host = Host::Winrm(Box::new(session));
         self.apply(id, effects);
+        self.forget_other_all_keys(id);
         self.update_title();
         self.refresh_chrome();
         self.refresh(id);
@@ -15968,7 +16075,7 @@ impl Window {
     }
 
     fn tmux_keys_of(&self, id: PaneId) -> Option<tmux_keys::Keys> {
-        if !self.settings.tmux_keys {
+        if !self.settings.tmux_keys || self.sends_all_keys(id) {
             return None;
         }
         let p = self.panes.get(&id)?;
@@ -16233,6 +16340,26 @@ impl Window {
         if mods.alt && vk == VK_F4 {
             return KeyOutcome::Default;
         }
+        // Send all keys to the host: none of FeroSSH's shortcuts but the
+        // one that turns it off, for programs that use them (Zellij's
+        // Alt+arrows, tmux run by hand). The menus still work.
+        if !self.side.focused
+            && self.sends_all_keys(self.focused_id())
+            && self
+                .panes
+                .get(&self.focused_id())
+                .is_some_and(|p| !p.term.search_active())
+        {
+            if self.shortcut_for(vk, mods) == Some(cmd::ALL_KEYS) {
+                drop_pending_char(self.hwnd);
+                return if held {
+                    KeyOutcome::Handled
+                } else {
+                    KeyOutcome::Run(Command::Id(cmd::ALL_KEYS))
+                };
+            }
+            return self.key_to_host(vk, mods);
+        }
         // F11: full screen, before the tmux prefix and the panes, so it
         // works in a side pane, the search bar and a remote desktop too.
         // Held down, it does not flip back and forth.
@@ -16280,6 +16407,10 @@ impl Window {
         }
         if let Some(id) = self.shortcut_for(vk, mods) {
             drop_pending_char(self.hwnd);
+            // Held down, Send all keys to the host does not flip back.
+            if id == cmd::ALL_KEYS && held {
+                return KeyOutcome::Handled;
+            }
             return KeyOutcome::Run(Command::Id(id));
         }
         if self.side.focused {
@@ -16313,6 +16444,14 @@ impl Window {
             drop_pending_char(self.hwnd);
             return KeyOutcome::Handled;
         }
+        self.key_to_host(vk, mods)
+    }
+
+    /// A key that no shortcut took, for the focused pane: the terminal's
+    /// keys and control codes go to the host (and broadcast); anything
+    /// else comes as a character (WM_CHAR).
+    fn key_to_host(&mut self, vk: VIRTUAL_KEY, mods: Mods) -> KeyOutcome {
+        let id = self.focused_id();
         if let Some(key) = terminal_key(vk) {
             drop_pending_char(self.hwnd);
             let typed = match key {
@@ -18862,6 +19001,7 @@ impl Window {
                     self.open_host(name, false);
                 }
             }
+            BulkAction::GridAll(names, broadcast) => self.open_grid(&names, broadcast),
             BulkAction::AddTag(names, tag) => {
                 let names = self.not_team(&names);
                 crate::bulk::add_tag(&mut self.settings, &names, &tag);
@@ -19711,6 +19851,59 @@ impl Window {
         if let Some(id) = self.host_pane_for(split) {
             self.focus_terminal();
             self.connect(id, host);
+        }
+    }
+
+    /// Connection manager > Connect to all in one grid: the terminal
+    /// connections as the panes of one new tab (see [`crate::bulk::grid`]),
+    /// on broadcast input to that tab when `broadcast`. Desktop, file
+    /// transfer and tunnel connections have no terminal and open as
+    /// usual, a tab each.
+    fn open_grid(&mut self, names: &[String], broadcast: bool) {
+        let (terminals, others): (Vec<String>, Vec<String>) =
+            names.iter().cloned().partition(|n| {
+                self.settings.profile(n).is_none_or(|p| {
+                    matches!(
+                        p.kind,
+                        SessionKind::Ssh
+                            | SessionKind::Telnet
+                            | SessionKind::Mosh
+                            | SessionKind::Serial
+                            | SessionKind::WinRm
+                    )
+                })
+            });
+        for name in &others {
+            self.open_host(name, false);
+        }
+        match terminals.as_slice() {
+            [] => return,
+            [one] => {
+                self.open_host(one, false);
+                return;
+            }
+            _ => {}
+        }
+        let Some(root) = crate::bulk::grid(&terminals) else {
+            for name in &terminals {
+                self.open_host(name, false);
+            }
+            return;
+        };
+        for name in &terminals {
+            self.note_recent(name);
+        }
+        let ws = wsfile::Workspace {
+            tabs: vec![wsfile::TabSpec { root, focus: 0 }],
+            active: 0,
+        };
+        // Nothing of its own runs: the panes only connect.
+        self.open_workspace(&ws, false);
+        if broadcast && self.broadcast != broadcast::Scope::Tab {
+            self.broadcast = self.broadcast.toggle(broadcast::Scope::Tab);
+            self.update_menu_checks();
+            self.update_title();
+            self.refresh_chrome();
         }
     }
 
@@ -21025,6 +21218,8 @@ impl Window {
         }
         self.reattach.remove(&id);
         self.workspace_tmux.remove(&id);
+        self.tmux_login_pick.remove(&id);
+        self.all_keys.remove(&id);
         self.workspace_extra.remove(&id);
         self.workspace_after.remove(&id);
         self.workspace_waiting.forget(id);
@@ -22795,6 +22990,17 @@ impl Window {
                 self.refresh(pane);
             }
             cmd::HIGHLIGHT => self.toggle_highlight(),
+            cmd::ALL_KEYS => {
+                // Nothing is written into the pane: a full-screen program
+                // owns it. The menu's tick shows it.
+                let host = self.host_pane(pane);
+                let on = !self.sends_all_keys(pane);
+                let (identity, _) = self.all_keys_identity(host);
+                self.all_keys.insert(host, (identity, on));
+                // A tmux prefix pressed before does not carry over.
+                self.tmux_armed = None;
+                self.tmux_repeat = None;
+            }
             cmd::CLEAR_SCROLLBACK => {
                 self.panes.get_mut(&pane)?.term.clear_scrollback();
                 self.refresh(pane);
@@ -23775,6 +23981,7 @@ impl Window {
                 (cmd::AGENT_AUDIT, s.agent_audit),
                 (cmd::ANSWER_TOASTS, s.answer_from_notification),
                 (cmd::HIGHLIGHT, s.highlight),
+                (cmd::ALL_KEYS, self.sends_all_keys(self.focused_id())),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
                 (cmd::TOOLS_RAIL, s.tools_rail),
@@ -28394,6 +28601,8 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
     const CONNECT_ALL: u32 = 1;
     const DELETE: u32 = 2;
     const CLEAR: u32 = 3;
+    const GRID: u32 = 4;
+    const GRID_BROADCAST: u32 = 5;
     let Some((tags, folders)) = group_choices(&names) else {
         return;
     };
@@ -28414,6 +28623,20 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             CONNECT_ALL as usize,
             PCWSTR(connect.as_ptr()),
         );
+        if n <= crate::bulk::MAX_GRID {
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                GRID as usize,
+                w!("Connect to all in one tab, as a &grid"),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                GRID_BROADCAST as usize,
+                w!("Connect to all in one grid with &broadcast input"),
+            );
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         append_group_items(menu, &tags, &folders);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -28460,6 +28683,18 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
                 return;
             }
             BulkAction::OpenAll(names)
+        }
+        GRID | GRID_BROADCAST => {
+            if n > 8
+                && dialog(
+                    hwnd,
+                    &format!("Connect to all {n} connections, in one grid?"),
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                ) != Some(IDYES)
+            {
+                return;
+            }
+            BulkAction::GridAll(names, picked == GRID_BROADCAST)
         }
         p => {
             group_pick(hwnd, p, names, &tags, &folders);

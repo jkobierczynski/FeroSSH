@@ -206,6 +206,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |
 | Show images the host prints (Sixel, kitty, iTerm2) | Shows pictures programs on the host print, such as `img2sixel`, `kitten icat` and `imgcat` (see [Images in the terminal](everyday-use.md#images-in-the-terminal)). ✓ `InlineImages`; off by default. |
 | Highlight keywords | Colours errors, warnings, success words and addresses in the output, and your own `HighlightRule`s (see [Highlighting and following output](everyday-use.md#highlighting-and-following-output)). ✓ on. `Highlight`. |
+| Send all keys to the host | Every key typed in this connection's panes goes to the host, FeroSSH's shortcuts too, for Zellij or tmux run by hand; the menus still work. Until the tab closes; `SendAllKeys yes` in the profile (All keys in the connection form) turns it on every time. See [Sending every key to the host](everyday-use.md#sending-every-key-to-the-host). |
 | Save font and theme for this host | Keeps the focused pane's font, text size and theme in the host's profile. |
 | Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there when the directory of the pane they come from is not known, also after a restart. |
 | Send break (serial) | Holds a serial line in break for 300 ms (Cisco ROM monitor, Linux SysRq). |
