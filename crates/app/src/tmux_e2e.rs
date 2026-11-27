@@ -57,6 +57,8 @@ struct Harness {
     notices: Vec<String>,
     /// Offers to detach other clients: (have, want, others).
     crowded: Vec<Crowded>,
+    /// Everything tmux sent, for a failing test to show.
+    seen: Vec<u8>,
 }
 
 impl Drop for Harness {
@@ -172,6 +174,7 @@ impl Harness {
             pickers: Vec::new(),
             notices: Vec::new(),
             crowded: Vec::new(),
+            seen: Vec::new(),
         };
         prep(&mut h.tmux);
         // What `tmux -CC` writes before its first line.
@@ -244,6 +247,7 @@ impl Harness {
                 .recv_timeout(left.min(Duration::from_millis(100)))
             {
                 Ok(bytes) => {
+                    self.seen.extend_from_slice(&bytes);
                     let actions = self.tmux.feed(&mut self.ws, &bytes);
                     self.apply(actions);
                 }
@@ -1426,9 +1430,12 @@ fn real_tmux_window_names_given_elsewhere_name_the_tab() {
             tick.elapsed() > Duration::from_millis(100) || !h.names.contains_key(&first)
         });
     }
+    let seen = String::from_utf8_lossy(&a.seen).into_owned();
+    let lines: Vec<&str> = seen.lines().filter(|l| !l.starts_with("%output")).collect();
+    let tail = lines[lines.len().saturating_sub(40)..].join("\n");
     assert!(
         !a.names.contains_key(&first),
-        "tmux says: {}",
+        "tmux sent:\n{tail}\ntmux says: {}",
         tmux_cmd(
             &server,
             &[
