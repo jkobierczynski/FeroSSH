@@ -160,6 +160,14 @@ pub enum Action {
     /// These panes, made before their window was known to run a coding
     /// agent, turn out to be one's: watch them as agent panes now.
     AgentMarked(Vec<Native>),
+    /// The panes of a window tmux renamed: the name the window was given
+    /// (`rename-window`, here or by another client), or `None` once
+    /// tmux names it after its program again (`automatic-rename`), when
+    /// the tab shows the pane's own title.
+    Named {
+        natives: Vec<Native>,
+        name: Option<String>,
+    },
     /// Other clients attached to the session keep a window smaller than
     /// the native panes (tmux sizes a window to its smallest client):
     /// offer to detach them. Asked once per attach.
@@ -238,6 +246,8 @@ enum Tag {
     /// The sessions sharing windows with session `.0` (linked windows,
     /// a session group), for [`Tag::Clients`].
     Links(SessionId),
+    /// `#{automatic-rename} #{window_name}` of a renamed window.
+    WindowName(WindowId),
     /// How many clients show session `.0`'s windows in a way closing one
     /// reaches: its own and those of the affected sessions.
     Clients(SessionId),
@@ -523,6 +533,10 @@ struct Restoring {
     /// ([`Tag::Resync`]), so its cursor matches them; the alternate
     /// screen waits here for it.
     resync: Option<Vec<Vec<u8>>>,
+    /// More output came than [`MAX_BUFFER`] holds: what was kept is
+    /// not all of it, so the screen is asked for again once this one is
+    /// drawn, instead of playing a broken part of the output on it.
+    overflowed: bool,
 }
 
 /// Before a paused pane's screen is drawn again: back to the normal
@@ -1235,6 +1249,17 @@ impl Tmux {
             Notification::SubscriptionChanged { name, value } if name == LAYOUT_SUBSCRIPTION => {
                 self.on_remote_layout(ws, &value, out);
             }
+            // Only a name someone gave counts: tmux's automatic names
+            // (the program running) say less than the pane's title.
+            Notification::WindowRenamed { window, .. } if self.windows.contains_key(&window) => {
+                self.send(
+                    &format!(
+                        "display-message -p -t @{window} '#{{automatic-rename}} #{{window_name}}'"
+                    ),
+                    Tag::WindowName(window),
+                    out,
+                );
+            }
             Notification::WindowAdd { window } => {
                 if !self.windows.contains_key(&window) {
                     self.discover(window, out);
@@ -1306,6 +1331,13 @@ impl Tmux {
             Tag::Ignore,
             out,
         );
+        self.redraw(pane, out);
+    }
+
+    /// Draws `pane`'s screen as tmux has it now (after a pause, or when
+    /// more came during a restore than was kept). A pane being restored
+    /// (or not shown yet) gets its screen from that restore.
+    fn redraw(&mut self, pane: PaneId, out: &mut Vec<Action>) {
         let Some(p) = self.panes.get_mut(&pane).filter(|p| p.restoring.is_none()) else {
             return;
         };
@@ -1333,8 +1365,12 @@ impl Tmux {
             Some(Pane {
                 restoring: Some(r), ..
             }) => {
-                if r.buffer.len() + data.len() <= MAX_BUFFER {
+                if r.overflowed {
+                } else if r.buffer.len() + data.len() <= MAX_BUFFER {
                     r.buffer.extend_from_slice(&data);
+                } else {
+                    r.overflowed = true;
+                    r.buffer = Vec::new();
                 }
             }
             Some(p) => out.push(Action::Feed {
@@ -1781,6 +1817,9 @@ impl Tmux {
                             bytes,
                         });
                     }
+                    if r.overflowed {
+                        self.redraw(p, out);
+                    }
                 }
             }
             Tag::CaptureAlternate(p) => {
@@ -1804,6 +1843,9 @@ impl Tmux {
                         native: pane.native,
                         bytes,
                     });
+                    if r.overflowed {
+                        self.redraw(p, out);
+                    }
                 }
             }
             Tag::NewWindow(placement) => {
@@ -1975,6 +2017,29 @@ impl Tmux {
                 if ours && !still {
                     self.remove_window(ws, window, out);
                     out.push(Action::Structure);
+                }
+            }
+            Tag::WindowName(w) => {
+                let reply = lines
+                    .first()
+                    .map(|l| String::from_utf8_lossy(l).into_owned())
+                    .unwrap_or_default();
+                // An empty name may come without its space.
+                let (auto, name) = reply.split_once(' ').unwrap_or((reply.as_str(), ""));
+                let name = match auto {
+                    // `rename-window ''`: no name, and none from tmux either.
+                    "0" if ok => (!name.is_empty()).then(|| name.to_owned()),
+                    "1" if ok => None,
+                    _ => return,
+                };
+                let natives: Vec<Native> = self
+                    .panes
+                    .values()
+                    .filter(|p| p.window == w)
+                    .map(|p| p.native)
+                    .collect();
+                if !natives.is_empty() {
+                    out.push(Action::Named { natives, name });
                 }
             }
             Tag::Links(session) => {
@@ -2281,6 +2346,7 @@ impl Tmux {
                         state: line.state.clone(),
                         normal: Vec::new(),
                         resync: None,
+                        overflowed: false,
                     }),
                 },
             );
@@ -4190,6 +4256,85 @@ mod tests {
             fed.ends_with("\x1b[4;3Hx") && !fed.contains("old"),
             "{fed:?}"
         );
+    }
+
+    #[test]
+    fn more_output_during_a_restore_than_is_kept_draws_the_screen_again() {
+        let panes = [pane_line(5, 1, 80, 24, "b25f,80x24,0,0,5")];
+        let (mut t, mut ws, _) = attached(Some("tmux"), None, &panes);
+        let native = t.native_of(5).unwrap();
+        // After the capture, more comes than is kept.
+        t.feed(&mut ws, &reply(5, &["$ then".into()]));
+        let chunk = format!("%output %5 {}\n", "y".repeat(1 << 20));
+        for _ in 0..5 {
+            assert!(t.feed(&mut ws, chunk.as_bytes()).is_empty());
+        }
+        let a = t.feed(&mut ws, &reply(6, &[]));
+        // The screen captured shows, without the broken part after it,
+        // and the screen is asked for again.
+        let fed = a.iter().find_map(|a| match a {
+            Action::Feed { native: n, bytes } if *n == native => {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            _ => None,
+        });
+        let fed = fed.unwrap();
+        assert!(
+            fed.contains("$ then") && !fed.contains('y'),
+            "{}",
+            fed.len()
+        );
+        assert_eq!(
+            writes(&a),
+            [format!(
+                "capture-pane -p -e -q -t %5 ; capture-pane -p -e -q -a -t %5 ; \
+                 list-panes -t %5 -F {}",
+                command::quote(PANE_FORMAT)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_window_name_given_in_tmux_names_its_tab() {
+        let panes = [pane_line(5, 1, 80, 24, "b25f,80x24,0,0,5")];
+        let (mut t, mut ws, _) = attached(None, None, &panes);
+        let native = t.native_of(5).unwrap();
+        answer_all(&mut t, &mut ws, &[]);
+        let a = t.feed(&mut ws, b"%window-renamed @1 my db\n");
+        assert_eq!(
+            writes(&a),
+            ["display-message -p -t @1 '#{automatic-rename} #{window_name}'"]
+        );
+        let a = t.feed(&mut ws, &reply(7, &["0 my db".into()]));
+        assert_eq!(
+            a,
+            [Action::Named {
+                natives: vec![native],
+                name: Some("my db".into())
+            }]
+        );
+        // Named after its program again: the tab's own title.
+        t.feed(&mut ws, b"%window-renamed @1 bash\n");
+        let a = t.feed(&mut ws, &reply(8, &["1 bash".into()]));
+        assert_eq!(
+            a,
+            [Action::Named {
+                natives: vec![native],
+                name: None
+            }]
+        );
+        // An empty name given clears the tab's name too.
+        t.feed(&mut ws, b"%window-renamed @1 \n");
+        let a = t.feed(&mut ws, &reply(9, &["0 ".into()]));
+        assert_eq!(
+            a,
+            [Action::Named {
+                natives: vec![native],
+                name: None
+            }]
+        );
+        // A window not shown here is not asked about.
+        assert!(writes(&t.feed(&mut ws, b"%window-renamed @9 x\n")).is_empty());
     }
 
     #[test]

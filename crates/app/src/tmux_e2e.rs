@@ -57,6 +57,8 @@ struct Harness {
     notices: Vec<String>,
     /// Offers to detach other clients: (have, want, others).
     crowded: Vec<Crowded>,
+    /// Everything tmux sent, for a failing test to show.
+    seen: Vec<u8>,
 }
 
 impl Drop for Harness {
@@ -172,6 +174,7 @@ impl Harness {
             pickers: Vec::new(),
             notices: Vec::new(),
             crowded: Vec::new(),
+            seen: Vec::new(),
         };
         prep(&mut h.tmux);
         // What `tmux -CC` writes before its first line.
@@ -211,6 +214,14 @@ impl Harness {
                 Action::Remove { native } => {
                     self.panes.remove(&native);
                 }
+                Action::Named { natives, name } => {
+                    for n in natives {
+                        match &name {
+                            Some(name) => self.names.insert(n, name.clone()),
+                            None => self.names.remove(&n),
+                        };
+                    }
+                }
                 Action::ShowGateway => self.gateway_shown = true,
                 Action::Picker(names) => self.pickers.push(names),
                 Action::Notice(text) => self.notices.push(text),
@@ -236,6 +247,7 @@ impl Harness {
                 .recv_timeout(left.min(Duration::from_millis(100)))
             {
                 Ok(bytes) => {
+                    self.seen.extend_from_slice(&bytes);
                     let actions = self.tmux.feed(&mut self.ws, &bytes);
                     self.apply(actions);
                 }
@@ -1385,4 +1397,55 @@ fn real_tmux_two_ferossh_clients_share_the_splits() {
     a.until("a's tab", |h| h.ws.tabs.len() == 2);
     a.save(|_| Look::default());
     b.until("the tab in b", |h| h.shown() == 4 && h.ws.tabs.len() == 2);
+}
+
+#[test]
+fn real_tmux_window_names_given_elsewhere_name_the_tab() {
+    if !tmux_available() || version() < MIN_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-names-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("the pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    // Another client (or prefix ,) names the window.
+    tmux_cmd(&server, &["rename-window", "-t", "e2e:", "my db"]);
+    a.until("the name", |h| {
+        h.names.get(&first).map(String::as_str) == Some("my db")
+    });
+    // Back to tmux's automatic name: the tab's own title again.
+    tmux_cmd(
+        &server,
+        &["set-option", "-w", "-t", "e2e:", "automatic-rename", "on"],
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while a.names.contains_key(&first) && Instant::now() < end {
+        // tmux before 3.2 renames from its loop's last step, and the
+        // notification waits for the next thing the server does (output,
+        // a key, any command): give it one.
+        tmux_cmd(&server, &["show-options", "-g", "-q", "base-index"]);
+        let tick = Instant::now();
+        a.until("a moment", |h| {
+            tick.elapsed() > Duration::from_millis(100) || !h.names.contains_key(&first)
+        });
+    }
+    let seen = String::from_utf8_lossy(&a.seen).into_owned();
+    let lines: Vec<&str> = seen.lines().filter(|l| !l.starts_with("%output")).collect();
+    let tail = lines[lines.len().saturating_sub(40)..].join("\n");
+    assert!(
+        !a.names.contains_key(&first),
+        "tmux sent:\n{tail}\ntmux says: {}",
+        tmux_cmd(
+            &server,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "e2e:",
+                "#{automatic-rename} [#{window_name}] [#{pane_current_command}]"
+            ]
+        )
+    );
 }

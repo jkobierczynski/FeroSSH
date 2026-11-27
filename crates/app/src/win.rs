@@ -4769,6 +4769,24 @@ impl Window {
                         self.watch_agent(gateway, native);
                     }
                 }
+                // tmux's name for the window, set here, by another client
+                // or by a program: the tab follows (not sent back).
+                tmux::Action::Named { natives, name } => {
+                    let name = name.as_deref().and_then(live::clean_name);
+                    let mut changed = false;
+                    for native in natives {
+                        if let Some(p) = self.panes.get_mut(&native)
+                            && p.name != name
+                        {
+                            p.name = name.clone();
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.update_title();
+                        self.refresh_chrome();
+                    }
+                }
                 tmux::Action::Tell(text) => {
                     self.queued
                         .push(Command::Notice(crate::ssh::sanitize(&text)));
