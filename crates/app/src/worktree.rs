@@ -30,8 +30,11 @@ const MARK: &str = "@ferossh-worktree";
 /// Branches tried at most for one agent: `claude`, `claude-2` … `claude-99`.
 const TRIES: u32 = 99;
 
-/// The longest branch name made or read back.
-const MAX_BRANCH: usize = 40;
+/// The longest branch name read back (an existing worktree's).
+const MAX_BRANCH: usize = 100;
+
+/// The longest branch name made for an agent, before `-99`.
+const MAX_BASE: usize = 37;
 
 /// The longest folder read back.
 const MAX_PATH: usize = 4096;
@@ -49,16 +52,17 @@ pub struct Worktree {
 /// git takes it.
 pub fn valid_branch(name: &str) -> bool {
     name.len() <= MAX_BRANCH
-        && name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && name.split('/').all(|part| {
+            part.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                && !part.ends_with('.')
+                && !part.ends_with(".lock")
+        })
         && !name.contains("..")
-        && !name.ends_with('.')
-        && !name.ends_with(".lock")
 }
 
 /// Whether `path` is a folder this module uses: absolute, on one line,
@@ -79,7 +83,7 @@ pub fn branch_base(agent: &str) -> String {
     }
     let name = name.trim_start_matches(['.', '_', '-']);
     // Room for `-99`.
-    let mut name: String = name.chars().take(MAX_BRANCH - 3).collect();
+    let mut name: String = name.chars().take(MAX_BASE).collect();
     loop {
         if let Some(rest) = name.strip_suffix(".lock") {
             name = rest.to_owned();
@@ -123,13 +127,14 @@ pub fn parse_option(value: &str) -> Option<Worktree> {
 
 /// The agents waiting to start in a new worktree, by the tmux pane whose
 /// folder tmux was asked for, in the order asked: tmux answers in order,
-/// so each answer goes with the oldest ask of its pane.
+/// so each answer goes with the oldest ask of its pane. `V` says what to
+/// do with the folder (the agent command, by default).
 #[derive(Debug)]
-pub struct Asks<K> {
-    by: std::collections::HashMap<K, std::collections::VecDeque<String>>,
+pub struct Asks<K, V = String> {
+    by: std::collections::HashMap<K, std::collections::VecDeque<V>>,
 }
 
-impl<K> Default for Asks<K> {
+impl<K, V> Default for Asks<K, V> {
     fn default() -> Self {
         Self {
             by: std::collections::HashMap::new(),
@@ -137,7 +142,7 @@ impl<K> Default for Asks<K> {
     }
 }
 
-impl<K: Eq + std::hash::Hash + Copy> Asks<K> {
+impl<K: Eq + std::hash::Hash + Copy, V> Asks<K, V> {
     /// A connection that never answers keeps only this many per pane.
     pub const MAX: usize = 16;
 
@@ -148,7 +153,7 @@ impl<K: Eq + std::hash::Hash + Copy> Asks<K> {
     pub fn ask<A>(
         &mut self,
         key: K,
-        command: &str,
+        command: impl Into<V>,
         ask: impl FnOnce() -> Vec<A>,
     ) -> Option<Vec<A>> {
         if self.by.get(&key).is_some_and(|q| q.len() >= Self::MAX) {
@@ -156,16 +161,13 @@ impl<K: Eq + std::hash::Hash + Copy> Asks<K> {
         }
         let sent = ask();
         if !sent.is_empty() {
-            self.by
-                .entry(key)
-                .or_default()
-                .push_back(command.to_owned());
+            self.by.entry(key).or_default().push_back(command.into());
         }
         Some(sent)
     }
 
     /// The agent command tmux's answer for pane `key` belongs to.
-    pub fn answered(&mut self, key: K) -> Option<String> {
+    pub fn answered(&mut self, key: K) -> Option<V> {
         let q = self.by.get_mut(&key)?;
         let command = q.pop_front();
         if q.is_empty() {
@@ -293,6 +295,158 @@ pub fn parse_add(out: &[u8], err: &[u8]) -> Added {
     }
 }
 
+/// The command that lists the worktrees of the repository the folder on
+/// its standard input is in, for Session > Coding agents > Start <agent>
+/// in an existing worktree: `git worktree list --porcelain -z` (or,
+/// with a git older than 2.36, without `-z`) after the answer line. The
+/// answer is only given once git has listed them; when it cannot, its
+/// error goes to standard error. Like [`add_command`], one line for `sh`.
+pub fn list_command() -> Vec<u8> {
+    let script = [
+        "IFS= read -r d || exit 2".to_owned(),
+        format!("command -v git >/dev/null 2>&1 || {{ echo {MARK} nogit; exit 0; }}"),
+        format!("cd -- \"$d\" 2>/dev/null || {{ echo {MARK} nodir; exit 0; }}"),
+        format!(
+            "git rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo {MARK} norepo; exit 0; }}"
+        ),
+        format!(
+            "git worktree list --porcelain -z >/dev/null 2>&1 && \
+             {{ echo {MARK} listz; exec git worktree list --porcelain -z; }}"
+        ),
+        format!(
+            "git worktree list --porcelain >/dev/null 2>&1 || \
+             {{ echo {MARK} failed; exec git worktree list --porcelain >&2; }}"
+        ),
+        format!("echo {MARK} list"),
+        "exec git worktree list --porcelain".to_owned(),
+    ]
+    .join("; ");
+    format!("exec sh -c '{script}'").into_bytes()
+}
+
+/// What goes on [`list_command`]'s standard input; `None` for a folder
+/// whose name could not go on one line.
+pub fn list_input(dir: &[u8]) -> Option<Vec<u8>> {
+    if dir.is_empty() || dir.iter().any(|&b| b == b'\n' || b == b'\r' || b == 0) {
+        return None;
+    }
+    let mut input = dir.to_vec();
+    input.push(b'\n');
+    Some(input)
+}
+
+/// What [`list_command`] (or git on this PC) found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listed {
+    /// The repository's worktrees other than its main one, each with a
+    /// branch checked out (maybe none).
+    Found(Vec<Worktree>),
+    NoGit,
+    NoDir,
+    NoRepo,
+    Failed(String),
+}
+
+/// The worktrees in `git worktree list --porcelain` output `data` (with
+/// `-z` when `nul`), as branch and folder: not the first (the main
+/// worktree), nor one that is bare, has no branch checked out (detached)
+/// or whose folder is gone (prunable). Folders are as git printed them;
+/// one that is not UTF-8, or that git quoted (without `-z`, for a name
+/// with a newline or such in it), is left out rather than changed.
+pub fn porcelain(data: &[u8], nul: bool) -> Vec<(String, String)> {
+    let sep = if nul { 0 } else { b'\n' };
+    let mut found = Vec::new();
+    let mut first = true;
+    let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut skip = false;
+    let mut end = |path: &mut Option<String>,
+                   branch: &mut Option<String>,
+                   skip: &mut bool,
+                   first: &mut bool| {
+        if let (false, false, Some(p), Some(b)) = (*first, *skip, path.take(), branch.take()) {
+            found.push((b, p));
+        }
+        *path = None;
+        *branch = None;
+        *skip = false;
+        *first = false;
+    };
+    for field in data.split(|&b| b == sep) {
+        let field = if nul {
+            field
+        } else {
+            field.strip_suffix(b"\r").unwrap_or(field)
+        };
+        if field.is_empty() {
+            // A blank line ends an entry; so does the end of the output.
+            if path.is_some() || skip || branch.is_some() {
+                end(&mut path, &mut branch, &mut skip, &mut first);
+            }
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(field) else {
+            if field.starts_with(b"worktree ") || field.starts_with(b"branch ") {
+                skip = true;
+            }
+            continue;
+        };
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if path.is_some() {
+                // No blank line between them: a new entry all the same.
+                end(&mut path, &mut branch, &mut skip, &mut first);
+            }
+            if !nul && p.starts_with('"') {
+                skip = true;
+            }
+            path = Some(p.to_owned());
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            branch = Some(b.to_owned());
+        } else if line == "bare" || line == "detached" || line.starts_with("prunable") {
+            skip = true;
+        }
+    }
+    end(&mut path, &mut branch, &mut skip, &mut first);
+    found
+}
+
+/// What [`list_command`]'s standard output `out` and standard error
+/// `err` mean. Only worktrees whose branch and folder FeroSSH can carry
+/// (see [`OPTION`]) are kept.
+pub fn parse_list(out: &[u8], err: &[u8]) -> Listed {
+    let mark = format!("{MARK} ");
+    let mut answer = None;
+    let mut at = 0;
+    for line in out.split(|&b| b == b'\n') {
+        at += line.len() + 1;
+        if let Some(a) = line.strip_prefix(mark.as_bytes()) {
+            answer = Some(a.strip_suffix(b"\r").unwrap_or(a));
+            break;
+        }
+    }
+    let Some(answer) = answer else {
+        return Listed::Failed(last_said(err));
+    };
+    let rest = out.get(at..).unwrap_or_default();
+    let found = |nul| {
+        Listed::Found(
+            porcelain(rest, nul)
+                .into_iter()
+                .filter(|(b, p)| valid_branch(b) && valid_path(p))
+                .map(|(branch, path)| Worktree { branch, path })
+                .collect(),
+        )
+    };
+    match answer {
+        b"nogit" => Listed::NoGit,
+        b"nodir" => Listed::NoDir,
+        b"norepo" => Listed::NoRepo,
+        b"listz" => found(true),
+        b"list" => found(false),
+        _ => Listed::Failed(last_said(err)),
+    }
+}
+
 /// The command that removes a worktree: `git worktree remove`, which
 /// refuses one with uncommitted or untracked changes, and then `git
 /// branch -d`, which keeps a branch that is not merged. Like
@@ -387,7 +541,7 @@ mod tests {
         let mut asks = Asks::<u32>::default();
         let mut sent = 0;
         for n in 0..Asks::<u32>::MAX {
-            let a = asks.ask(1, &format!("agent{n}"), || {
+            let a = asks.ask(1, format!("agent{n}"), || {
                 sent += 1;
                 vec![n]
             });
@@ -416,6 +570,82 @@ mod tests {
     }
 
     #[test]
+    fn existing_worktrees_are_read_from_porcelain() {
+        let text = "worktree /srv/app\nHEAD 1\nbranch refs/heads/main\n\n\
+                    worktree /srv/app-claude\nHEAD 2\nbranch refs/heads/claude\n\n\
+                    worktree /srv/my app\nHEAD 3\nbranch refs/heads/feature/x\nlocked\n\n\
+                    worktree /srv/app-d\nHEAD 4\ndetached\n\n\
+                    worktree /srv/gone\nHEAD 5\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location\n";
+        assert_eq!(
+            porcelain(text.as_bytes(), false),
+            [
+                ("claude".to_owned(), "/srv/app-claude".to_owned()),
+                ("feature/x".to_owned(), "/srv/my app".to_owned())
+            ]
+        );
+        let mut out = b"noise\n@ferossh-worktree list\n".to_vec();
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(
+            b"\nworktree relative\nbranch refs/heads/r\n\nworktree /x\nbranch refs/heads/a b\n",
+        );
+        assert_eq!(
+            parse_list(&out, b""),
+            Listed::Found(vec![
+                Worktree {
+                    branch: "claude".into(),
+                    path: "/srv/app-claude".into()
+                },
+                Worktree {
+                    branch: "feature/x".into(),
+                    path: "/srv/my app".into()
+                },
+            ])
+        );
+        assert_eq!(
+            parse_list(b"@ferossh-worktree norepo\n", b""),
+            Listed::NoRepo
+        );
+        assert_eq!(
+            parse_list(b"", b"sh: 1: boom\n"),
+            Listed::Failed("sh: 1: boom".into())
+        );
+        // git failed after all: its error, not an empty list.
+        assert_eq!(
+            parse_list(
+                b"@ferossh-worktree failed\n",
+                b"fatal: not a git repository\n"
+            ),
+            Listed::Failed("fatal: not a git repository".into())
+        );
+        // With -z: a folder with a newline in it is whole, so left out;
+        // one with spaces stays; one that is not UTF-8 is left out, not
+        // changed.
+        let z = b"worktree /srv/app\0HEAD 1\0branch refs/heads/main\0\0\
+                  worktree /srv/a\nb\0HEAD 2\0branch refs/heads/nl\0\0\
+                  worktree /srv/my app\0HEAD 3\0branch refs/heads/sp\0\0\
+                  worktree /srv/\xff\0HEAD 4\0branch refs/heads/bad\0\0";
+        let mut out = b"@ferossh-worktree listz\n".to_vec();
+        out.extend_from_slice(z);
+        assert_eq!(
+            parse_list(&out, b""),
+            Listed::Found(vec![Worktree {
+                branch: "sp".into(),
+                path: "/srv/my app".into()
+            }])
+        );
+        // Without -z, a name git had to quote is left out too.
+        let mut out = b"@ferossh-worktree list\n".to_vec();
+        out.extend_from_slice(
+            b"worktree /srv/app\nbranch refs/heads/main\n\n\
+              worktree \"/srv/a\\nb\"\nbranch refs/heads/nl\n\n\
+              worktree /srv/\xff\nbranch refs/heads/bad\n",
+        );
+        assert_eq!(parse_list(&out, b""), Listed::Found(Vec::new()));
+        assert_eq!(list_input(b"/a\nb"), None);
+        assert_eq!(list_input(b"/a b").unwrap(), b"/a b\n");
+    }
+
+    #[test]
     fn branch_names_are_plain() {
         assert_eq!(branch_base("claude"), "claude");
         assert_eq!(branch_base("aider.py"), "aider.py");
@@ -427,12 +657,16 @@ mod tests {
         assert_eq!(branch_base("..."), "agent");
         assert_eq!(branch_base(""), "agent");
         assert_eq!(branch_base("rm -rf /"), "rm-rf");
-        assert!(branch_base(&"a".repeat(80)).len() <= MAX_BRANCH - 3);
+        assert!(branch_base(&"a".repeat(80)).len() <= MAX_BASE);
         for bad in [
-            "", "-a", ".a", "a..b", "a.", "a.lock", "a b", "a/b", "a;b", "a$b",
+            "", "-a", ".a", "a..b", "a.", "a.lock", "a b", "a;b", "a$b", "/a", "a/", "a//b",
+            "a/.b", "a/-b", "a.lock/b",
         ] {
             assert!(!valid_branch(bad), "{bad}");
         }
+        // An existing worktree's branch may have folders.
+        assert!(valid_branch("feature/login-2"));
+        assert!(!valid_branch(&"a".repeat(MAX_BRANCH + 1)));
     }
 
     #[test]
@@ -472,7 +706,7 @@ mod tests {
 
     #[test]
     fn commands_survive_csh_and_fish() {
-        for c in [add_command(), remove_command()] {
+        for c in [add_command(), remove_command(), list_command()] {
             let c = String::from_utf8(c).unwrap();
             let inner = c
                 .strip_prefix("exec sh -c '")
@@ -529,6 +763,12 @@ mod tests {
             .arg(String::from_utf8(command).unwrap())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -554,6 +794,12 @@ mod tests {
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .output()
             .unwrap();
         assert!(
@@ -630,6 +876,28 @@ mod tests {
         assert_eq!(add(&nel, "claude"), Added::BadPath);
         assert!(git(&nel, &["branch", "--list", "claude"]).trim().is_empty());
         assert!(!root.join("nel\u{85}here-claude").exists());
+        // Start in an existing worktree lists both, from any folder of
+        // the repository, but not the main one.
+        let list = |dir: &std::path::Path| {
+            let (out, err) = run(
+                list_command(),
+                &list_input(dir.as_os_str().as_encoded_bytes()).unwrap(),
+            );
+            parse_list(&out, &err)
+        };
+        // One whose folder has a newline in it is left out.
+        let nl = root.join("nl\nhere");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "nl", nl.to_str().unwrap()],
+        );
+        assert_eq!(
+            list(&repo.join("src")),
+            Listed::Found(vec![first.clone(), second.clone()])
+        );
+        git(&repo, &["worktree", "remove", nl.to_str().unwrap()]);
+        assert_eq!(list(&root), Listed::NoRepo);
+        assert_eq!(list(&root.join("nope")), Listed::NoDir);
         // Not a repository, not a folder.
         assert_eq!(add(&root, "claude"), Added::NoRepo);
         assert_eq!(add(&root.join("nope"), "claude"), Added::NoDir);
