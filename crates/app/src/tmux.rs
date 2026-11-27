@@ -2024,9 +2024,11 @@ impl Tmux {
                     .first()
                     .map(|l| String::from_utf8_lossy(l).into_owned())
                     .unwrap_or_default();
-                let name = match reply.split_once(' ') {
-                    Some(("0", name)) if ok && !name.is_empty() => Some(name.to_owned()),
-                    Some(("1", _)) if ok => None,
+                // An empty name may come without its space.
+                let (auto, name) = reply.split_once(' ').unwrap_or((reply.as_str(), ""));
+                let name = match auto {
+                    "0" if ok && !name.is_empty() => Some(name.to_owned()),
+                    "1" if ok => None,
                     _ => return,
                 };
                 let natives: Vec<Native> = self
