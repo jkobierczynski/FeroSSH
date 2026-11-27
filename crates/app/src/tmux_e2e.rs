@@ -1416,5 +1416,8 @@ fn real_tmux_window_names_given_elsewhere_name_the_tab() {
         &server,
         &["set-option", "-w", "-t", "e2e:", "automatic-rename", "on"],
     );
+    // Before 3.2 tmux names the window again only once the pane prints.
+    let actions = a.tmux.input(first, b"echo renamed\r");
+    a.apply(actions);
     a.until("the name gone", |h| !h.names.contains_key(&first));
 }
