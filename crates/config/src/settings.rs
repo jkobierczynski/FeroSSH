@@ -3082,7 +3082,12 @@ Profile lab
         assert!(s.profile("z").unwrap().send_all_keys);
         assert!(s.profile("y").is_none_or(|p| !p.send_all_keys));
         assert!(s.to_text().contains("    SendAllKeys yes\n"));
-        assert!(Settings::parse(&s.to_text()).profile("z").unwrap().send_all_keys);
+        assert!(
+            Settings::parse(&s.to_text())
+                .profile("z")
+                .unwrap()
+                .send_all_keys
+        );
     }
 
     #[test]
