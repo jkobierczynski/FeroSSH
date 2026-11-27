@@ -888,8 +888,8 @@ enum Host {
 /// A tab showing what changed in a git repository on a server
 /// ([`crate::diff`]).
 struct DiffTab {
-    /// The SSH connection git runs on, and the host as the user knows it.
-    connection: ChannelId,
+    /// Where git runs, and the host as the user knows it.
+    via: Via,
     label: String,
     /// The folder asked about, as the pane's shell or tmux gave it.
     dir: Vec<u8>,
@@ -1606,6 +1606,9 @@ struct Window {
     /// git worktree scripts of Session > Coding agents running, by their
     /// exec channel.
     worktree_jobs: HashMap<ChannelId, WorktreeJob>,
+    /// The git scripts (worktrees, diffs) running in WSL through
+    /// `wsl.exe`, by the channel their messages come as.
+    wsl_jobs: HashMap<ChannelId, crate::pipes::PipeChild>,
     /// Agents to start in a new worktree, by the tmux pane whose folder
     /// tmux was asked for, in the order asked (tmux answers in order).
     worktree_asks: crate::worktree::Asks<PaneId>,
@@ -1967,8 +1970,16 @@ struct SystemRead {
 }
 
 /// A git worktree script of Session > Coding agents running on a server.
+/// Where a git script runs: on an SSH connection's exec channel, or in a
+/// WSL distro (`""`: the default one) through `wsl.exe`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Via {
+    Ssh(ChannelId),
+    Wsl(String),
+}
+
 struct WorktreeJob {
-    connection: ChannelId,
+    via: Via,
     /// The pane it is for.
     pane: PaneId,
     kind: WorktreeKind,
@@ -3157,6 +3168,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 preview_waiting: Vec::new(),
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
+                wsl_jobs: HashMap::new(),
                 worktree_jobs: HashMap::new(),
                 worktree_asks: crate::worktree::Asks::default(),
                 system_reads: HashMap::new(),
@@ -5798,8 +5810,7 @@ impl Window {
             .keys()
             .copied()
             .filter(|&ch| {
-                self.diff_on(ch)
-                    .is_some_and(|c| !self.workers.contains_key(&c))
+                matches!(self.diff_on(ch), Some(Via::Ssh(c)) if !self.workers.contains_key(&c))
             })
             .collect();
         for channel in dropped {
@@ -5818,8 +5829,10 @@ impl Window {
             .retain(|_, f| workers.contains_key(&f.connection));
         self.system_reads
             .retain(|_, r| workers.contains_key(&r.connection));
-        self.worktree_jobs
-            .retain(|_, j| workers.contains_key(&j.connection));
+        self.worktree_jobs.retain(|_, j| match &j.via {
+            Via::Ssh(c) => workers.contains_key(c),
+            Via::Wsl(_) => true,
+        });
         // SAFETY: our window and timer.
         unsafe {
             SetTimer(
@@ -5877,7 +5890,7 @@ impl Window {
             || self
                 .worktree_jobs
                 .values()
-                .any(|j| j.connection == connection)
+                .any(|j| j.via == Via::Ssh(connection))
     }
 
     /// Ends the workers that retired long enough ago.
@@ -5915,6 +5928,126 @@ impl Window {
             Host::Tmux { gateway, .. } => self.pane_connection(*gateway),
             _ => None,
         }
+    }
+
+    /// Where a git script for pane `id` runs: its SSH connection, or the
+    /// WSL distro of a WSL shell, a WSL gateway or one of its tmux panes.
+    fn pane_via(&self, id: PaneId) -> Option<Via> {
+        match self.panes.get(&id).map(|p| &p.host)? {
+            Host::Ssh(s) if s.state() == State::Connected => Some(Via::Ssh(s.connection)),
+            Host::Tmux { gateway, .. } => self.pane_via(*gateway),
+            Host::Wsl(g) => Some(Via::Wsl(g.distro.clone())),
+            Host::Local { wsl: Some(d), .. } => Some(Via::Wsl(d.clone())),
+            _ => None,
+        }
+    }
+
+    /// Runs `command` (see [`Message::Exec`]) with `input` on its standard
+    /// input, `via` an SSH exec channel or `wsl.exe`; what it says
+    /// arrives as `channel`'s messages, as from an SSH worker
+    /// ([`Self::wsl_job_output`] for WSL). `false` when it could not start.
+    fn run_script(
+        &mut self,
+        channel: ChannelId,
+        via: &Via,
+        command: Vec<u8>,
+        input: Vec<u8>,
+    ) -> bool {
+        match via {
+            Via::Ssh(connection) => {
+                let Some(w) = self.workers.get(connection) else {
+                    return false;
+                };
+                w.link.send(Message::Exec {
+                    channel,
+                    connection: *connection,
+                    command,
+                    split_stderr: true,
+                });
+                w.link.send(Message::Data {
+                    channel,
+                    bytes: input,
+                });
+                w.link.send(Message::Eof { channel });
+                true
+            }
+            Via::Wsl(distro) => {
+                let Ok(wsl) = crate::program::locate("wsl.exe") else {
+                    return false;
+                };
+                let args = crate::wsl::script_args(distro, &String::from_utf8_lossy(&command));
+                let notify = self.notifier();
+                let Ok(mut child) = crate::pipes::PipeChild::spawn_split(&wsl, &args, notify)
+                else {
+                    return false;
+                };
+                child.write(input);
+                child.close_input();
+                self.wsl_jobs.insert(channel, child);
+                true
+            }
+        }
+    }
+
+    /// Stops script `channel` started by [`Self::run_script`].
+    fn stop_script(&mut self, channel: ChannelId, via: &Via) {
+        match via {
+            Via::Ssh(connection) => {
+                if let Some(w) = self.workers.get(connection) {
+                    w.link.send(Message::Close { channel });
+                }
+            }
+            // Dropping it ends wsl.exe.
+            Via::Wsl(_) => {
+                self.wsl_jobs.remove(&channel);
+            }
+        }
+    }
+
+    /// What the git scripts running in WSL said, passed on as an SSH
+    /// worker would: output, standard error, then the exit status and
+    /// the end. `true` when there was some.
+    fn wsl_job_output(&mut self) -> bool {
+        let channels: Vec<ChannelId> = self.wsl_jobs.keys().copied().collect();
+        let mut any = false;
+        for channel in channels {
+            while let Some(out) = self
+                .wsl_jobs
+                .get(&channel)
+                .and_then(crate::pipes::PipeChild::try_read)
+            {
+                any = true;
+                let msgs = match out {
+                    crate::pipes::Output::Data(bytes) => vec![Message::Data { channel, bytes }],
+                    crate::pipes::Output::Stderr(bytes) => {
+                        vec![Message::ExecStderr { channel, bytes }]
+                    }
+                    crate::pipes::Output::Exited(code) => {
+                        self.wsl_jobs.remove(&channel);
+                        let mut end = Vec::new();
+                        if let Some(code) = code.and_then(|c| u32::try_from(c).ok()) {
+                            end.push(Message::ExitStatus { channel, code });
+                        }
+                        end.push(Message::Disconnected {
+                            channel,
+                            reason: format!(
+                                "wsl.exe ended{}",
+                                code.map_or(String::new(), |c| format!(" with code {c}"))
+                            ),
+                        });
+                        end
+                    }
+                };
+                for msg in msgs {
+                    if self.worktree_jobs.contains_key(&channel) {
+                        self.on_worktree(channel, msg);
+                    } else if self.diffs.contains_key(&channel) {
+                        self.on_diff(channel, msg);
+                    }
+                }
+            }
+        }
+        any
     }
 
     /// Session > Remote desktop > Open remote desktop: asks the forwarding engine for a
@@ -11884,6 +12017,8 @@ impl Window {
                 }
             }
         }
+        // git scripts in WSL.
+        self.wsl_job_output();
         // The WSL gateways: tmux in control mode.
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {
@@ -11899,7 +12034,7 @@ impl Window {
                     break;
                 };
                 match out {
-                    crate::pipes::Output::Data(data) => {
+                    crate::pipes::Output::Data(data) | crate::pipes::Output::Stderr(data) => {
                         fed += data.len();
                         self.host_output(id, &data);
                     }
@@ -12109,7 +12244,7 @@ impl Window {
                 if self
                     .worktree_jobs
                     .get(&c)
-                    .is_some_and(|j| j.connection == connection)
+                    .is_some_and(|j| j.via == Via::Ssh(connection))
                 {
                     self.on_worktree(c, msg);
                     return false;
@@ -12122,7 +12257,7 @@ impl Window {
                     self.on_system_read(c, msg);
                     return false;
                 }
-                if self.diff_on(c) == Some(connection) {
+                if self.diff_on(c) == Some(Via::Ssh(connection)) {
                     self.on_diff(c, msg);
                     return false;
                 }
@@ -12218,7 +12353,7 @@ impl Window {
                 let lost: Vec<ChannelId> = self
                     .worktree_jobs
                     .iter()
-                    .filter(|(_, j)| j.connection == connection)
+                    .filter(|(_, j)| j.via == Via::Ssh(connection))
                     .map(|(&c, _)| c)
                     .collect();
                 for c in lost {
@@ -12234,7 +12369,7 @@ impl Window {
                     .diffs
                     .keys()
                     .copied()
-                    .filter(|&c| self.diff_on(c) == Some(connection))
+                    .filter(|&c| self.diff_on(c) == Some(Via::Ssh(connection)))
                     .collect();
                 for c in lost {
                     self.on_diff(
@@ -12433,7 +12568,7 @@ impl Window {
     /// tmux pane's folder comes from tmux (an agent there reports none);
     /// another pane's from its shell (OSC 7 or the prompt).
     fn show_changes(&mut self, pane: PaneId) -> Option<Command> {
-        if self.pane_connection(pane).is_none() {
+        if self.pane_via(pane).is_none() {
             return Some(Command::Notice(DIFF_HOW.into()));
         }
         if let Some(g) = self.panes.get(&pane).and_then(Pane::gateway) {
@@ -12465,7 +12600,7 @@ impl Window {
         // A tmux pane gets a new id when its gateway reconnects; the
         // gateway keeps its own, so r follows that one.
         let source = self.host_pane(from);
-        let Some(connection) = self.pane_connection(from) else {
+        let Some(via) = self.pane_via(from) else {
             return Some(Command::Notice(DIFF_HOW.into()));
         };
         if crate::diff::input(&dir).is_none() {
@@ -12496,7 +12631,7 @@ impl Window {
             )));
             p.no_broadcast = true;
             p.host = Host::Diff(Box::new(DiffTab {
-                connection,
+                via,
                 label,
                 dir,
                 channel: None,
@@ -12522,11 +12657,11 @@ impl Window {
         None
     }
 
-    /// Which connection the git of diff channel `channel` runs on.
-    fn diff_on(&self, channel: ChannelId) -> Option<ChannelId> {
+    /// Where the git of diff channel `channel` runs.
+    fn diff_on(&self, channel: ChannelId) -> Option<Via> {
         let id = self.diffs.get(&channel)?;
         match &self.panes.get(id)?.host {
-            Host::Diff(d) if d.channel == Some(channel) => Some(d.connection),
+            Host::Diff(d) if d.channel == Some(channel) => Some(d.via.clone()),
             _ => None,
         }
     }
@@ -12539,7 +12674,7 @@ impl Window {
         // The connection it came from, or the one the pane it was opened
         // from has now (after a reconnect).
         let from = match self.panes.get(&id).map(|p| &p.host) {
-            Some(Host::Diff(d)) if !self.workers.contains_key(&d.connection) => {
+            Some(Host::Diff(d)) if matches!(&d.via, Via::Ssh(c) if !self.workers.contains_key(c)) => {
                 self.pane_connection(d.from)
             }
             _ => None,
@@ -12548,19 +12683,27 @@ impl Window {
             return;
         };
         if let Some(c) = from {
-            d.connection = c;
+            d.via = Via::Ssh(c);
         }
-        let (Some(w), Some(input)) = (self.workers.get(&d.connection), crate::diff::input(&d.dir))
-        else {
+        let via = d.via.clone();
+        let started = crate::diff::input(&d.dir)
+            .is_some_and(|input| self.run_script(channel, &via, crate::diff::command(), input));
+        let Some(Host::Diff(d)) = self.panes.get_mut(&id).map(|p| &mut p.host) else {
+            self.stop_script(channel, &via);
+            return;
+        };
+        if !started {
             let label = crate::ssh::sanitize(&d.label);
-            self.show(
-                id,
-                &format!(
-                    "\x1b[?7h\r\n\x1b[0;31mThe connection to {label} is closed. Reconnect the \
-                     pane this was opened from, then press r here; or open it again from a pane \
-                     logged in there.\x1b[0m"
+            let why = match via {
+                Via::Ssh(_) => format!(
+                    "The connection to {label} is closed. Reconnect the pane this was opened \
+                     from, then press r here; or open it again from a pane logged in there."
                 ),
-            );
+                Via::Wsl(_) => {
+                    format!("Could not start wsl.exe to ask git in {label}. Press r to try again.")
+                }
+            };
+            self.show(id, &format!("\x1b[?7h\r\n\x1b[0;31m{why}\x1b[0m"));
             // Below a long diff: brought into view.
             if let Some(p) = self.panes.get_mut(&id) {
                 p.term.scroll_to_bottom();
@@ -12568,18 +12711,7 @@ impl Window {
             }
             self.refresh(id);
             return;
-        };
-        w.link.send(Message::Exec {
-            channel,
-            connection: d.connection,
-            command: crate::diff::command(),
-            split_stderr: true,
-        });
-        w.link.send(Message::Data {
-            channel,
-            bytes: input,
-        });
-        w.link.send(Message::Eof { channel });
+        }
         d.channel = Some(channel);
         d.out.clear();
         d.err.clear();
@@ -12607,10 +12739,9 @@ impl Window {
             return;
         };
         if let Some(channel) = d.channel.take() {
+            let via = d.via.clone();
             self.diffs.remove(&channel);
-            if let Some(w) = self.workers.get(&d.connection) {
-                w.link.send(Message::Close { channel });
-            }
+            self.stop_script(channel, &via);
         }
     }
 
@@ -12663,8 +12794,15 @@ impl Window {
         }
         if d.partial {
             // Enough: the part read so far shows.
-            if let Some(w) = self.workers.get(&d.connection) {
-                w.link.send(Message::Close { channel });
+            match &d.via {
+                Via::Ssh(c) => {
+                    if let Some(w) = self.workers.get(c) {
+                        w.link.send(Message::Close { channel });
+                    }
+                }
+                Via::Wsl(_) => {
+                    self.wsl_jobs.remove(&channel);
+                }
             }
         }
         self.diffs.remove(&channel);
@@ -13097,61 +13235,53 @@ impl Window {
     /// the worktree once it is made.
     fn make_worktree(&mut self, id: PaneId, dir: Vec<u8>, command: String) -> Option<Command> {
         let base = crate::worktree::branch_base(&crate::tmux::agent_name(&command));
-        let (Some(connection), Some(input)) = (
-            self.pane_connection(id),
-            crate::worktree::add_input(&dir, &base),
-        ) else {
+        let (Some(via), Some(input)) = (self.pane_via(id), crate::worktree::add_input(&dir, &base))
+        else {
             return Some(Command::Notice(
                 "FeroSSH cannot make a worktree from this pane: it needs a pane logged in \
-                 over SSH, in a folder whose name is on one line."
+                 over SSH or a WSL pane, in a folder whose name is on one line."
                     .into(),
             ));
         };
         self.run_worktree_job(
-            connection,
+            via,
             id,
             crate::worktree::add_command(),
             input,
             WorktreeKind::Add { command },
-        );
-        None
+        )
     }
 
     /// Starts git worktree script `command` with `input` on its standard
-    /// input, on `connection`.
+    /// input, `via` SSH or WSL; a notice when it could not start.
     fn run_worktree_job(
         &mut self,
-        connection: ChannelId,
+        via: Via,
         pane: PaneId,
         command: Vec<u8>,
         input: Vec<u8>,
         kind: WorktreeKind,
-    ) {
+    ) -> Option<Command> {
         let channel = self.new_channel();
-        let Some(w) = self.workers.get(&connection) else {
-            return;
-        };
-        w.link.send(Message::Exec {
-            channel,
-            connection,
-            command,
-            split_stderr: true,
-        });
-        w.link.send(Message::Data {
-            channel,
-            bytes: input,
-        });
-        w.link.send(Message::Eof { channel });
+        if !self.run_script(channel, &via, command, input) {
+            return Some(Command::Notice(match via {
+                Via::Ssh(_) => {
+                    "The connection to that host is closed: reconnect, then try again.".into()
+                }
+                Via::Wsl(_) => "Could not start wsl.exe to run git in WSL.".into(),
+            }));
+        }
         self.worktree_jobs.insert(
             channel,
             WorktreeJob {
-                connection,
+                via,
                 pane,
                 kind,
                 out: Vec::new(),
                 err: Vec::new(),
             },
         );
+        None
     }
 
     /// What a git worktree script said, or that it ended: the agent
@@ -13372,21 +13502,18 @@ impl Window {
                     .into(),
             ));
         }
-        let (Some(connection), Some(input)) =
-            (self.pane_connection(id), crate::worktree::remove_input(w))
-        else {
+        let (Some(via), Some(input)) = (self.pane_via(id), crate::worktree::remove_input(w)) else {
             return Some(Command::Notice(
                 "The connection to that agent's host is closed: reconnect, then try again.".into(),
             ));
         };
         self.run_worktree_job(
-            connection,
+            via,
             id,
             crate::worktree::remove_command(),
             input,
             WorktreeKind::Remove(w.clone()),
-        );
-        None
+        )
     }
 
     /// The worktree of its own that coding agent pane `id` was started in,
@@ -25441,8 +25568,8 @@ fn finished_note(end: &ferossh_term::CommandEnd) -> (String, String) {
 const JOINED_AGENT: &str = "This agent would start in someone else's tmux session, which \
     FeroSSH changes nothing of: start it from a connection of your own.";
 
-const DIFF_HOW: &str = "Show what changed works in a pane logged in to a server over SSH (or \
-     a tmux pane there), in a folder of a git repository.";
+const DIFF_HOW: &str = "Show what changed works in a pane logged in to a server over SSH or \
+     in a WSL pane (or a tmux pane in either), in a folder of a git repository.";
 /// Scrollback a diff tab keeps beyond [`crate::diff::MAX_ROWS`].
 const DIFF_SPARE_ROWS: usize = 1000;
 

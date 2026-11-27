@@ -110,6 +110,21 @@ pub fn gateway_args(
     args
 }
 
+/// The arguments for `wsl.exe` that run `command` (a line for a POSIX
+/// shell, as an SSH exec channel would run it, such as
+/// [`crate::diff::command`]) with `sh -c` in `distro` (the default when
+/// empty), in the home folder.
+pub fn script_args(distro: &str, command: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    if valid_name(distro) {
+        args.extend(["-d".to_owned(), distro.to_owned()]);
+    }
+    args.extend(["--cd".to_owned(), "~".to_owned()]);
+    args.extend(["-e".to_owned(), "sh".to_owned(), "-c".to_owned()]);
+    args.push(command.to_owned());
+    args
+}
+
 /// The script a gateway runs (see [`gateway_args`]).
 pub fn gateway_script(before: Option<&str>, session: &str) -> String {
     let check = "command -v tmux >/dev/null 2>&1 || { echo 'tmux is not installed in this \
@@ -236,6 +251,20 @@ mod tests {
     }
 
     #[test]
+    fn scripts_run_whole_in_sh() {
+        let line = "exec sh -c 'echo \"$1\" it\\x'";
+        assert_eq!(
+            script_args("Ubuntu-24.04", line),
+            ["-d", "Ubuntu-24.04", "--cd", "~", "-e", "sh", "-c", line]
+        );
+        assert_eq!(script_args("", "x"), ["--cd", "~", "-e", "sh", "-c", "x"]);
+        assert_eq!(
+            script_args("bad name", "x"),
+            ["--cd", "~", "-e", "sh", "-c", "x"]
+        );
+    }
+
+    #[test]
     fn home_relative_folders() {
         assert_eq!(
             in_home_folder("my app", "run"),
@@ -344,10 +373,67 @@ mod e2e {
                     }
                 }
                 Some(Output::Exited(code)) => panic!("exited {code:?}: {all:?}"),
-                None => {}
+                Some(Output::Stderr(_)) | None => {}
             }
         }
         panic!("timed out: {all:?}");
+    }
+
+    /// The git scripts reach WSL as `wsl.exe` passes them on: what
+    /// follows `-e` runs as given.
+    #[test]
+    fn a_worktree_script_runs_through_script_args() {
+        let has_git = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !has_git {
+            eprintln!("git is not installed: skipped");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("ferossh-wsl-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "one"]);
+        let command = String::from_utf8(crate::worktree::add_command()).unwrap();
+        let args = script_args("", &command);
+        let at = args.iter().position(|a| a == "-e").unwrap();
+        let mut c = PipeChild::spawn_split(Path::new("/bin/sh"), &args[at + 2..], || {}).unwrap();
+        let dir = repo.to_str().unwrap().as_bytes();
+        c.write(crate::worktree::add_input(dir, "claude").unwrap());
+        c.close_input();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        loop {
+            match c.read_timeout(Duration::from_secs(20)) {
+                Some(Output::Data(d)) => out.extend(d),
+                Some(Output::Stderr(d)) => err.extend(d),
+                Some(Output::Exited(_)) => break,
+                None => panic!("no exit"),
+            }
+        }
+        let made = crate::worktree::parse_add(&out, &err);
+        let canon = std::fs::canonicalize(&root).unwrap();
+        assert!(
+            matches!(&made, crate::worktree::Added::Made(w)
+                if w.branch == "claude" && w.path == canon.join("app-claude").to_str().unwrap()),
+            "{made:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -408,7 +494,7 @@ mod e2e {
         let mut out = Vec::new();
         loop {
             match c.read_timeout(Duration::from_secs(10)).unwrap() {
-                Output::Data(d) => out.extend(d),
+                Output::Data(d) | Output::Stderr(d) => out.extend(d),
                 Output::Exited(code) => {
                     assert_eq!(code, Some(127));
                     break;

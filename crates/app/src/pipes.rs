@@ -22,6 +22,9 @@ const READ_CHUNK: usize = 64 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Output {
     Data(Vec<u8>),
+    /// Standard error, for a program started with
+    /// [`PipeChild::spawn_split`] (otherwise it comes as `Data`).
+    Stderr(Vec<u8>),
     /// The program exited (with this code, when it had one) and all it
     /// wrote was read.
     Exited(Option<i32>),
@@ -48,6 +51,25 @@ impl PipeChild {
         args: &[String],
         notify: impl Fn() + Send + Clone + 'static,
     ) -> std::io::Result<Self> {
+        Self::start(program, args, notify, false)
+    }
+
+    /// As [`Self::spawn`], but standard error comes apart, as
+    /// [`Output::Stderr`].
+    pub fn spawn_split(
+        program: &Path,
+        args: &[String],
+        notify: impl Fn() + Send + Clone + 'static,
+    ) -> std::io::Result<Self> {
+        Self::start(program, args, notify, true)
+    }
+
+    fn start(
+        program: &Path,
+        args: &[String],
+        notify: impl Fn() + Send + Clone + 'static,
+        split: bool,
+    ) -> std::io::Result<Self> {
         let mut command = Command::new(program);
         command
             .args(args)
@@ -73,11 +95,18 @@ impl PipeChild {
         let mut readers = 0;
         if let Some(out) = stdout {
             readers += 1;
-            spawn_reader(out, out_tx.clone(), done_tx.clone(), notify.clone());
+            spawn_reader(
+                out,
+                Output::Data,
+                out_tx.clone(),
+                done_tx.clone(),
+                notify.clone(),
+            );
         }
         if let Some(err) = stderr {
             readers += 1;
-            spawn_reader(err, out_tx.clone(), done_tx.clone(), notify.clone());
+            let wrap = if split { Output::Stderr } else { Output::Data };
+            spawn_reader(err, wrap, out_tx.clone(), done_tx.clone(), notify.clone());
         }
         drop(done_tx);
         {
@@ -134,6 +163,12 @@ impl PipeChild {
         }
     }
 
+    /// Closes the program's input once what was queued is written: it
+    /// reads its end.
+    pub fn close_input(&mut self) {
+        self.input = None;
+    }
+
     /// The next piece of output, if any is waiting.
     pub fn try_read(&self) -> Option<Output> {
         self.output.as_ref()?.try_recv().ok()
@@ -161,6 +196,7 @@ impl Drop for PipeChild {
 
 fn spawn_reader(
     mut pipe: impl Read + Send + 'static,
+    wrap: fn(Vec<u8>) -> Output,
     tx: SyncSender<Output>,
     done: Sender<()>,
     notify: impl Fn() + Send + 'static,
@@ -172,7 +208,7 @@ fn spawn_reader(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let data = buf.get(..n).unwrap_or_default().to_vec();
-                    if tx.send(Output::Data(data)).is_err() {
+                    if tx.send(wrap(data)).is_err() {
                         break;
                     }
                     notify();
@@ -194,7 +230,7 @@ mod tests {
         let mut out = Vec::new();
         loop {
             match c.read_timeout(Duration::from_secs(10)) {
-                Some(Output::Data(d)) => out.extend(d),
+                Some(Output::Data(d) | Output::Stderr(d)) => out.extend(d),
                 Some(Output::Exited(code)) => return (out, code),
                 None => panic!("no exit; got {:?}", String::from_utf8_lossy(&out)),
             }
@@ -218,6 +254,30 @@ mod tests {
         assert!(text.contains("got hello"), "{text}");
         assert!(text.contains("oops"), "{text}");
         assert_eq!(code, Some(3));
+    }
+
+    #[test]
+    fn split_keeps_standard_error_apart() {
+        let mut c = PipeChild::spawn_split(
+            Path::new("/bin/sh"),
+            &["-c".into(), "cat; echo oops >&2".into()],
+            || {},
+        )
+        .unwrap();
+        c.write(b"in".to_vec());
+        c.close_input();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = loop {
+            match c.read_timeout(Duration::from_secs(10)) {
+                Some(Output::Data(d)) => out.extend(d),
+                Some(Output::Stderr(d)) => err.extend(d),
+                Some(Output::Exited(code)) => break code,
+                None => panic!("no exit"),
+            }
+        };
+        assert_eq!(out, b"in");
+        assert_eq!(err, b"oops\n");
+        assert_eq!(code, Some(0));
     }
 
     #[test]
