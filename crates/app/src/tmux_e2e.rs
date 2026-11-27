@@ -1420,11 +1420,12 @@ fn real_tmux_window_names_given_elsewhere_name_the_tab() {
         &server,
         &["set-option", "-w", "-t", "e2e:", "automatic-rename", "on"],
     );
-    // Before 3.2 tmux names the window again only once the pane prints.
-    let actions = a.tmux.input(first, b"echo renamed\r");
-    a.apply(actions);
     let end = Instant::now() + Duration::from_secs(10);
     while a.names.contains_key(&first) && Instant::now() < end {
+        // tmux before 3.2 renames from its loop's last step, and the
+        // notification waits for the next thing the server does (output,
+        // a key, any command): give it one.
+        tmux_cmd(&server, &["show-options", "-g", "-q", "base-index"]);
         let tick = Instant::now();
         a.until("a moment", |h| {
             tick.elapsed() > Duration::from_millis(100) || !h.names.contains_key(&first)
