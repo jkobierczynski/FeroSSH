@@ -92,6 +92,24 @@ fn tmux() -> Command {
     }
 }
 
+/// Whether the host tmux runs on (the container, if any) has `program`.
+fn has_program(program: &str) -> bool {
+    let check = format!("command -v {program}");
+    let mut c = match std::env::var("FEROSSH_TMUX_CONTAINER") {
+        Ok(id) if !id.is_empty() => {
+            let mut c = Command::new("docker");
+            c.args(["exec", &id, "sh", "-c", &check]);
+            c
+        }
+        _ => {
+            let mut c = Command::new("sh");
+            c.args(["-c", &check]);
+            c
+        }
+    };
+    c.output().is_ok_and(|o| o.status.success())
+}
+
 fn tmux_available() -> bool {
     let found = tmux().arg("-V").output().is_ok_and(|o| o.status.success());
     if !found {
@@ -1056,7 +1074,7 @@ fn real_tmux_watcher_sees_but_changes_nothing() {
 /// though the native terminal cannot after a reattach.
 #[test]
 fn real_tmux_reattach_with_a_full_screen_program() {
-    if !tmux_available() {
+    if !tmux_available() || version() < MIN_VERSION {
         return;
     }
     let server = Server {
@@ -1111,12 +1129,7 @@ fn real_tmux_reattach_with_a_full_screen_program() {
 /// attach and after FeroSSH resizes the pane.
 #[test]
 fn real_tmux_reattach_shows_top() {
-    if !tmux_available()
-        || Command::new("sh")
-            .args(["-c", "command -v top"])
-            .output()
-            .map_or(true, |o| !o.status.success())
-    {
+    if !tmux_available() || version() < MIN_VERSION || !has_program("top") {
         return;
     }
     let server = Server {
@@ -1152,12 +1165,7 @@ fn real_tmux_reattach_shows_top() {
 /// screen comes back on attach, not the shell's.
 #[test]
 fn real_tmux_reattach_shows_nano() {
-    if !tmux_available()
-        || Command::new("sh")
-            .args(["-c", "command -v nano"])
-            .output()
-            .map_or(true, |o| !o.status.success())
-    {
+    if !tmux_available() || version() < MIN_VERSION || !has_program("nano") {
         return;
     }
     let server = Server {
