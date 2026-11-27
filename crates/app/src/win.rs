@@ -13100,7 +13100,12 @@ impl Window {
 
     /// [`Self::start_agent`], once a Production host's question was
     /// answered (or there was none).
-    fn start_agent_asked(&mut self, id: PaneId, command: &str, place: AgentPlace) -> Option<Command> {
+    fn start_agent_asked(
+        &mut self,
+        id: PaneId,
+        command: &str,
+        place: AgentPlace,
+    ) -> Option<Command> {
         match place {
             AgentPlace::Here => self.start_agent_now(id, command),
             AgentPlace::NewWorktree => self.start_agent_worktree(id, command, false),
