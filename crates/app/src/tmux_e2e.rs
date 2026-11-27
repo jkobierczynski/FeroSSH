@@ -1147,3 +1147,44 @@ fn real_tmux_reattach_shows_top() {
     let screen = term.screen_text().join("\n");
     assert!(screen.contains("Tasks:"), "{screen}");
 }
+
+/// A real `nano` (on the alternate screen), where the host has it: its
+/// screen comes back on attach, not the shell's.
+#[test]
+fn real_tmux_reattach_shows_nano() {
+    if !tmux_available()
+        || Command::new("sh")
+            .args(["-c", "command -v nano"])
+            .output()
+            .map_or(true, |o| !o.status.success())
+    {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-nano-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Tmux);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    let actions = a.tmux.input(first, b"echo SHELL; nano\r");
+    a.apply(actions);
+    a.until("nano on the alternate screen", |_| {
+        tmux_cmd(
+            &server,
+            &["display-message", "-p", "-t", "e2e", "#{alternate_on}"],
+        ) == "1"
+            && tmux_cmd(&server, &["capture-pane", "-p", "-t", "e2e"]).contains("GNU nano")
+    });
+    drop(a);
+
+    let mut b = Harness::attach(&server, Mode::Tmux);
+    b.until("the restored pane", |h| {
+        h.panes.len() == 1 && h.panes.values().all(|p| !p.1.is_empty())
+    });
+    let pane = *b.panes.keys().next().unwrap();
+    let mut term = ferossh_term::Terminal::new(80, 24, &ferossh_term::Settings::default());
+    term.feed(b.text(pane).as_bytes());
+    let screen = term.screen_text().join("\n");
+    assert!(screen.contains("GNU nano"), "{screen}");
+    assert!(!screen.contains("SHELL"), "{screen}");
+}
