@@ -116,6 +116,26 @@ impl<T: Clone> Client<T> {
         Some(out)
     }
 
+    /// Sends `lines` as one line, `a ; b ; c`, each with its tag: tmux
+    /// runs them back to back, with no pane output read between them
+    /// (each still has its own reply). `None` outside control mode or
+    /// for no lines.
+    pub fn commands(&mut self, lines: Vec<(&str, T)>) -> Option<Vec<u8>> {
+        if !self.control || lines.is_empty() {
+            return None;
+        }
+        let mut out: Vec<u8> = Vec::new();
+        for (i, (line, tag)) in lines.into_iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b" ; ");
+            }
+            out.extend(line.bytes().filter(|&b| b != b'\n' && b != b'\r'));
+            self.pending.push_back(tag);
+        }
+        out.push(b'\n');
+        Some(out)
+    }
+
     /// Reads bytes from the pane.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event<T>> {
         let mut events = Vec::new();

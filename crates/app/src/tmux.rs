@@ -1192,22 +1192,18 @@ impl Tmux {
             ..Restoring::default()
         });
         // The screen only: the history before the pause is still in the
-        // native scrollback. The state after, for a cursor that matches.
-        self.send(
-            &format!("capture-pane -p -e -q -t %{pane}"),
-            Tag::Capture(pane),
-            out,
-        );
-        self.send(
-            &format!("capture-pane -p -e -q -a -t %{pane}"),
-            Tag::CaptureAlternate(pane),
-            out,
-        );
-        self.send(
-            &format!("list-panes -t %{pane} -F {}", command::quote(PANE_FORMAT)),
-            Tag::Resync(pane),
-            out,
-        );
+        // native scrollback. The state after, on the same line, so tmux
+        // reads no output between them and the cursor matches.
+        let normal = format!("capture-pane -p -e -q -t %{pane}");
+        let alternate = format!("capture-pane -p -e -q -a -t %{pane}");
+        let state = format!("list-panes -t %{pane} -F {}", command::quote(PANE_FORMAT));
+        if let Some(bytes) = self.client.commands(vec![
+            (normal.as_str(), Tag::Capture(pane)),
+            (alternate.as_str(), Tag::CaptureAlternate(pane)),
+            (state.as_str(), Tag::Resync(pane)),
+        ]) {
+            out.push(Action::Write(bytes));
+        }
     }
 
     fn on_output(&mut self, pane: PaneId, data: Vec<u8>, out: &mut Vec<Action>) {
@@ -3638,9 +3634,11 @@ mod tests {
             writes(&a),
             [
                 "refresh-client -A '%5:continue'".to_owned(),
-                "capture-pane -p -e -q -t %5".to_owned(),
-                "capture-pane -p -e -q -a -t %5".to_owned(),
-                format!("list-panes -t %5 -F {}", command::quote(PANE_FORMAT)),
+                format!(
+                    "capture-pane -p -e -q -t %5 ; capture-pane -p -e -q -a -t %5 ; \
+                     list-panes -t %5 -F {}",
+                    command::quote(PANE_FORMAT)
+                ),
             ]
         );
         // A second pause before the redraw only lets the pane go again.
