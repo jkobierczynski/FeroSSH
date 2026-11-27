@@ -18941,6 +18941,7 @@ impl Window {
                     self.open_host(name, false);
                 }
             }
+            BulkAction::GridAll(names, broadcast) => self.open_grid(&names, broadcast),
             BulkAction::AddTag(names, tag) => {
                 let names = self.not_team(&names);
                 crate::bulk::add_tag(&mut self.settings, &names, &tag);
@@ -19790,6 +19791,59 @@ impl Window {
         if let Some(id) = self.host_pane_for(split) {
             self.focus_terminal();
             self.connect(id, host);
+        }
+    }
+
+    /// Connection manager > Connect to all in one grid: the terminal
+    /// connections as the panes of one new tab (see [`crate::bulk::grid`]),
+    /// on broadcast input to that tab when `broadcast`. Desktop, file
+    /// transfer and tunnel connections have no terminal and open as
+    /// usual, a tab each.
+    fn open_grid(&mut self, names: &[String], broadcast: bool) {
+        let (terminals, others): (Vec<String>, Vec<String>) =
+            names.iter().cloned().partition(|n| {
+                self.settings.profile(n).is_none_or(|p| {
+                    matches!(
+                        p.kind,
+                        SessionKind::Ssh
+                            | SessionKind::Telnet
+                            | SessionKind::Mosh
+                            | SessionKind::Serial
+                            | SessionKind::WinRm
+                    )
+                })
+            });
+        for name in &others {
+            self.open_host(name, false);
+        }
+        match terminals.as_slice() {
+            [] => return,
+            [one] => {
+                self.open_host(one, false);
+                return;
+            }
+            _ => {}
+        }
+        let Some(root) = crate::bulk::grid(&terminals) else {
+            for name in &terminals {
+                self.open_host(name, false);
+            }
+            return;
+        };
+        for name in &terminals {
+            self.note_recent(name);
+        }
+        let ws = wsfile::Workspace {
+            tabs: vec![wsfile::TabSpec { root, focus: 0 }],
+            active: 0,
+        };
+        // Nothing of its own runs: the panes only connect.
+        self.open_workspace(&ws, false);
+        if broadcast && self.broadcast != broadcast::Scope::Tab {
+            self.broadcast = self.broadcast.toggle(broadcast::Scope::Tab);
+            self.update_menu_checks();
+            self.update_title();
+            self.refresh_chrome();
         }
     }
 
@@ -28483,6 +28537,8 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
     const CONNECT_ALL: u32 = 1;
     const DELETE: u32 = 2;
     const CLEAR: u32 = 3;
+    const GRID: u32 = 4;
+    const GRID_BROADCAST: u32 = 5;
     let Some((tags, folders)) = group_choices(&names) else {
         return;
     };
@@ -28503,6 +28559,20 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             CONNECT_ALL as usize,
             PCWSTR(connect.as_ptr()),
         );
+        if n <= crate::bulk::MAX_GRID {
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                GRID as usize,
+                w!("Connect to all in one tab, as a &grid"),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                GRID_BROADCAST as usize,
+                w!("Connect to all in one grid with &broadcast input"),
+            );
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         append_group_items(menu, &tags, &folders);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -28549,6 +28619,18 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
                 return;
             }
             BulkAction::OpenAll(names)
+        }
+        GRID | GRID_BROADCAST => {
+            if n > 8
+                && dialog(
+                    hwnd,
+                    &format!("Connect to all {n} connections, in one grid?"),
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                ) != Some(IDYES)
+            {
+                return;
+            }
+            BulkAction::GridAll(names, picked == GRID_BROADCAST)
         }
         p => {
             group_pick(hwnd, p, names, &tags, &folders);
