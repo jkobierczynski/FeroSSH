@@ -562,6 +562,10 @@ pub struct Workspace {
     next_id: PaneId,
     /// Hidden panes, in the order they were hidden.
     hidden: Vec<Hidden>,
+    /// Zoomed panes: each fills its tab while the tab's other panes keep
+    /// running unseen (tmux's `resize-pane -Z`). At most one per tab
+    /// counts; see [`Workspace::zoom_of`].
+    zoomed: Vec<PaneId>,
 }
 
 impl Workspace {
@@ -575,6 +579,7 @@ impl Workspace {
             active: 0,
             next_id: 2,
             hidden: Vec::new(),
+            zoomed: Vec::new(),
         };
         (ws, 1)
     }
@@ -677,6 +682,62 @@ impl Workspace {
         tab.root.graft(target, new, side)
     }
 
+    /// The pane that fills tab `t` while its other panes are out of
+    /// sight, if it is zoomed and the tab has other panes.
+    pub fn zoom_of(&self, t: &Tab) -> Option<PaneId> {
+        if t.root.panes().len() < 2 {
+            return None;
+        }
+        self.zoomed.iter().copied().find(|z| t.root.contains(*z))
+    }
+
+    /// Whether pane `id` is zoomed in its tab.
+    pub fn is_zoomed(&self, id: PaneId) -> bool {
+        self.tab_of(id)
+            .and_then(|i| self.tabs.get(i))
+            .is_some_and(|t| self.zoom_of(t) == Some(id))
+    }
+
+    /// Zooms pane `id` in its tab (`on`), or ends its tab's zoom. `false`
+    /// if nothing changed: it is not in a tab, or is its tab's only pane.
+    pub fn set_zoom(&mut self, id: PaneId, on: bool) -> bool {
+        let Some(t) = self.tab_of(id).and_then(|i| self.tabs.get(i)) else {
+            return false;
+        };
+        let members = t.root.panes();
+        let before = self.zoom_of(t);
+        self.zoomed.retain(|z| !members.contains(z));
+        if on && members.len() > 1 {
+            self.zoomed.push(id);
+        }
+        let after = on.then_some(id).filter(|_| members.len() > 1);
+        before != after
+    }
+
+    /// The panes of tab `t` that show: the zoomed one, or all.
+    pub fn shown(&self, t: &Tab) -> Vec<PaneId> {
+        match self.zoom_of(t) {
+            Some(z) => vec![z],
+            None => t.root.panes(),
+        }
+    }
+
+    /// Where the panes of tab `t` that show go in `area`.
+    pub fn placed(&self, t: &Tab, area: Rect, gap: i32) -> Vec<(PaneId, Rect)> {
+        match self.zoom_of(t) {
+            Some(z) => vec![(z, area)],
+            None => t.root.layout(area, gap),
+        }
+    }
+
+    /// The dividers of tab `t` in `area`: none while a pane is zoomed.
+    pub fn dividers(&self, t: &Tab, area: Rect, gap: i32) -> Vec<Divider> {
+        if self.zoom_of(t).is_some() {
+            return Vec::new();
+        }
+        t.root.dividers(area, gap)
+    }
+
     pub fn tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
     }
@@ -714,6 +775,9 @@ impl Workspace {
     /// Splits the focused pane; the new pane takes the focus.
     pub fn split(&mut self, side: Dir) -> Option<PaneId> {
         let id = self.fresh_id();
+        // As in tmux, a split ends the tab's zoom.
+        let focus = self.focused();
+        self.set_zoom(focus, false);
         let tab = self.tabs.get_mut(self.active)?;
         if !tab.root.split(tab.focus, id, side) {
             return None;
@@ -727,6 +791,15 @@ impl Workspace {
         let Some(i) = self.tab_of(id) else {
             return false;
         };
+        // Another pane of a zoomed tab: the zoom ends, as in tmux.
+        if self
+            .tabs
+            .get(i)
+            .and_then(|t| self.zoom_of(t))
+            .is_some_and(|z| z != id)
+        {
+            self.set_zoom(id, false);
+        }
         self.active = i;
         if let Some(t) = self.tabs.get_mut(i) {
             t.focus = id;
@@ -1321,5 +1394,30 @@ mod tests {
         assert!(ws.is_hidden(7));
         assert!(ws.show(7));
         assert_eq!(ws.tab_of(7), Some(1));
+    }
+
+    #[test]
+    fn a_zoomed_pane_fills_its_tab_until_another_has_the_focus() {
+        let mut ws = three();
+        let area = Rect::new(0, 0, 100, 50);
+        let t = ws.focused();
+        assert!(ws.set_zoom(t, true));
+        let tab = ws.tab().unwrap().clone();
+        assert_eq!(ws.placed(&tab, area, 2), [(t, area)]);
+        assert!(ws.dividers(&tab, area, 2).is_empty());
+        assert_eq!(ws.shown(&tab), [t]);
+        assert!(!ws.set_zoom(t, true), "already zoomed");
+        // Another pane of the tab gets the focus: the zoom ends.
+        let other = tab.root.panes().into_iter().find(|p| *p != t).unwrap();
+        assert!(ws.focus(other));
+        assert!(!ws.is_zoomed(t));
+        let tab = ws.tab().unwrap().clone();
+        assert_eq!(ws.shown(&tab).len(), 3);
+        // A split ends it too, and a tab's only pane does not zoom.
+        assert!(ws.set_zoom(other, true));
+        ws.split(Dir::Right);
+        assert!(!ws.is_zoomed(other));
+        let lone = ws.new_tab();
+        assert!(!ws.set_zoom(lone, true));
     }
 }

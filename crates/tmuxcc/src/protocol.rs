@@ -32,6 +32,10 @@ pub enum Notification {
     LayoutChange {
         window: WindowId,
         layout: String,
+        /// What shows: one pane at the window's size while it is zoomed.
+        visible: String,
+        /// The window's flags; `Z` while it is zoomed.
+        flags: String,
     },
     /// This client is now attached to another session (also sent once
     /// when control mode starts).
@@ -45,6 +49,14 @@ pub enum Notification {
     /// detached (`%client-session-changed`, `%client-detached`): how many
     /// clients a session has may have changed.
     ClientsChanged,
+    /// A window was linked into a session this client does not show
+    /// (`%unlinked-window-add`).
+    LinksChanged,
+    /// A window closed or was unlinked, and this client's session does
+    /// not have it (any more): unlinking one from this session says so.
+    UnlinkedWindowClose {
+        window: WindowId,
+    },
     /// The active window of a session changed.
     SessionWindowChanged {
         session: SessionId,
@@ -114,8 +126,10 @@ pub fn parse_notification(line: &[u8]) -> Notification {
             })
         }
         b"%window-add" => id(&next(), '@').map(|window| Notification::WindowAdd { window }),
-        b"%window-close" | b"%unlinked-window-close" => {
-            id(&next(), '@').map(|window| Notification::WindowClose { window })
+        b"%window-close" => id(&next(), '@').map(|window| Notification::WindowClose { window }),
+        b"%unlinked-window-add" => Some(Notification::LinksChanged),
+        b"%unlinked-window-close" => {
+            id(&next(), '@').map(|window| Notification::UnlinkedWindowClose { window })
         }
         b"%window-renamed" => {
             let window = id(&next(), '@');
@@ -127,7 +141,14 @@ pub fn parse_notification(line: &[u8]) -> Notification {
         b"%layout-change" => {
             let window = id(&next(), '@');
             let layout = next();
-            window.map(|window| Notification::LayoutChange { window, layout })
+            let visible = next();
+            let flags = next();
+            window.map(|window| Notification::LayoutChange {
+                window,
+                layout,
+                visible,
+                flags,
+            })
         }
         b"%session-changed" => {
             let session = id(&next(), '$');
@@ -284,7 +305,20 @@ mod tests {
             parse_notification(b"%layout-change @3 b25f,80x24,0,0,1 b25f,80x24,0,0,1 *"),
             Notification::LayoutChange {
                 window: 3,
-                layout: "b25f,80x24,0,0,1".into()
+                layout: "b25f,80x24,0,0,1".into(),
+                visible: "b25f,80x24,0,0,1".into(),
+                flags: "*".into(),
+            }
+        );
+        assert_eq!(
+            parse_notification(
+                b"%layout-change @3 x,80x24,0,0{40x24,0,0,1,39x24,41,0,2} y,80x24,0,0,2 *Z"
+            ),
+            Notification::LayoutChange {
+                window: 3,
+                layout: "x,80x24,0,0{40x24,0,0,1,39x24,41,0,2}".into(),
+                visible: "y,80x24,0,0,2".into(),
+                flags: "*Z".into(),
             }
         );
         assert_eq!(
@@ -303,7 +337,7 @@ mod tests {
         );
         assert_eq!(
             parse_notification(b"%unlinked-window-close @4"),
-            Notification::WindowClose { window: 4 }
+            Notification::UnlinkedWindowClose { window: 4 }
         );
         assert_eq!(
             parse_notification(b"%exit"),

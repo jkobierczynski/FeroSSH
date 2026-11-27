@@ -56,7 +56,8 @@ const PANE_FORMAT: &str = "#{pane_id} #{window_id} #{pane_width} #{pane_height} 
     #{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} #{keypad_cursor_flag} \
     #{keypad_flag} #{mouse_standard_flag} #{mouse_button_flag} #{mouse_all_flag} \
     #{mouse_sgr_flag} #{mouse_utf8_flag} #{origin_flag} #{insert_flag} #{wrap_flag} #{scroll_region_upper} \
-    #{scroll_region_lower} #{window_layout} #{@ferossh-agent} #{@ferossh-worktree}";
+    #{scroll_region_lower} #{?window_zoomed_flag,#{?pane_active,Z,},}#{window_layout} \
+    #{@ferossh-agent} #{@ferossh-worktree}";
 
 /// The window option that marks a coding agent's window, holding the
 /// agent's name ([`agent_name`]); it is read back on every attach, from
@@ -225,7 +226,14 @@ enum Tag {
     /// The size tmux gave a window after we asked for this one, and how
     /// many clients the session has.
     SizeCheck(WindowId, (u16, u16)),
-    /// How many clients session `.0` has.
+    /// Whether window `.1` is still in session `.0`, after tmux said it
+    /// closed: gone, it goes here too.
+    Reconcile(SessionId, WindowId),
+    /// The sessions sharing windows with session `.0` (linked windows,
+    /// a session group), for [`Tag::Clients`].
+    Links(SessionId),
+    /// How many clients show session `.0`'s windows in a way closing one
+    /// reaches: its own and those of the affected sessions.
     Clients(SessionId),
     /// Our own client's name, before detaching the others of session `.0`.
     OwnClient(SessionId),
@@ -330,6 +338,8 @@ struct PaneLine {
     window: WindowId,
     state: PaneState,
     layout: String,
+    /// This pane fills its window, which tmux has zoomed.
+    zoomed: bool,
     /// The window's [`AGENT_OPTION`], when it has one.
     agent: Option<String>,
     /// The window's [`crate::worktree::OPTION`], when it has one.
@@ -415,7 +425,8 @@ fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
             wrap: *wrap != "0",
             region: (n(top), n(bottom)),
         },
-        layout: (*layout).to_owned(),
+        zoomed: layout.starts_with('Z'),
+        layout: layout.trim_start_matches('Z').to_owned(),
     })
 }
 
@@ -525,6 +536,12 @@ struct Pane {
 #[derive(Debug)]
 struct Window {
     layout: Cell,
+    /// The pane filling the window while tmux has it zoomed (prefix `z`
+    /// here or in another client): the native tab zooms it too.
+    zoomed: Option<PaneId>,
+    /// The native zoom ended (another pane got the focus) and tmux was
+    /// asked to end its zoom too.
+    unzoom_sent: bool,
 }
 
 /// The size of a native pane in cells, for sizing tmux's panes.
@@ -568,6 +585,12 @@ pub struct Tmux {
     /// How many clients the session attached has, ours included, as
     /// tmux last said (`#{session_attached}`); `None` until it has.
     clients: Option<u32>,
+    /// The other sessions that closing a pane here reaches, from the last
+    /// [`Tag::Links`]: those of its session group (a window closed in one
+    /// closes in all), and those that link one of its windows of more
+    /// than one pane (`kill-pane` reaches every session showing it).
+    /// Windows linked elsewhere are only unlinked from this session.
+    affected: BTreeSet<SessionId>,
     /// Counts asked for after a client came or went, not answered yet.
     clients_asked: u32,
     saved_text: Option<String>,
@@ -731,6 +754,7 @@ impl Tmux {
             sent_layouts: BTreeMap::new(),
             crowded_asked: false,
             clients: None,
+            affected: BTreeSet::new(),
             clients_asked: 0,
             saved_text: None,
             reattach: None,
@@ -1115,6 +1139,7 @@ impl Tmux {
                 Event::Started => {
                     self.session = None;
                     self.clients = None;
+                    self.affected.clear();
                     self.clients_asked = 0;
                     self.version = None;
                     self.joined = self.join_pending.take();
@@ -1190,12 +1215,55 @@ impl Tmux {
                     self.discover(window, out);
                 }
             }
-            Notification::WindowClose { window } => {
-                self.remove_window(ws, window, out);
-                out.push(Action::Structure);
+            // A window linked into another session, or taken out of one:
+            // which other sessions' clients closing reaches may change.
+            Notification::LinksChanged => {
+                if self.session.is_some() {
+                    self.clients_asked += 1;
+                }
+                self.ask_clients(out);
             }
-            Notification::LayoutChange { window, layout } => {
+            // tmux names the wrong one of the two for a window linked into
+            // other sessions too (3.4: unlinked from another session it
+            // says %window-close here, unlinked from this one
+            // %unlinked-window-close), so a linked window's close is
+            // checked against the session's windows first.
+            Notification::WindowClose { window } | Notification::UnlinkedWindowClose { window } => {
+                match self.session.as_ref().map(|(s, _)| *s) {
+                    Some(s) if self.windows.contains_key(&window) => {
+                        self.send(
+                            &format!("list-windows -t ${s} -F '#{{window_id}}'"),
+                            Tag::Reconcile(s, window),
+                            out,
+                        );
+                    }
+                    _ => {
+                        self.remove_window(ws, window, out);
+                        out.push(Action::Structure);
+                    }
+                }
+                if self.session.is_some() {
+                    self.clients_asked += 1;
+                }
+                self.ask_clients(out);
+            }
+            Notification::LayoutChange {
+                window,
+                layout,
+                visible,
+                flags,
+            } => {
+                // While zoomed, the visible layout is the zoomed pane alone.
+                let zoomed = flags
+                    .contains('Z')
+                    .then(|| tl::parse(&visible))
+                    .flatten()
+                    .and_then(|c| match c.kind {
+                        Kind::Pane(p) => Some((p, c.width, c.height)),
+                        _ => None,
+                    });
                 self.on_layout_change(ws, window, &layout, out);
+                self.set_window_zoom(ws, window, zoomed, out);
             }
             Notification::Exit { reason } if !reason.is_empty() => {
                 out.push(Action::Notice(format!("tmux: {reason}")));
@@ -1275,12 +1343,15 @@ impl Tmux {
         self.sent_layouts.clear();
         self.crowded_asked = false;
         self.clients = None;
+        self.affected.clear();
         self.saved_text = None;
         self.restoring = true;
         // With how many clients the session has, so closing can ask
         // first when others show it too.
         self.send(
-            "display-message -p '#{version} #{session_attached_list}'",
+            "display-message -p '#{version} \
+             links=#{?session_grouped,G,}#{W:#{?window_linked,#{?#{!=:#{window_panes},1},L,},}} \
+             #{session_attached_list}'",
             Tag::Version,
             out,
         );
@@ -1314,10 +1385,46 @@ impl Tmux {
             return;
         };
         self.send(
-            &format!("list-clients -t ${session} -F '#{{client_name}}'"),
+            "list-windows -a -F '#{session_id} #{window_id} #{window_panes} #{session_group}'",
+            Tag::Links(session),
+            out,
+        );
+        self.send(
+            "list-clients -F '#{session_id}'",
             Tag::Clients(session),
             out,
         );
+    }
+
+    /// The sessions other than `session` that closing its panes reaches,
+    /// from `list-windows -a` lines (`$session @window panes group`).
+    fn affected_by(session: SessionId, lines: &[Vec<u8>]) -> BTreeSet<SessionId> {
+        let rows: Vec<(SessionId, WindowId, u32, String)> = lines
+            .iter()
+            .filter_map(|l| {
+                let text = std::str::from_utf8(l).ok()?;
+                let mut f = text.splitn(4, ' ');
+                let s = f.next()?.strip_prefix('$')?.parse().ok()?;
+                let w = f.next()?.strip_prefix('@')?.parse().ok()?;
+                let panes = f.next()?.parse().ok()?;
+                Some((s, w, panes, f.next().unwrap_or_default().to_owned()))
+            })
+            .collect();
+        let group = rows
+            .iter()
+            .find(|r| r.0 == session)
+            .map(|r| r.3.clone())
+            .filter(|g| !g.is_empty());
+        let split: BTreeSet<WindowId> = rows
+            .iter()
+            .filter(|r| r.0 == session && r.2 > 1)
+            .map(|r| r.1)
+            .collect();
+        rows.iter()
+            .filter(|r| r.0 != session)
+            .filter(|r| group.as_ref() == Some(&r.3) || split.contains(&r.1))
+            .map(|r| r.0)
+            .collect()
     }
 
     /// How many other clients (another FeroSSH connection, a terminal)
@@ -1453,6 +1560,13 @@ impl Tmux {
                 let mut words = reply.split_whitespace();
                 let version = words.next().unwrap_or_default();
                 self.version = ok.then(|| Version::parse(version)).flatten();
+                // A session group, or a window of more than one pane linked
+                // into another session: closing reaches other sessions'
+                // clients, which only a full count finds.
+                let mut words = words.peekable();
+                let linked = words
+                    .next_if(|w| w.starts_with("links="))
+                    .is_some_and(|w| w.len() > "links=".len());
                 // Flow control, for every client but one that only watches
                 // (it may not be let to continue a pane tmux paused).
                 if self.version.is_some_and(|v| v >= PAUSE_VERSION) && self.joined != Some(false) {
@@ -1477,7 +1591,7 @@ impl Tmux {
                             .and_then(|n| u32::try_from(n).ok())
                             .filter(|n| *n > 0);
                     }
-                    false
+                    linked && ok && self.clients_asked == 0
                 } else {
                     ok && self.clients_asked == 0
                 };
@@ -1819,12 +1933,35 @@ impl Tmux {
                     }
                 }
             }
+            Tag::Reconcile(session, window) => {
+                let ours = self.session.as_ref().map(|(s, _)| *s) == Some(session);
+                let still = ok && lines.iter().any(|l| win_of(l) == Some(window));
+                if ours && !still {
+                    self.remove_window(ws, window, out);
+                    out.push(Action::Structure);
+                }
+            }
+            Tag::Links(session) => {
+                if self.session.as_ref().map(|(s, _)| *s) == Some(session) {
+                    self.affected = if ok {
+                        Self::affected_by(session, &lines)
+                    } else {
+                        BTreeSet::new()
+                    };
+                }
+            }
             Tag::Clients(session) => {
                 self.clients_asked = self.clients_asked.saturating_sub(1);
                 if self.session.as_ref().map(|(s, _)| *s) == Some(session) {
+                    let counts = |l: &Vec<u8>| {
+                        std::str::from_utf8(l)
+                            .ok()
+                            .and_then(|t| t.strip_prefix('$')?.parse::<SessionId>().ok())
+                            .is_some_and(|s| s == session || self.affected.contains(&s))
+                    };
                     // A failed count is unknown, never "alone".
                     self.clients = ok
-                        .then(|| lines.iter().filter(|l| !l.is_empty()).count())
+                        .then(|| lines.iter().filter(|l| counts(l)).count())
                         .and_then(|n| u32::try_from(n).ok())
                         .filter(|n| *n > 0);
                 }
@@ -2013,7 +2150,20 @@ impl Tmux {
         if let Some(text) = self.notice_after_attach.take() {
             out.push(Action::Tell(text));
         }
+        let parsed: Vec<PaneLine> = lines.iter().filter_map(|l| parse_pane_line(l)).collect();
+        self.zoom_from(ws, &parsed, out);
         out.push(Action::Structure);
+    }
+
+    /// The windows tmux has zoomed, from pane lines: their native tabs
+    /// zoom too.
+    fn zoom_from(&mut self, ws: &mut Workspace, lines: &[PaneLine], out: &mut Vec<Action>) {
+        for line in lines {
+            if line.zoomed {
+                let size = (line.pane, line.state.width, line.state.height);
+                self.set_window_zoom(ws, line.window, Some(size), out);
+            }
+        }
     }
 
     fn first_native_of(&self, window: WindowId) -> Option<Native> {
@@ -2118,7 +2268,14 @@ impl Tmux {
         }
         let panes = &self.panes;
         let tree = native_tree(&layout, &|p| panes.get(&p).map(|x| x.native))?;
-        self.windows.insert(w, Window { layout });
+        self.windows.insert(
+            w,
+            Window {
+                layout,
+                zoomed: None,
+                unzoom_sent: false,
+            },
+        );
         Some(tree)
     }
 
@@ -2193,6 +2350,7 @@ impl Tmux {
                 self.focus_next = Some(p);
             }
         }
+        self.zoom_from(ws, &lines, out);
         out.push(Action::Structure);
     }
 
@@ -2262,6 +2420,62 @@ impl Tmux {
         }
     }
 
+    /// tmux zoomed window `w` (`Some`: the pane and its size, the whole
+    /// window's) or ended its zoom: the native tab follows, so a zoom made
+    /// in another client shows here and is never undone by a layout sync.
+    fn set_window_zoom(
+        &mut self,
+        ws: &mut Workspace,
+        w: WindowId,
+        zoomed: Option<(PaneId, u16, u16)>,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(win) = self.windows.get_mut(&w) else {
+            return;
+        };
+        let before = win.zoomed;
+        win.zoomed = zoomed.map(|(p, _, _)| p);
+        win.unzoom_sent = false;
+        let natives: BTreeMap<PaneId, Native> =
+            self.panes.iter().map(|(id, p)| (*id, p.native)).collect();
+        if let Some((p, cols, rows)) = zoomed
+            && let Some(&native) = natives.get(&p)
+        {
+            out.push(Action::Resize { native, cols, rows });
+            if ws.set_zoom(native, true) {
+                out.push(Action::Structure);
+            }
+            // A pane that cannot zoom here (the others are hidden) leaves
+            // tmux's zoom alone.
+            if let Some(win) = self.windows.get_mut(&w) {
+                win.unzoom_sent = !ws.is_zoomed(native);
+            }
+        } else if let Some(native) = before.and_then(|p| natives.get(&p))
+            && ws.is_zoomed(*native)
+        {
+            ws.set_zoom(*native, false);
+            out.push(Action::Structure);
+        }
+    }
+
+    /// Zooms native pane `native` in tmux (`resize-pane -Z`, prefix `z`),
+    /// or ends its window's zoom; the native tab follows once tmux says
+    /// (`%layout-change`). For tmux layout, where tmux's windows are the
+    /// tabs; in FeroSSH layout the window zooms the pane on its own.
+    pub fn zoom(&mut self, native: Native) -> Vec<Action> {
+        let mut out = Vec::new();
+        if let Some(p) = self.pane_of(native) {
+            self.send(&format!("resize-pane -Z -t %{p}"), Tag::Ignore, &mut out);
+        }
+        out
+    }
+
+    /// Whether prefix `z` zooms in tmux (tmux layout, own session) rather
+    /// than in the window alone.
+    pub fn zooms_in_tmux(&self) -> bool {
+        self.client.is_control() && self.mode == Mode::Tmux && self.joined.is_none()
+    }
+
     fn remove_window(&mut self, ws: &mut Workspace, w: WindowId, out: &mut Vec<Action>) {
         self.windows.remove(&w);
         self.agents.remove(&w);
@@ -2322,6 +2536,7 @@ impl Tmux {
         self.placements.clear();
         self.session = None;
         self.clients = None;
+        self.affected.clear();
         self.clients_asked = 0;
         self.restoring = false;
         self.joined = None;
@@ -2489,8 +2704,21 @@ impl Tmux {
         else {
             return out;
         };
-        self.send(&format!("kill-window -t @{w}"), Tag::Ignore, &mut out);
+        let line = self.close_window_line(w);
+        self.send(&line, Tag::Ignore, &mut out);
         out
+    }
+
+    /// Closes window `w` in this session: a window linked into other
+    /// sessions too is only taken out of this one (`unlink-window -k`
+    /// kills it when this is its only session, as `kill-window` would);
+    /// in a session group it goes from the whole group, which shares its
+    /// windows.
+    fn close_window_line(&self, w: WindowId) -> String {
+        match &self.session {
+            Some((s, _)) => format!("unlink-window -k -t ${s}:@{w}"),
+            None => format!("kill-window -t @{w}"),
+        }
     }
 
     /// Asks tmux which directory native pane `native` is in, to show what
@@ -2681,7 +2909,7 @@ impl Tmux {
         let alone =
             window.is_some_and(|w| self.panes.values().filter(|x| x.window == w).count() == 1);
         let line = match window {
-            Some(w) if alone => format!("kill-window -t @{w}"),
+            Some(w) if alone => self.close_window_line(w),
             _ => format!("kill-pane -t %{p}"),
         };
         self.send(&line, Tag::Ignore, &mut out);
@@ -2776,8 +3004,23 @@ impl Tmux {
             return out;
         }
         let mut wanted: Vec<(WindowId, (u16, u16), Option<String>)> = Vec::new();
+        let mut unzoom: Vec<(WindowId, PaneId)> = Vec::new();
         for (w, win) in &self.windows {
             let want = |p: PaneId| self.native_of(p).and_then(cells);
+            // Zoomed in tmux: the window is its zoomed pane's size, and
+            // its layout is left alone (select-layout would end the zoom).
+            // Once the native zoom ended, tmux's ends too.
+            if let Some(z) = win.zoomed {
+                let native = self.native_of(z);
+                if native.is_some_and(|n| ws.is_zoomed(n)) {
+                    if let Some(size) = want(z) {
+                        wanted.push((*w, size, None));
+                    }
+                } else if !win.unzoom_sent {
+                    unzoom.push((*w, z));
+                }
+                continue;
+            }
             let Some((shape, (cols, rows))) = shape_of(&win.layout, &want) else {
                 continue;
             };
@@ -2787,6 +3030,12 @@ impl Tmux {
                 tl::place(&shape, cols, rows, 0, 0).map(|c| c.to_layout_string())
             };
             wanted.push((*w, (cols, rows), layout));
+        }
+        for (w, z) in unzoom {
+            if let Some(win) = self.windows.get_mut(&w) {
+                win.unzoom_sent = true;
+            }
+            self.send(&format!("resize-pane -Z -t %{z}"), Tag::Ignore, &mut out);
         }
         let focused = self
             .pane_of(ws.focused())
@@ -3009,6 +3258,16 @@ mod tests {
     /// says its version (3.2 or later): fed on its own, after the
     /// replies before it are read.
     const PAUSE_ACK: &[u8] = b"%begin 9 90 1\n%end 9 90 1\n";
+
+    /// Answers every command still waiting with `lines`; what that did.
+    fn answer_all(t: &mut Tmux, ws: &mut Workspace, lines: &[&str]) -> Vec<Action> {
+        let lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+        let mut all = Vec::new();
+        while t.client.pending() > 0 {
+            all.extend(t.feed(ws, &reply(90, &lines)));
+        }
+        all
+    }
 
     fn writes(actions: &[Action]) -> Vec<String> {
         actions
@@ -3635,7 +3894,10 @@ mod tests {
         assert!(w[0].contains("hidden=@1 look="), "{w:?}");
         assert!(!w[0].contains("hidden=@2"), "{w:?}");
         // A hidden pane's window closing forgets it.
+        // tmux says so; the window list confirms it (see Tag::Reconcile).
         let a = t.feed(&mut ws, b"%window-close @1\n");
+        assert!(!a.contains(&Action::Remove { native: n1 }));
+        let a = answer_all(&mut t, &mut ws, &["@0", "@2"]);
         assert!(a.contains(&Action::Remove { native: n1 }));
         assert!(ws.hidden().is_empty());
     }
@@ -3911,8 +4173,9 @@ mod tests {
         );
         assert!(t.rename(999, Some("x")).is_empty());
         // Closing a pane kills its window; tmux then says so.
-        assert_eq!(writes(&t.close(n9)), ["kill-window -t @4"]);
-        let a = t.feed(&mut ws, b"%window-close @4\n");
+        assert_eq!(writes(&t.close(n9)), ["unlink-window -k -t $0:@4"]);
+        t.feed(&mut ws, b"%window-close @4\n");
+        let a = answer_all(&mut t, &mut ws, &["@0"]);
         assert!(a.contains(&Action::Remove { native: n9 }));
         assert_eq!(ws.all_panes(), [a0]);
     }
@@ -4122,7 +4385,10 @@ mod tests {
         let captures = writes(&a).len();
         // Remove worktree closes the agent's whole window, and only an
         // agent's.
-        assert_eq!(writes(&t.close_agent_window(native)), ["kill-window -t @4"]);
+        assert_eq!(
+            writes(&t.close_agent_window(native)),
+            ["unlink-window -k -t $0:@4"]
+        );
         assert!(t.close_agent_window(a0).is_empty());
         // Start in a new worktree asks tmux for the pane's folder first.
         assert_eq!(
@@ -4245,20 +4511,69 @@ mod tests {
         }
         // Another client attached: shared at once, before the count.
         let a = t.feed(&mut ws, b"%client-session-changed /dev/pts/4 $0 main\n");
-        assert_eq!(writes(&a), ["list-clients -t $0 -F '#{client_name}'"]);
+        assert_eq!(
+            writes(&a),
+            [
+                "list-windows -a -F '#{session_id} #{window_id} #{window_panes} #{session_group}'",
+                "list-clients -F '#{session_id}'"
+            ]
+        );
         assert!(t.maybe_shared());
         assert_eq!(t.others_attached(), 0);
+        // A client of another session that links window @0 (one pane)
+        // does not count: closing only unlinks it from this session.
+        let links = ["$0 @0 1 ".to_owned(), "$1 @0 1 ".to_owned()];
+        t.feed(&mut ws, &reply(n + 1, &links));
         t.feed(
             &mut ws,
-            &reply(n + 1, &["/dev/pts/3".into(), "/dev/pts/4".into()]),
+            &reply(n + 2, &["$0".into(), "$0".into(), "$1".into()]),
         );
         assert!(t.maybe_shared());
         assert_eq!(t.others_attached(), 1);
         // It left: still asked about until tmux says so.
         t.feed(&mut ws, b"%client-detached /dev/pts/4\n");
         assert!(t.maybe_shared());
-        t.feed(&mut ws, &reply(n + 2, &["/dev/pts/3".into()]));
+        t.feed(&mut ws, &reply(n + 3, &links));
+        t.feed(&mut ws, &reply(n + 4, &["$0".into(), "$1".into()]));
         assert!(!t.maybe_shared());
+        // In a session group, closing reaches the whole group.
+        t.feed(&mut ws, b"%client-session-changed /dev/pts/5 $2 g\n");
+        let grouped = ["$0 @0 1 main".to_owned(), "$2 @0 1 main".to_owned()];
+        t.feed(&mut ws, &reply(n + 5, &grouped));
+        t.feed(&mut ws, &reply(n + 6, &["$0".into(), "$2".into()]));
+        assert_eq!(t.others_attached(), 1);
+    }
+
+    #[test]
+    fn a_window_tmux_says_closed_but_still_here_stays() {
+        let panes = [
+            pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0"),
+            pane_line(1, 1, 80, 24, "b25f,80x24,0,0,1"),
+        ];
+        let (mut t, mut ws, _) = attached(None, None, &panes);
+        let n1 = t.native_of(1).unwrap();
+        // Unlinked from another session, tmux 3.4 says %window-close.
+        let a = t.feed(&mut ws, b"%window-close @1\n");
+        assert_eq!(writes(&a)[0], "list-windows -t $0 -F '#{window_id}'",);
+        let a = answer_all(&mut t, &mut ws, &["@0", "@1"]);
+        assert!(!a.contains(&Action::Remove { native: n1 }));
+        assert_eq!(t.native_of(1), Some(n1));
+    }
+
+    #[test]
+    fn closing_reaches_only_the_sessions_a_close_takes_from() {
+        let rows = |r: &[&str]| r.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
+        // Linked one-pane window: only unlinked here; a split one: its
+        // panes close everywhere it shows; a group shares every window.
+        assert!(Tmux::affected_by(0, &rows(&["$0 @1 1 ", "$1 @1 1 "])).is_empty());
+        assert_eq!(
+            Tmux::affected_by(0, &rows(&["$0 @1 2 ", "$1 @1 2 ", "$3 @7 2 "])),
+            BTreeSet::from([1])
+        );
+        assert_eq!(
+            Tmux::affected_by(0, &rows(&["$0 @1 1 g", "$2 @1 1 g", "$4 @9 1 h"])),
+            BTreeSet::from([2])
+        );
     }
 
     #[test]

@@ -191,6 +191,8 @@ pub enum Action {
     CloseTab,
     /// `!`: the pane to a tab of its own.
     BreakPane,
+    /// `z`: the pane fills its tab, or the tab's zoom ends.
+    Zoom,
     /// `d`
     Detach,
     /// `s` and `w`: the other tmux sessions.
@@ -247,6 +249,7 @@ pub fn action(keys: &Keys, key: Key) -> Action {
                 'x' => Action::ClosePane,
                 '&' => Action::CloseTab,
                 '!' => Action::BreakPane,
+                'z' => Action::Zoom,
                 'd' => Action::Detach,
                 's' | 'w' => Action::ChooseSession,
                 '[' => Action::ScrollBack,
@@ -287,6 +290,7 @@ pub fn help(prefix: &str, repeat_ms: u64) -> String {
          x\tclose the pane\n\
          &\tclose the tab\n\
          !\tmove the pane to its own tab\n\
+         z\tzoom the pane (again: back)\n\
          d\tdetach tmux\n\
          s / w\tswitch tmux session\n\
          [ / PageUp\tscroll back a page (PageDown forward)\n\
